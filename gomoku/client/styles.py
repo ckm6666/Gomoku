@@ -757,4 +757,220 @@ QMessageBox QLabel {
 QMessageBox QPushButton {
     min-width: 84px;
 }
+
+/* ------------------------------ 联机聊天 ------------------------------ */
+QFrame#chatLogPanel {
+    background-color: rgba(252, 248, 239, 226);
+    border: 1px solid #D3C4AD;
+    border-top: 3px solid #B8934E;
+    border-radius: 8px;
+}
+
+QScrollArea#chatLogScroll {
+    background: transparent;
+    border: none;
+}
+
+QScrollArea#chatLogScroll > QWidget#qt_scrollarea_viewport {
+    background: transparent;
+}
+
+QWidget#chatLogBody {
+    background: transparent;
+}
+
+QLabel#chatLogTitle {
+    color: #4C463C;
+    font-size: 13px;
+    font-weight: bold;
+    padding-top: 2px;
+}
+
+QLabel#chatLogEntry {
+    color: #332C24;
+    background-color: rgba(243, 234, 218, 190);
+    border: 1px solid #E0D2B8;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 12px;
+}
+
+QLabel#chatLogEntry[side="self"] {
+    color: #7E2C22;
+    background-color: rgba(242, 220, 202, 214);
+    border-color: #C9A98C;
+}
+
+QLabel#chatLogEntry[side="opponent"] {
+    color: #2F4A5C;
+    background-color: rgba(219, 230, 238, 200);
+    border-color: #A9BFCB;
+}
+
+QPushButton#emojiPickerButton {
+    color: #5A4A38;
+    background-color: #F3EADA;
+    border: 1px solid #C9B99F;
+    border-radius: 5px;
+    padding: 8px 14px;
+    font-size: 13px;
+}
+
+QPushButton#emojiPickerButton:hover {
+    background-color: #EADCC8;
+    border-color: #B8934E;
+}
+
+QPushButton#emojiPickerButton:pressed {
+    background-color: #E2D3BC;
+}
+
+QPushButton#emojiPickerButton:disabled {
+    background-color: #EEE8DF;
+    border-color: #DCD0BC;
+    color: #B3A898;
+}
+
+QPushButton#presetCommentButton {
+    color: #5A4A38;
+    background-color: #F3EADA;
+    border: 1px solid #C9B99F;
+    border-radius: 5px;
+    padding: 8px 14px;
+    font-size: 13px;
+}
+
+QPushButton#presetCommentButton:hover {
+    background-color: #EADCC8;
+    border-color: #B8934E;
+}
+
+QPushButton#presetCommentButton:pressed {
+    background-color: #E2D3BC;
+}
+
+QPushButton#presetCommentButton:disabled {
+    background-color: #EEE8DF;
+    border-color: #DCD0BC;
+    color: #B3A898;
+}
+
+/* 对话日志开关：未展开时是普通的描边按钮，展开后用墨色实底表示
+   “当前显示中”。 */
+QPushButton#chatLogToggleButton {
+    color: #5A4A38;
+    background-color: #F3EADA;
+    border: 1px solid #C9B99F;
+    border-radius: 5px;
+    padding: 8px 14px;
+    font-size: 13px;
+}
+
+QPushButton#chatLogToggleButton:hover {
+    background-color: #EADCC8;
+    border-color: #B8934E;
+}
+
+QPushButton#chatLogToggleButton:pressed {
+    background-color: #E2D3BC;
+}
+
+QPushButton#chatLogToggleButton:checked {
+    color: #FFF9EF;
+    background-color: #4C463C;
+    border-color: #332C24;
+}
+
+QLineEdit#chatInput {
+    color: #332C24;
+    background-color: #FBF7EE;
+    border: 1px solid #C9B99F;
+    border-radius: 4px;
+    padding: 8px 10px;
+    min-height: 20px;
+    font-size: 13px;
+}
+
+QLineEdit#chatInput:hover {
+    border-color: #B8934E;
+}
+
+QLineEdit#chatInput:focus {
+    border: 1px solid #8E6C32;
+}
+
+QLineEdit#chatInput:disabled {
+    color: #B3A898;
+    background-color: #EEE8DF;
+    border-color: #DCD0BC;
+}
+
+QPushButton#chatSendButton {
+    color: #FFF9EF;
+    background-color: #9E3B2E;
+    border: 1px solid #7E2C22;
+    border-radius: 5px;
+    padding: 9px 18px;
+    font-size: 13px;
+    font-weight: bold;
+}
+
+QPushButton#chatSendButton:hover {
+    background-color: #8A3127;
+}
+
+QPushButton#chatSendButton:pressed {
+    background-color: #6B241B;
+}
+
+QPushButton#chatSendButton:disabled {
+    background-color: #EEE8DF;
+    border-color: #DCD0BC;
+    color: #B3A898;
+}
+
+QLabel#chatLogNotice {
+    color: #8A5A2B;
+    background-color: transparent;
+    font-size: 12px;
+    padding: 2px 4px;
+}
+
+/* 表情网格里的按钮必须清掉全局的内边距：全局 QPushButton 规则留了
+   9px 17px，在 36x36 的小方块里内容宽度会被挤成 0，表情就看不见了。 */
+QPushButton#emojiGridButton {
+    padding: 0px;
+    margin: 0px;
+    border: 1px solid #E0D2B8;
+    border-radius: 6px;
+    background-color: rgba(251, 247, 238, 235);
+    font-size: 19px;
+    font-weight: normal;
+}
+
+QPushButton#emojiGridButton:hover {
+    background-color: #F1E4CC;
+    border-color: #B8934E;
+}
+
+QPushButton#emojiGridButton:pressed {
+    background-color: #E6D6BB;
+}
+
+QMenu#chatMenu {
+    background-color: #FBF7EE;
+    border: 1px solid #C9B99F;
+    border-radius: 6px;
+    padding: 4px;
+}
+
+QMenu#chatMenu::item {
+    color: #3F382F;
+    padding: 6px 14px;
+    border-radius: 3px;
+}
+
+QMenu#chatMenu::item:selected {
+    background-color: #F1E4CC;
+}
 """

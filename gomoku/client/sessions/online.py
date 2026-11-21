@@ -11,6 +11,7 @@ Stage 1 已接入真实 WebSocket 协议（登录/建房/加入/落子/认输/�
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from typing import Any, Mapping, Optional
 
@@ -19,10 +20,18 @@ from PySide6.QtCore import QObject, Signal
 from gomoku.client.board_view import BoardView
 from gomoku.client.sessions.base import GameSession
 from gomoku.client.transport import Transport
+from gomoku.shared.chat import (
+    CHAT_INTERVAL_SECONDS,
+    CHAT_KIND_EMOJI,
+    CHAT_KIND_TEXT,
+    build_chat_payload,
+    parse_chat_message,
+)
 from gomoku.shared.errors import ProtocolError, TransportError
 from gomoku.shared.protocol import (
     CLIENT_AUTH,
     CLIENT_CANCEL_MATCH,
+    CLIENT_CHAT,
     CLIENT_CREATE_ROOM,
     CLIENT_JOIN_ROOM,
     CLIENT_LEAVE_ROOM,
@@ -32,10 +41,12 @@ from gomoku.shared.protocol import (
     CLIENT_REMATCH,
     CLIENT_RESIGN,
     SERVER_AUTHENTICATED,
+    SERVER_CHAT,
     SERVER_ERROR,
     SERVER_GAME_STATE,
     SERVER_MATCH_FOUND,
     SERVER_MOVE_REJECTED,
+    SERVER_MESSAGE_TYPES,
     SERVER_OPPONENT_STATUS,
     SERVER_PONG,
     SERVER_QUEUE_STATUS,
@@ -51,6 +62,9 @@ from gomoku.shared.protocol import (
 from gomoku.shared.rules import BOARD_SIZE, Cell, Player
 
 logger = logging.getLogger(__name__)
+
+#: 已发出的发言请求在本地保留多久，等待服务器的回执或过期淘汰。
+CHAT_REQUEST_TTL_SECONDS = 30.0
 
 _EMPTY_BOARD: tuple[tuple[Cell, ...], ...] = tuple(
     tuple(None for _ in range(BOARD_SIZE)) for _ in range(BOARD_SIZE)
@@ -93,6 +107,8 @@ class OnlineGameSession(GameSession):
     rematch_status_changed = Signal(bool, bool)  # yours, opponent
     queue_status_changed = Signal(bool, int)  # queued, queue_size
     matched = Signal(str, str)  # game_id, opponent_name
+    chat_received = Signal(object)  # ChatMessage
+    chat_failed = Signal(str)  # 发言被拒/发送失败的中文提示
 
     def __init__(
         self,
@@ -128,6 +144,11 @@ class OnlineGameSession(GameSession):
         self._opponent_rating_before: Optional[int] = None
         self._opponent_rating_after: Optional[int] = None
         self._rating_delta: Optional[int] = None
+        self._last_chat_at: Optional[float] = None
+        # 已发出但尚未收到服务器回执的发言请求，用于把错误精确归位。
+        # 发言成功时服务器只广播消息、不回执 request_id，所以这里必须
+        # 有界，否则长时间对局会一直累积。
+        self._pending_chat_ids: dict[str, float] = {}
 
         transport.message_received.connect(self._on_transport_message)
         transport.disconnected.connect(self._on_transport_disconnected)
@@ -217,6 +238,34 @@ class OnlineGameSession(GameSession):
     @property
     def your_rating_after(self) -> Optional[int]:
         return self._your_rating_after
+
+    @property
+    def chat_available(self) -> bool:
+        """聊天输入是否可用（已认证、连接正常、已经进入对局）。
+
+        这里**不**包含发言冷却：冷却只用来限制发送频率，如果拿它去
+        禁用输入框，Qt 会把焦点从被禁用的控件上摘走，用户每发一条
+        消息都要重新点回输入框。
+        """
+        if self._closed or not self._authenticated:
+            return False
+        if self._snapshot is None:
+            # 还没进入对局（等待对手）时不可发言。
+            return False
+        return not self._disconnected
+
+    @property
+    def can_send_chat(self) -> bool:
+        """当前是否可以真的发出这条消息（chat_available 且冷却已过）。"""
+        if not self.chat_available:
+            return False
+        now = time.monotonic()
+        if (
+            self._last_chat_at is not None
+            and now - self._last_chat_at < CHAT_INTERVAL_SECONDS
+        ):
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # GameSession 只读接口
@@ -353,6 +402,80 @@ class OnlineGameSession(GameSession):
             return False
         return self._send(make_message(CLIENT_LEAVE_ROOM, {}))
 
+    # ------------------------------------------------------------------
+    # 表情/评论
+    # ------------------------------------------------------------------
+    def send_chat(self, kind: str, content: str) -> bool:
+        """发送表情或评论；失败时发出 chat_failed 信号并返回 False。"""
+        if self._closed or not self._authenticated:
+            return False
+        if not self.chat_available:
+            self.chat_failed.emit("当前不能发言")
+            return False
+        try:
+            payload = build_chat_payload(kind, content)
+        except ProtocolError as exc:
+            self.chat_failed.emit(str(exc))
+            return False
+        # 客户端冷却：两次发送之间至少间隔 CHAT_INTERVAL_SECONDS。
+        now = time.monotonic()
+        if (
+            self._last_chat_at is not None
+            and now - self._last_chat_at < CHAT_INTERVAL_SECONDS
+        ):
+            # 明确告诉用户被冷却挡下来了，不要让点击悄悄消失。
+            self.chat_failed.emit("发言太快，请稍候")
+            return False
+        self._last_chat_at = now
+        # 带 request_id，服务器拒绝这条发言时才能把错误精确归到聊天，
+        # 不会混进对局的红色错误条。
+        request_id = uuid.uuid4().hex
+        sent = self._send_chat_message(
+            make_message(CLIENT_CHAT, payload, request_id=request_id)
+        )
+        if not sent:
+            self.chat_failed.emit("网络发送失败，请检查连接")
+        else:
+            self._remember_chat_request(request_id)
+        return sent
+
+    def _send_chat_message(self, message: Mapping[str, Any]) -> bool:
+        """发送聊天消息，且不触发对局的通用错误信号。
+
+        发言失败只提示在聊天区域；混进对局的红色错误条会让玩家以为
+        是棋局出了故障。
+        """
+        try:
+            self._transport.send_message(dict(message))
+            return True
+        except (TransportError, RuntimeError, OSError) as exc:
+            logger.warning("发送聊天消息失败：%s", exc)
+            return False
+
+    def send_emoji(self, emoji: str) -> bool:
+        """发送一个预设表情。"""
+        return self.send_chat(CHAT_KIND_EMOJI, emoji)
+
+    def send_comment(self, text: str) -> bool:
+        """发送一条手动输入或预设的评论。"""
+        return self.send_chat(CHAT_KIND_TEXT, text)
+
+    def _remember_chat_request(self, request_id: str) -> None:
+        """记录一条已发出的发言请求，并淘汰过期的记录。
+
+        服务器只在**拒绝**发言时才回执 request_id，成功的发言只会收到
+        一条广播，因此这里必须限制上限，避免长时间对局无限累积。
+        """
+        now = time.monotonic()
+        stale = [
+            key
+            for key, stamp in self._pending_chat_ids.items()
+            if now - stamp > CHAT_REQUEST_TTL_SECONDS
+        ]
+        for key in stale:
+            self._pending_chat_ids.pop(key, None)
+        self._pending_chat_ids[request_id] = now
+
     def pause(self) -> None:
         if not self._closed and not self._paused:
             self._paused = True
@@ -403,6 +526,16 @@ class OnlineGameSession(GameSession):
     def _on_transport_message(self, raw: Any) -> None:
         if self._closed:
             return
+        # 服务端以后新增消息类型时（协议版本不变），旧客户端应该安静
+        # 忽略，而不是当成协议错误打扰玩家。
+        if isinstance(raw, Mapping):
+            raw_type = raw.get("type")
+            if (
+                isinstance(raw_type, str)
+                and raw_type not in SERVER_MESSAGE_TYPES
+            ):
+                logger.warning("忽略未知服务器消息：%s", raw_type)
+                return
         try:
             message = parse_message(raw)
         except ProtocolError as exc:
@@ -433,6 +566,8 @@ class OnlineGameSession(GameSession):
             self._handle_server_error(message)
         elif message_type == SERVER_PONG:
             return
+        elif message_type == SERVER_CHAT:
+            self._handle_chat(message)
         else:
             logger.warning("忽略未知服务器消息：%s", message_type)
 
@@ -665,13 +800,31 @@ class OnlineGameSession(GameSession):
     def _handle_server_error(self, message: Mapping[str, Any]) -> None:
         payload = message.get("payload", {})
         reason = payload.get("reason") if isinstance(payload, Mapping) else None
+        request_id = message.get("request_id")
+        # 发言被服务器拒绝（限流、白名单等）走 chat_failed，
+        # 不混进对局的红色错误条。
+        if isinstance(request_id, str) and request_id in self._pending_chat_ids:
+            self._pending_chat_ids.pop(request_id, None)
+            self.chat_failed.emit(
+                reason if isinstance(reason, str) and reason else "发言未发送"
+            )
+            return
         if (
             self._pending_move_id is not None
-            and message.get("request_id") == self._pending_move_id
+            and request_id == self._pending_move_id
         ):
             self._pending_move_id = None
             self.state_changed.emit()
         self.error.emit(reason if isinstance(reason, str) and reason else "服务器错误")
+
+    def _handle_chat(self, message: Mapping[str, Any]) -> None:
+        """解析服务端广播的表情/评论并转发给界面。"""
+        try:
+            chat = parse_chat_message(message.get("payload", {}))
+        except ProtocolError as exc:
+            logger.warning("丢弃非法聊天消息：%s", exc)
+            return
+        self.chat_received.emit(chat)
 
     def _on_transport_disconnected(self, reason: str) -> None:
         if self._closed:

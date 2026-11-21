@@ -24,9 +24,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy import select, update
 from starlette.websockets import WebSocket
 
+from gomoku.shared.chat import (
+    CHAT_BURST,
+    CHAT_WINDOW_SECONDS,
+    normalize_chat_content,
+)
+from gomoku.shared.errors import ProtocolError
 from gomoku.shared.game_model import GameModel
 from gomoku.shared.protocol import (
     SERVER_ERROR,
+    SERVER_CHAT,
     SERVER_GAME_STATE,
     SERVER_MATCH_FOUND,
     SERVER_MOVE_REJECTED,
@@ -130,6 +137,11 @@ class Room:
     timeout_task: Optional[asyncio.Task] = None
     turn_token: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # 表情/评论专用锁：只用于串行化发言广播，绝不占用 lock，
+    # 否则聊天会拖慢落子写库和超时判定，可能造成误判超时负。
+    chat_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # 每个用户最近若干次发言的时间戳（time.monotonic），用于限流。
+    chat_sent_times: dict[str, list[float]] = field(default_factory=dict)
     rated: bool = False
     matchmade: bool = False
     rating_before: dict[str, int] = field(default_factory=dict)
@@ -1016,6 +1028,74 @@ class RoomManager:
 
         if error:
             await self._send_error(conn, error)
+
+    # ------------------------------------------------------------------
+    # 表情/评论
+    # ------------------------------------------------------------------
+    async def send_chat(
+        self,
+        conn: ClientConnection,
+        kind: str,
+        content: str,
+        request_id: Optional[str] = None,
+    ) -> None:
+        """处理房间内的表情/评论：校验、限流后广播给房间内所有人。
+
+        校验放在这里而不是网关层，保证任何调用方（未来的机器人或管理
+        工具）都无法绕过白名单和长度限制；广播出去的也是规范化之后的
+        文本，而不是客户端原样送上来的内容。
+        """
+        if not self._is_current_connection(conn):
+            return
+
+        room = self._room_by_user.get(conn.user_id)
+        if room is None:
+            await self._send_error(conn, "你不在房间中", request_id)
+            return
+
+        # 规范化在锁外完成，失败直接回错误，不占用任何房间锁。
+        try:
+            normalized = normalize_chat_content(kind, content)
+        except ProtocolError as exc:
+            await self._send_error(conn, str(exc), request_id)
+            return
+
+        # 只用 chat_lock 串行化发言顺序；绝不碰 room.lock，
+        # 否则聊天的网络写会拖慢落子写库与超时判定，造成误判超时负。
+        async with room.chat_lock:
+            if room.connections.get(conn.user_id) is not conn:
+                return
+            if room.status == "waiting":
+                await self._send_error(
+                    conn, "对手尚未加入，暂时无法发言", request_id
+                )
+                return
+
+            # 限流：CHAT_WINDOW_SECONDS 窗口内最多 CHAT_BURST 条。
+            # 窗口比客户端的发言间隔宽一倍，网络抖动时也不会误判。
+            now = time.monotonic()
+            times = [
+                stamp
+                for stamp in room.chat_sent_times.get(conn.user_id, [])
+                if now - stamp < CHAT_WINDOW_SECONDS
+            ]
+            if len(times) >= CHAT_BURST:
+                await self._send_error(conn, "发言太快，请稍候", request_id)
+                return
+            times.append(now)
+            room.chat_sent_times[conn.user_id] = times
+
+            payload = {
+                "kind": kind,
+                "content": normalized,
+                "sender_id": conn.user_id,
+                "sender_name": conn.username,
+                "sent_at_ms": _now_ms(),
+            }
+            # 广播给房间内所有连接（含发送者本人，双方看到同样的弹幕）。
+            message = make_message(SERVER_CHAT, payload)
+            for other in list(room.connections.values()):
+                await other.send(message)
 
     # ------------------------------------------------------------------
     # 时钟

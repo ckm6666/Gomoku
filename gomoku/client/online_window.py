@@ -11,12 +11,13 @@ import logging
 import time
 from typing import Mapping, Optional
 
-from PySide6.QtCore import QUrl, Qt, QTimer
+from PySide6.QtCore import QSettings, QUrl, Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -35,6 +36,11 @@ from PySide6.QtWidgets import (
 from gomoku.client.audio import get_audio_manager
 from gomoku.client.auth import AuthSession
 from gomoku.client.board_view import BoardView
+from gomoku.client.chat_widgets import (
+    ChatLogPanel,
+    EmojiPickerButton,
+    PresetCommentButton,
+)
 from gomoku.client.ui_theme import ONLINE_BACKDROP_SPEC, InkBackdrop
 from gomoku.client.board_widget import BoardWidget
 from gomoku.client.config import AppConfig
@@ -45,16 +51,28 @@ from gomoku.client.constants import (
     WINDOW_MIN_WIDTH,
     WINDOW_SCREEN_MARGIN,
 )
+from gomoku.client.danmaku import DanmakuOverlay
 from gomoku.client.net.http_api import AuthHTTPClient
 from gomoku.client.net.profile_api import ProfileHTTPClient
 from gomoku.client.net.websocket_transport import QtWebSocketTransport
 from gomoku.client.sessions.online import OnlineGameSession
 from gomoku.client.sound_control import SoundButton
+from gomoku.shared.chat import (
+    CHAT_KIND_EMOJI,
+    CHAT_KIND_TEXT,
+    MAX_COMMENT_LENGTH,
+    ChatMessage,
+)
 from gomoku.shared.errors import TransportError
 from gomoku.shared.protocol import GameSnapshot
 from gomoku.shared.rules import BOARD_SIZE, Cell, Player
 
 logger = logging.getLogger(__name__)
+
+#: 输入框的常规占位提示。
+CHAT_INPUT_HINT = "说点什么…（回车发送）"
+#: 对话日志展开状态在 QSettings 里的键名。
+SETTINGS_CHAT_LOG_VISIBLE = "chat_log_visible"
 
 _EMPTY_BOARD: tuple[tuple[Cell, ...], ...] = tuple(
     tuple(None for _ in range(BOARD_SIZE)) for _ in range(BOARD_SIZE)
@@ -161,6 +179,10 @@ class OnlineWindow(QMainWindow):
         self._leaderboard_entries: list = []
         self._auto_requeue = False
         self._refresh_after_auth_refresh = False
+        # 对话日志的展开状态（逻辑值，不受页面是否在前台影响）。
+        self._chat_log_expanded = False
+        # 用户偏好（对话日志展开状态）通过 QSettings 持久化。
+        self._settings = QSettings()
 
         self._api_base_url, self._ws_url = self._resolve_urls()
         self._auth_client = AuthHTTPClient(
@@ -589,8 +611,8 @@ class OnlineWindow(QMainWindow):
         page = QWidget(self)
         page.setObjectName("onlinePage")
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(10)
+        layout.setContentsMargins(6, 12, 6, 12)
+        layout.setSpacing(8)
 
         top = QHBoxLayout()
         self.room_title_label = QLabel("好友房", page)
@@ -611,10 +633,31 @@ class OnlineWindow(QMainWindow):
         cards.addWidget(self.opponent_card, 1)
         layout.addLayout(cards)
 
-        self.board_widget = BoardWidget(_empty_view(), page)
+        # 棋盘与对话日志并排：左侧棋盘，右侧只读对话日志。
+        play_area = QHBoxLayout()
+        play_area.setSpacing(6)
+
+        left_column = QVBoxLayout()
+        left_column.setSpacing(8)
+
+        # 棋盘容器：弹幕覆盖层与棋盘叠放在同一个网格单元格中。
+        self.board_container = QWidget(page)
+        self.board_container.setObjectName("boardContainer")
+        board_grid = QGridLayout(self.board_container)
+        board_grid.setContentsMargins(0, 0, 0, 0)
+        board_grid.setSpacing(0)
+
+        self.board_widget = BoardWidget(_empty_view(), self.board_container)
         self.board_widget.set_interaction_enabled(False)
         self.board_widget.cell_clicked.connect(self._on_board_clicked)
-        layout.addWidget(self.board_widget, 1)
+        board_grid.addWidget(self.board_widget, 0, 0)
+
+        self.danmaku_overlay = DanmakuOverlay(self.board_container)
+        board_grid.addWidget(self.danmaku_overlay, 0, 0)
+        # 让弹幕以棋面（居中的正方形）为活动范围，而不是控件留白。
+        self.danmaku_overlay.set_board_widget(self.board_widget)
+
+        left_column.addWidget(self.board_container, 1)
 
         info = QHBoxLayout()
         info.setSpacing(10)
@@ -631,7 +674,48 @@ class OnlineWindow(QMainWindow):
         info.addWidget(self.clock_label)
         info.addStretch(1)
         info.addWidget(self.move_label)
-        layout.addLayout(info)
+        left_column.addLayout(info)
+
+        self.chat_log = ChatLogPanel(page)
+        self.chat_log.setObjectName("chatLogPanel")
+        self.chat_log.setMinimumWidth(210)
+        self.chat_log.setMaximumWidth(300)
+        self.chat_log.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding
+        )
+
+        play_area.addLayout(left_column, 1)
+        play_area.addWidget(self.chat_log, 0)
+        layout.addLayout(play_area, 1)
+
+        # 聊天输入栏：表情、快捷评论与手动输入。
+        chat_bar = QHBoxLayout()
+        chat_bar.setSpacing(8)
+        self.emoji_button = EmojiPickerButton(page)
+        self.preset_comment_button = PresetCommentButton(page)
+        self.chat_log_toggle_button = QPushButton("对话日志", page)
+        self.chat_log_toggle_button.setObjectName("chatLogToggleButton")
+        self.chat_log_toggle_button.setCheckable(True)
+        self.chat_input = QLineEdit(page)
+        self.chat_input.setObjectName("chatInput")
+        self.chat_input.setMaxLength(MAX_COMMENT_LENGTH)
+        self.chat_input.setPlaceholderText(CHAT_INPUT_HINT)
+        self.chat_send_button = QPushButton("发送", page)
+        self.chat_send_button.setObjectName("chatSendButton")
+        for button in (
+            self.emoji_button,
+            self.preset_comment_button,
+            self.chat_log_toggle_button,
+            self.chat_send_button,
+        ):
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setAutoDefault(False)
+        chat_bar.addWidget(self.emoji_button)
+        chat_bar.addWidget(self.preset_comment_button)
+        chat_bar.addWidget(self.chat_input, 1)
+        chat_bar.addWidget(self.chat_send_button)
+        chat_bar.addWidget(self.chat_log_toggle_button)
+        layout.addLayout(chat_bar)
 
         self.game_rating_label = QLabel(page)
         self.game_rating_label.setObjectName("onlineRatingResult")
@@ -668,6 +752,18 @@ class OnlineWindow(QMainWindow):
         self.resign_button.clicked.connect(self._on_resign)
         self.rematch_button.clicked.connect(self._on_rematch)
         self.leave_button.clicked.connect(self._on_leave_room)
+        self.emoji_button.emoji_picked.connect(self._on_emoji_picked)
+        self.preset_comment_button.comment_picked.connect(
+            self._on_preset_comment_picked
+        )
+        self.chat_send_button.clicked.connect(self._on_send_comment)
+        self.chat_input.returnPressed.connect(self._on_send_comment)
+        self.chat_log_toggle_button.toggled.connect(
+            self._on_chat_log_toggled
+        )
+        # 对话日志默认收起：棋盘可以占满整行，需要时再点开。
+        self._apply_chat_log_visibility(self._load_chat_log_visible())
+        self._refresh_chat_controls()
         return page
 
     # ------------------------------------------------------------------
@@ -1062,6 +1158,8 @@ class OnlineWindow(QMainWindow):
             self._on_queue_status_changed
         )
         session.matched.connect(self._on_match_found)
+        session.chat_received.connect(self._on_chat_received)
+        session.chat_failed.connect(self._on_chat_failed)
 
         self._open_transport(reset_status=True)
 
@@ -1278,6 +1376,8 @@ class OnlineWindow(QMainWindow):
         if self.sender() is not self._session:
             return
         self._room_action_pending = False
+        # 新的排位对局开始，旧房间的聊天记录不再保留。
+        self._clear_chat_area()
         self._set_lobby_status("")
         self._set_match_status(
             f"已匹配到 {opponent_name}，正在载入棋局…"
@@ -1286,6 +1386,8 @@ class OnlineWindow(QMainWindow):
 
     def _on_room_created(self, code: str) -> None:
         self._room_action_pending = False
+        # 新房间 = 新的对话上下文，旧房间的聊天记录不再保留。
+        self._clear_chat_area()
         self.room_code_edit.clear()
         self._set_match_status("")
         self._show_game_page()
@@ -1299,10 +1401,138 @@ class OnlineWindow(QMainWindow):
         self.game_rating_label.clear()
         self.game_rating_label.setVisible(False)
         self._set_match_status("")
+        # 房间关闭后清空对话日志与在飞弹幕。
+        self._clear_chat_area()
         self._show_lobby_page(reason)
         if self._auto_requeue:
             self._auto_requeue = False
             QTimer.singleShot(0, self._on_quick_match)
+
+    # ------------------------------------------------------------------
+    # 表情/评论
+    # ------------------------------------------------------------------
+    def _on_chat_received(self, message: ChatMessage) -> None:
+        """收到服务端广播的表情/评论：飞弹幕并写入对话日志。"""
+        if self.sender() is not self._session or self._closing:
+            return
+        is_self = bool(
+            self._session is not None
+            and message.sender_id == self._session.user_id
+        )
+        if message.kind == CHAT_KIND_EMOJI:
+            self.danmaku_overlay.push_emoji(message.content, is_self)
+        elif message.kind == CHAT_KIND_TEXT:
+            self.danmaku_overlay.push_text(message.content, is_self)
+        self.chat_log.append_message(message, is_self)
+
+    def _on_emoji_picked(self, emoji: str) -> None:
+        """发送用户选中的预设表情。"""
+        if self._session is not None:
+            self._session.send_emoji(emoji)
+
+    def _on_chat_failed(self, reason: str) -> None:
+        """发言失败：提示在聊天区域，不打断对局。
+
+        提示同时出现在两处：对话日志里留一条记录，日志收起时则改用
+        输入框的占位提示——对话日志默认是收起的，不能让失败提示跟着
+        一起消失。两种提示都不会在对局页上多占一行垂直空间，避免把
+        棋盘挤小、裁掉棋盘下沿。
+        """
+        if self.sender() is not self._session or self._closing:
+            return
+        text = reason or "发言未发送"
+        self.chat_log.append_notice(f"（{text}）")
+        if not self._chat_log_expanded:
+            self._flash_chat_hint(text)
+
+    def _flash_chat_hint(self, text: str) -> None:
+        """把提示临时显示在输入框的占位文字上。"""
+        self.chat_input.setPlaceholderText(text)
+        QTimer.singleShot(3000, self._restore_chat_hint)
+
+    def _restore_chat_hint(self) -> None:
+        """恢复输入框的常规占位提示。"""
+        if not self._closing:
+            self.chat_input.setPlaceholderText(CHAT_INPUT_HINT)
+
+    def _on_chat_log_toggled(self, checked: bool) -> None:
+        """对话日志的展开/收起。"""
+        self._apply_chat_log_visibility(checked)
+        self._save_chat_log_visible(checked)
+
+    def _apply_chat_log_visibility(self, visible: bool) -> None:
+        """显示或隐藏对话日志，并同步按钮状态。"""
+        expanded = bool(visible)
+        # 记录逻辑状态：chat_log.isVisible() 还会受父级页面是否显示
+        # 的影响，对局页不在前台时它恒为 False，不能拿来判断"用户
+        # 是否展开了日志"。
+        self._chat_log_expanded = expanded
+        self.chat_log.setVisible(expanded)
+        button = self.chat_log_toggle_button
+        # 程序化设置勾选状态时不要触发 toggled，否则会绕一圈回来。
+        button.blockSignals(True)
+        button.setChecked(expanded)
+        button.blockSignals(False)
+        button.setText("隐藏日志" if expanded else "对话日志")
+        button.setToolTip(
+            "收起对话日志，让棋盘占满整行"
+            if expanded
+            else "展开对话日志，查看双方的发言"
+        )
+
+    def _load_chat_log_visible(self) -> bool:
+        """读取上次的对话日志展开状态；没有记录时默认收起。"""
+        value = self._settings.value(SETTINGS_CHAT_LOG_VISIBLE, False)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes")
+        return False
+
+    def _save_chat_log_visible(self, visible: bool) -> None:
+        """记住对话日志的展开状态。"""
+        self._settings.setValue(SETTINGS_CHAT_LOG_VISIBLE, bool(visible))
+        self._settings.sync()
+
+    def _on_preset_comment_picked(self, text: str) -> None:
+        """发送用户选中的预设评论。"""
+        if self._session is not None:
+            self._session.send_comment(text)
+
+    def _on_send_comment(self) -> None:
+        """发送手动输入的评论；发送成功后清空输入框。"""
+        if self._session is None:
+            return
+        text = self.chat_input.text().strip()
+        if not text:
+            return
+        if self._session.send_comment(text):
+            self.chat_input.clear()
+
+    def _refresh_chat_controls(self) -> None:
+        """按当前会话状态启用或禁用聊天输入控件。
+
+        这里用的是 chat_available 而不是 can_send_chat：后者还包含
+        发言冷却，如果拿它去禁用输入框，Qt 会把焦点从被禁用的控件
+        上摘走，用户每发一条消息都得重新点回输入框。
+        """
+        chat_input = getattr(self, "chat_input", None)
+        if chat_input is None:
+            return
+        enabled = (
+            self._session is not None
+            and self._ws_connected
+            and self._session.chat_available
+        )
+        chat_input.setEnabled(enabled)
+        self.chat_send_button.setEnabled(enabled)
+        self.emoji_button.set_emoji_enabled(enabled)
+        self.preset_comment_button.setEnabled(enabled)
+
+    def _clear_chat_area(self) -> None:
+        """清空对话日志与在飞的弹幕。"""
+        self.chat_log.clear_log()
+        self.danmaku_overlay.clear()
 
     def _on_board_clicked(self, row: int, col: int) -> None:
         if self._session is not None and self._session.accepts_human_input:
@@ -1390,6 +1620,7 @@ class OnlineWindow(QMainWindow):
             self.game_error_label.setText(message)
 
     def _sync_online_ui(self) -> None:
+        self._refresh_chat_controls()
         if self._session is None:
             return
         session = self._session
@@ -1406,6 +1637,7 @@ class OnlineWindow(QMainWindow):
             self._refresh_lobby_controls()
 
     def _sync_game_page(self) -> None:
+        self._refresh_chat_controls()
         session = self._session
         if session is None:
             return
@@ -1651,6 +1883,8 @@ class OnlineWindow(QMainWindow):
         self.leave_button.setVisible(leave)
 
     def _update_clock_label(self) -> None:
+        # 聊天控件状态每次心跳都刷新一次（即使当前没有对局）。
+        self._refresh_chat_controls()
         if (
             self._session is None
             or self._session.snapshot is None
@@ -1684,6 +1918,8 @@ class OnlineWindow(QMainWindow):
         self._auth_client.abort()
         self._profile_client.abort_all()
         self._teardown_ws()
+        if hasattr(self, "danmaku_overlay"):
+            self.danmaku_overlay.clear()
         super().closeEvent(event)
 
 
