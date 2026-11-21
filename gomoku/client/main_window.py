@@ -3,7 +3,7 @@
 对局规则、棋盘状态、AI 线程和本地悔棋语义都已下沉到
 :mod:`gomoku.client.sessions`。MainWindow 只负责：
 
-* 主菜单导航（联机/双人/人机/残局占位/退出）与对局页切换；
+* 主菜单导航（联机/双人/人机/残局/棋谱/退出）与页面切换；
 * 绘制/更新界面，读取 GameSession 的只读 BoardView；
 * 难度、先手方的用户交互与确认；
 * 在需要时暂停会话、显示终局弹窗；
@@ -16,8 +16,10 @@
 from __future__ import annotations
 
 import logging
+import uuid
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 from PySide6.QtCore import QPointF, Qt, QTimer
 from PySide6.QtGui import (
@@ -61,11 +63,16 @@ from gomoku.client.constants import (
     WINDOW_SCREEN_MARGIN,
 )
 from gomoku.client.online_window import OnlineWindow
+from gomoku.client.puzzle_bank import load_puzzle_bank
+from gomoku.client.puzzle_page import PuzzlePage
+from gomoku.client.records import LocalRecordStore
+from gomoku.client.replay_window import ReplayWindow
 from gomoku.client.result_dialog import ResultDialog, ResultPresentation
 from gomoku.client.sessions import (
     AIGameSession,
     GameSession,
     LocalGameSession,
+    PuzzleSession,
 )
 from gomoku.client.sound_control import SoundButton
 from gomoku.client.theme_palette import INK_FAINT, INK_MUTED
@@ -76,6 +83,8 @@ from gomoku.client.ui_theme import (
     RicePaperCard,
 )
 from gomoku.shared.game_model import GameModel
+from gomoku.shared.puzzle import Puzzle
+from gomoku.shared.record import GameRecord
 from gomoku.shared.rules import Player
 
 logger = logging.getLogger(__name__)
@@ -86,11 +95,16 @@ class GameMode(Enum):
 
     LOCAL = "local"
     AI = "ai"
+    PUZZLE = "puzzle"
 
     @property
     def label(self) -> str:
         """返回界面展示名称。"""
-        return "双人对战" if self is GameMode.LOCAL else "人机对战"
+        return {
+            GameMode.LOCAL: "双人对战",
+            GameMode.AI: "人机对战",
+            GameMode.PUZZLE: "残局挑战",
+        }[self]
 
 
 class ThemedComboBox(QComboBox):
@@ -213,10 +227,26 @@ class PlayerCard(QFrame):
 class MainWindow(QMainWindow):
     """应用主窗口。"""
 
-    def __init__(self, config: Optional[AppConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[AppConfig] = None,
+        *,
+        puzzles: Optional[Sequence[Puzzle]] = None,
+        record_store: Optional[LocalRecordStore] = None,
+    ) -> None:
         super().__init__()
         # 服务器地址等非敏感配置传给独立联机窗口；本地棋盘不联网。
         self.config = config or AppConfig()
+
+        # 残局题库/进度与本地棋谱；测试可注入临时目录/固定题库。
+        self._puzzles = (
+            tuple(puzzles) if puzzles is not None else load_puzzle_bank()
+        )
+        self._record_store = record_store or LocalRecordStore()
+        self._current_puzzle: Optional[Puzzle] = None
+        self._puzzle_result: Optional[tuple[bool, str]] = None
+        self._recorded_generation = -1
+        self._replay_window: Optional[ReplayWindow] = None
 
         # 对局配置：默认保持本地双人，切到人机模式后默认中等难度。
         self._game_mode = GameMode.LOCAL
@@ -228,6 +258,8 @@ class MainWindow(QMainWindow):
         self._modal_dialog_open = False
         self._closing = False
         self._syncing_settings = False
+        # 提示结果显示后，_sync_ui 不应立即覆盖“备选着法”tooltip。
+        self._hint_tooltip_active = False
 
         # 每次会话替换/撤销递增，用于丢弃过期终局弹窗定时器。
         self._game_generation = 0
@@ -270,9 +302,15 @@ class MainWindow(QMainWindow):
         return self._human_player.opponent
 
     def _make_session(self) -> GameSession:
-        """按当前模式创建本地/AI 会话并连接统一信号。"""
-        if self._game_mode is GameMode.AI:
-            session: GameSession = AIGameSession(
+        """按当前模式创建会话并连接统一信号。"""
+        if self._game_mode is GameMode.PUZZLE:
+            if self._current_puzzle is None:
+                # 启动占位/异常兜底：没有选关时不创建残局会话。
+                session: GameSession = LocalGameSession()
+            else:
+                session = PuzzleSession(self._current_puzzle)
+        elif self._game_mode is GameMode.AI:
+            session = AIGameSession(
                 human_player=self._human_player,
                 difficulty=self._difficulty,
             )
@@ -283,6 +321,11 @@ class MainWindow(QMainWindow):
         session.stone_placed.connect(self._on_session_stone_placed)
         session.game_over.connect(self._on_session_game_over)
         session.error.connect(self._on_session_error)
+        if isinstance(session, PuzzleSession):
+            session.puzzle_finished.connect(self._on_puzzle_finished)
+        if isinstance(session, AIGameSession):
+            session.hint_ready.connect(self._on_ai_hint_ready)
+            session.hint_failed.connect(self._on_ai_hint_failed)
         return session
 
     def _replace_session(self) -> None:
@@ -294,6 +337,8 @@ class MainWindow(QMainWindow):
         old_session = self._session
         old_session.shutdown()
 
+        self._puzzle_result = None
+        self._clear_hint_display()
         self._session = self._make_session()
         self._game_generation += 1
         self._sync_ui()
@@ -334,12 +379,87 @@ class MainWindow(QMainWindow):
         if self.sender() is not self._session or self._closing:
             return
         get_audio_manager().play_move()
+        # 棋盘已变化，旧提示（文字与标记）立即失效。
+        self._clear_hint_display()
 
     def _on_session_game_over(self) -> None:
         if self.sender() is not self._session or self._closing:
             return
+        self._clear_hint_display()
+        self._record_current_game()
         self._play_game_over_sound()
         self._schedule_result_dialog()
+
+    def _on_puzzle_finished(self, success: bool, reason: str) -> None:
+        """残局成功/失败：记录棋谱、更新进度并展示结果。"""
+        if self.sender() is not self._session or self._closing:
+            return
+        session = self._session
+        if not isinstance(session, PuzzleSession):
+            return
+
+        self._puzzle_result = (success, reason)
+        self._record_current_game()
+        if success:
+            get_audio_manager().play_win()
+        else:
+            get_audio_manager().play_lose()
+
+        self._sync_ui()
+        self._schedule_result_dialog()
+
+    def _record_current_game(self) -> None:
+        """把已结束的本地/AI 对局写入本地棋谱；残局不记录成功。"""
+        if self._recorded_generation == self._game_generation:
+            return
+        if self._game_mode is GameMode.PUZZLE:
+            return
+        session = self._session
+        model = session.model
+        if model is None or not model.is_game_over:
+            return
+
+        mode = "local" if self._game_mode is GameMode.LOCAL else "ai"
+        if model.winner is not None:
+            result_reason = "five"
+        elif model.is_draw:
+            result_reason = "draw"
+        else:
+            result_reason = ""
+        metadata = {}
+
+        human = session.human_player
+        if self._game_mode is GameMode.AI:
+            ai_label = f"AI（{self._difficulty.label}）"
+            black_name = "你" if human is Player.BLACK else ai_label
+            white_name = "你" if human is Player.WHITE else ai_label
+            metadata["ai_difficulty"] = self._difficulty.value
+            metadata["human_color"] = (
+                human.value if human is not None else ""
+            )
+        else:
+            black_name = "黑棋"
+            white_name = "白棋"
+
+        record = GameRecord(
+            record_id=uuid.uuid4().hex,
+            created_at=datetime.now(timezone.utc).isoformat(
+                timespec="seconds"
+            ),
+            mode=mode,
+            moves=tuple(model.moves),
+            winner=model.winner,
+            result_reason=result_reason,
+            black_name=black_name,
+            white_name=white_name,
+            rated=False,
+            metadata=metadata,
+        )
+        try:
+            self._record_store.append(record)
+        except Exception:
+            logger.exception("保存本地棋谱失败")
+        self._recorded_generation = self._game_generation
 
     def _play_start_sound(self) -> None:
         if not self._closing:
@@ -371,7 +491,7 @@ class MainWindow(QMainWindow):
     # 界面搭建
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        """创建主菜单/对局两页堆栈，应用启动时显示主菜单。"""
+        """创建主菜单/残局列表/对局三页堆栈，启动时显示主菜单。"""
         central_widget = QWidget(self)
         central_widget.setObjectName("centralWidget")
         central_widget.setAttribute(
@@ -385,8 +505,14 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget(central_widget)
         self.stack.setObjectName("mainStack")
         self.menu_page = self._build_menu_page()
+        self.puzzle_page = PuzzlePage(self._puzzles, self.stack)
+        self.puzzle_page.puzzle_selected.connect(self._start_puzzle)
+        self.puzzle_page.back_requested.connect(
+            self._return_to_menu_from_puzzle
+        )
         self.game_page = self._build_game_page()
         self.stack.addWidget(self.menu_page)
+        self.stack.addWidget(self.puzzle_page)
         self.stack.addWidget(self.game_page)
         self.stack.setCurrentWidget(self.menu_page)
 
@@ -424,7 +550,9 @@ class MainWindow(QMainWindow):
         title.setObjectName("menuTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        subtitle = QLabel("双人对弈、人机过招、联机排位", self.menu_card)
+        subtitle = QLabel(
+            "双人、人机、残局、联机排位与棋谱复盘", self.menu_card
+        )
         subtitle.setObjectName("menuSubtitle")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setWordWrap(True)
@@ -461,8 +589,14 @@ class MainWindow(QMainWindow):
         self.puzzle_button = self._make_menu_button(
             "残局挑战",
             "menuButton",
-            "残局挑战即将上线",
-            self._show_puzzle_placeholder,
+            "限手数残局，考验攻杀与算计",
+            self._open_puzzle_page,
+        )
+        self.replay_button = self._make_menu_button(
+            "棋谱复盘",
+            "menuButton",
+            "查看并逐步回放最近的本地棋谱",
+            self._open_replay_window,
         )
         self.exit_button = self._make_menu_button(
             "退出游戏",
@@ -476,6 +610,7 @@ class MainWindow(QMainWindow):
             self.local_button,
             self.ai_button,
             self.puzzle_button,
+            self.replay_button,
         ):
             card_layout.addWidget(button)
         card_layout.addSpacing(4)
@@ -543,7 +678,7 @@ class MainWindow(QMainWindow):
         title_label = QLabel(APP_NAME, self)
         title_label.setObjectName("brandTitle")
         subtitle_label = QLabel(
-            "双人 / 人机 / 联机排位，连成五子即胜", self
+            "双人 / 人机 / 残局 / 联机排位，连成五子即胜", self
         )
         subtitle_label.setObjectName("brandSubtitle")
 
@@ -615,10 +750,14 @@ class MainWindow(QMainWindow):
         )
         self.local_mode_label = QLabel("双人对战，轮流落子", settings_bar)
         self.local_mode_label.setObjectName("settingsLabel")
+        self.puzzle_info_label = QLabel("", settings_bar)
+        self.puzzle_info_label.setObjectName("settingsLabel")
+        self.puzzle_info_label.setVisible(False)
 
         bar_layout.addWidget(self.difficulty_group)
         bar_layout.addWidget(self.first_group)
         bar_layout.addWidget(self.local_mode_label)
+        bar_layout.addWidget(self.puzzle_info_label)
         bar_layout.addStretch(1)
 
         # 声音设置与模式设置同栏，不参与 AI 回合的锁定逻辑。
@@ -671,9 +810,14 @@ class MainWindow(QMainWindow):
         self.move_label.setObjectName("moveInfo")
         hint_label = QLabel("Ctrl+Z 悔棋    Ctrl+N 重新开局", self)
         hint_label.setObjectName("hintLabel")
+        self.puzzle_hint_label = QLabel("", self)
+        self.puzzle_hint_label.setObjectName("hintLabel")
+        self.puzzle_hint_label.setWordWrap(True)
+        self.puzzle_hint_label.setVisible(False)
 
         info_layout.addWidget(self.move_label)
         info_layout.addWidget(hint_label)
+        info_layout.addWidget(self.puzzle_hint_label)
 
         self.menu_back_button = QPushButton("返回主菜单", self)
         self.menu_back_button.setObjectName("menuBackButton")
@@ -682,7 +826,16 @@ class MainWindow(QMainWindow):
         self.menu_back_button.setMinimumWidth(104)
         self.menu_back_button.setMinimumHeight(38)
         self.menu_back_button.setAutoDefault(False)
-        self.menu_back_button.clicked.connect(self.show_main_menu)
+        self.menu_back_button.clicked.connect(self._on_back_requested)
+
+        self.hint_button = QPushButton("提示", self)
+        self.hint_button.setObjectName("undoButton")
+        self.hint_button.setToolTip("查看提示")
+        self.hint_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.hint_button.setMinimumWidth(74)
+        self.hint_button.setMinimumHeight(38)
+        self.hint_button.setAutoDefault(False)
+        self.hint_button.setVisible(False)
 
         self.undo_button = QPushButton("悔棋", self)
         self.undo_button.setObjectName("undoButton")
@@ -700,12 +853,14 @@ class MainWindow(QMainWindow):
         self.restart_button.setMinimumHeight(38)
         self.restart_button.setAutoDefault(False)
 
+        self.hint_button.clicked.connect(self._request_hint)
         self.undo_button.clicked.connect(self._undo_move)
         self.restart_button.clicked.connect(self._request_restart)
 
         footer_layout.addLayout(info_layout)
         footer_layout.addStretch(1)
         footer_layout.addWidget(self.menu_back_button)
+        footer_layout.addWidget(self.hint_button)
         footer_layout.addWidget(self.undo_button)
         footer_layout.addWidget(self.restart_button)
         return footer_layout
@@ -750,6 +905,13 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.game_page)
         self._set_game_shortcuts_enabled(True)
 
+    def _on_back_requested(self) -> None:
+        """对局页“返回”按钮：残局回列表，其余回主菜单。"""
+        if self._game_mode is GameMode.PUZZLE:
+            self._request_puzzle_list()
+        else:
+            self.show_main_menu()
+
     def show_main_menu(self) -> None:
         """返回主菜单；进行中的棋局需要确认放弃。"""
         if (
@@ -778,24 +940,108 @@ class MainWindow(QMainWindow):
         self._set_game_shortcuts_enabled(False)
         self.online_button.setFocus()
 
-    def _show_puzzle_placeholder(self) -> None:
-        """残局挑战入口占位提示。"""
+    def _open_puzzle_page(self) -> None:
+        """从主菜单打开残局关卡列表。"""
+        if (
+            self._closing
+            or self._modal_dialog_open
+            or self._result_dialog_open
+        ):
+            return
+        self._session.pause()
+        self.stack.setCurrentWidget(self.puzzle_page)
+        self._set_game_shortcuts_enabled(False)
+        self.puzzle_page.back_button.setFocus()
+
+    def _return_to_menu_from_puzzle(self) -> None:
+        """残局列表返回主菜单。"""
         if self._closing or self._modal_dialog_open:
             return
-        self._modal_dialog_open = True
+        self._session.pause()
+        self.stack.setCurrentWidget(self.menu_page)
+        self._set_game_shortcuts_enabled(False)
+        self.online_button.setFocus()
+
+    def _start_puzzle(self, puzzle: object) -> None:
+        """从关卡列表进入选定残局。"""
+        if not isinstance(puzzle, Puzzle):
+            return
+        if (
+            self._closing
+            or self._modal_dialog_open
+            or self._result_dialog_open
+        ):
+            return
+        self._current_puzzle = puzzle
+        self._game_mode = GameMode.PUZZLE
+        self._puzzle_result = None
+        self._replace_session()
+        self.stack.setCurrentWidget(self.game_page)
+        self._set_game_shortcuts_enabled(True)
+        self.board_widget.setFocus()
+
+    def _request_puzzle_list(self) -> None:
+        """从残局对局返回关卡列表；进行中的残局需要确认。"""
+        if (
+            self._closing
+            or self._modal_dialog_open
+            or self._result_dialog_open
+        ):
+            return
+        session = self._session
+        if (
+            isinstance(session, PuzzleSession)
+            and not session.finished
+            and session.player_moves > 0
+        ):
+            session.pause()
+            if not self._confirm_discard_game(
+                "返回残局列表",
+                "返回残局列表将放弃当前残局，确定要返回吗？",
+                confirm_text="返回残局列表",
+            ):
+                session.resume()
+                self._sync_ui()
+                return
+
+        self._game_generation += 1
+        self.stack.setCurrentWidget(self.puzzle_page)
+        self._set_game_shortcuts_enabled(False)
+        self.puzzle_page.back_button.setFocus()
+
+    def _open_replay_window(self) -> None:
+        """打开本地棋谱复盘窗口。"""
+        if (
+            self._closing
+            or self._modal_dialog_open
+            or self._result_dialog_open
+        ):
+            return
         try:
-            box = QMessageBox(self)
-            box.setWindowTitle("残局挑战")
-            box.setIcon(QMessageBox.Icon.Information)
-            box.setTextFormat(Qt.TextFormat.PlainText)
-            box.setText("残局挑战即将上线，敬请期待。")
-            ok_button = box.addButton(
-                "知道了", QMessageBox.ButtonRole.AcceptRole
-            )
-            box.setDefaultButton(ok_button)
-            box.exec()
-        finally:
-            self._modal_dialog_open = False
+            records = self._record_store.list_recent(50)
+        except Exception:
+            logger.exception("读取本地棋谱失败")
+            records = ()
+
+        existing = self._replay_window
+        if existing is not None:
+            try:
+                existing.close()
+            except RuntimeError:
+                pass
+            self._replay_window = None
+
+        window = ReplayWindow(records, self)
+        window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        window.destroyed.connect(self._on_replay_window_destroyed)
+        self._replay_window = window
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _on_replay_window_destroyed(self, *_args) -> None:
+        if self.sender() is self._replay_window:
+            self._replay_window = None
 
     def _exit_game(self) -> None:
         """退出应用；closeEvent 负责关闭联机窗口与后台线程。"""
@@ -807,8 +1053,10 @@ class MainWindow(QMainWindow):
         return self.stack.currentWidget() is self.game_page
 
     def _set_game_shortcuts_enabled(self, enabled: bool) -> None:
-        """菜单页禁用 Ctrl+Z/Ctrl+N，进入对局后恢复。"""
-        self._undo_shortcut.setEnabled(enabled)
+        """菜单页禁用 Ctrl+Z/Ctrl+N；残局不提供悔棋。"""
+        self._undo_shortcut.setEnabled(
+            enabled and self._game_mode is not GameMode.PUZZLE
+        )
         self._restart_shortcut.setEnabled(enabled)
 
     def _open_online_window(self) -> None:
@@ -885,11 +1133,24 @@ class MainWindow(QMainWindow):
 
             settings_enabled = not self._closing and not self._session.busy
             ai_mode = self._game_mode is GameMode.AI
+            puzzle_mode = self._game_mode is GameMode.PUZZLE
 
-            # 双人模式不展示 AI 难度/先手选择，保持设置栏简洁。
+            # 双人/残局不展示 AI 难度/先手选择，保持设置栏简洁。
             self.difficulty_group.setVisible(ai_mode)
             self.first_group.setVisible(ai_mode)
-            self.local_mode_label.setVisible(not ai_mode)
+            self.local_mode_label.setVisible(
+                self._game_mode is GameMode.LOCAL
+            )
+            self.puzzle_info_label.setVisible(puzzle_mode)
+            if puzzle_mode:
+                puzzle = self._current_puzzle
+                if puzzle is not None:
+                    self.puzzle_info_label.setText(
+                        f"残局：{puzzle.title} · "
+                        f"限 {puzzle.max_player_moves} 手"
+                    )
+                else:
+                    self.puzzle_info_label.setText("残局")
 
             self.difficulty_combo.setEnabled(settings_enabled and ai_mode)
             self.first_combo.setEnabled(settings_enabled and ai_mode)
@@ -935,6 +1196,7 @@ class MainWindow(QMainWindow):
 
         self._difficulty = desired
         self._session.set_difficulty(desired)
+        self._clear_hint_display()
         self._sync_ui()
 
     # ------------------------------------------------------------------
@@ -959,7 +1221,116 @@ class MainWindow(QMainWindow):
 
         if self._session.request_undo():
             self._game_generation += 1
+            self._clear_hint_display()
             self._sync_ui()
+
+    def _request_hint(self) -> None:
+        """按模式请求提示：残局显示文字，人机模式请求 AI 分析。"""
+        if (
+            self._closing
+            or self._modal_dialog_open
+            or self._result_dialog_open
+            or not self._is_game_page_active()
+        ):
+            return
+
+        if self._game_mode is GameMode.PUZZLE:
+            self._show_puzzle_hint()
+            return
+        if self._game_mode is not GameMode.AI:
+            return
+
+        session = self._session
+        if not isinstance(session, AIGameSession) or not session.can_hint:
+            return
+        if session.request_hint():
+            self._hint_tooltip_active = False
+            self.puzzle_hint_label.setText("提示：正在分析局面…")
+            self.puzzle_hint_label.setVisible(True)
+            self.hint_button.setEnabled(False)
+
+    def _show_puzzle_hint(self) -> None:
+        """在当前残局中展示题库提供的文字提示。"""
+        if self._game_mode is not GameMode.PUZZLE:
+            return
+        session = self._session
+        if not isinstance(session, PuzzleSession):
+            return
+        hint = session.hint or session.puzzle.description
+        if not hint:
+            hint = "观察棋盘上的双威胁，优先制造对手无法同时封堵的棋形。"
+        self.puzzle_hint_label.setText(f"提示：{hint}")
+        self.puzzle_hint_label.setVisible(True)
+
+    def _on_ai_hint_ready(self, analysis: object) -> None:
+        """显示后台分析返回的推荐落点、评分与候选。"""
+        if self.sender() is not self._session or self._closing:
+            return
+
+        session = self._session
+        move = getattr(analysis, "best_move", None)
+        if not isinstance(session, AIGameSession) or move is None:
+            return
+        row, col = move
+        self.board_widget.set_hint_cell(move, session.model.move_count)
+
+        coordinate = self._format_board_coordinate(row, col)
+        source = getattr(analysis, "source", "search")
+        if source == "vcf":
+            text = f"提示：{coordinate}，VCF 强制胜"
+        elif source == "vct":
+            text = f"提示：{coordinate}，双威胁强制胜"
+        elif source == "forced":
+            text = f"提示：{coordinate}，可直接成五"
+        elif source == "block":
+            text = f"提示：{coordinate}，必须封堵对手"
+        elif source == "book":
+            text = f"提示：{coordinate}（开局库）"
+        else:
+            depth = getattr(analysis, "completed_depth", 0)
+            score = getattr(analysis, "best_score", 0)
+            text = (
+                f"提示：推荐 {coordinate}"
+                f"（深度 {depth}，评分 {score:+d}）"
+            )
+        self.puzzle_hint_label.setText(text)
+        self.puzzle_hint_label.setVisible(True)
+
+        alternatives = [
+            candidate
+            for candidate in getattr(analysis, "candidates", ())
+            if candidate.move != move
+        ][:2]
+        if alternatives:
+            parts = [
+                f"{self._format_board_coordinate(*candidate.move)}"
+                f"（{candidate.score:+d}）"
+                for candidate in alternatives
+            ]
+            self.hint_button.setToolTip("备选：" + "，".join(parts))
+            self._hint_tooltip_active = True
+
+    def _on_ai_hint_failed(self, message: str) -> None:
+        """提示分析失败时给出简短反馈，不阻断对局。"""
+        if self.sender() is not self._session or self._closing:
+            return
+        logger.warning("AI 提示分析失败：%s", message)
+        self.puzzle_hint_label.setText("提示：分析失败，请稍后重试")
+        self.puzzle_hint_label.setVisible(True)
+
+    def _clear_hint_display(self) -> None:
+        """清除提示文字与棋盘标记。"""
+        self._hint_tooltip_active = False
+        if hasattr(self, "puzzle_hint_label"):
+            self.puzzle_hint_label.clear()
+            self.puzzle_hint_label.setVisible(False)
+        if hasattr(self, "board_widget"):
+            self.board_widget.clear_hint()
+
+    @staticmethod
+    def _format_board_coordinate(row: int, col: int) -> str:
+        """把行列坐标格式化为 H8 形式。"""
+        return f"{chr(ord('A') + col)}{row + 1}"
 
     def _request_restart(self) -> None:
         """重新开局；已有落子时确认，并安全暂停/替换会话。"""
@@ -969,6 +1340,10 @@ class MainWindow(QMainWindow):
             or self._result_dialog_open
             or not self._is_game_page_active()
         ):
+            return
+
+        if self._game_mode is GameMode.PUZZLE:
+            self._replace_session()
             return
 
         if self._session.view.move_count > 0:
@@ -1006,7 +1381,11 @@ class MainWindow(QMainWindow):
             return
         if generation is not None and generation != self._game_generation:
             return
-        if not self._session.view.is_game_over:
+        puzzle_over = (
+            self._game_mode is GameMode.PUZZLE
+            and self._puzzle_result is not None
+        )
+        if not (self._session.view.is_game_over or puzzle_over):
             return
         if self._modal_dialog_open:
             # 返回主菜单/重新开局的确认框仍在，关闭后再展示终局结果。
@@ -1032,11 +1411,37 @@ class MainWindow(QMainWindow):
 
         if restart:
             self._reset_game()
+        elif self._game_mode is GameMode.PUZZLE:
+            self._request_puzzle_list()
 
     def _build_result_presentation(
         self, winner: Optional[Player], move_count: int
     ) -> ResultPresentation:
         """根据模式与胜者生成古风终局文案。"""
+        if self._game_mode is GameMode.PUZZLE:
+            success, reason = self._puzzle_result or (False, "")
+            puzzle = self._current_puzzle
+            puzzle_title = puzzle.title if puzzle is not None else "残局"
+            if success:
+                return ResultPresentation(
+                    kind="win",
+                    title="破局",
+                    subtitle=f"残局「{puzzle_title}」已破局",
+                    detail="关卡已重置，可再次挑战",
+                    seal_text="胜",
+                    primary_text="再试一次",
+                    secondary_text="返回残局列表",
+                )
+            return ResultPresentation(
+                kind="lose",
+                title="未破局",
+                subtitle=f"残局「{puzzle_title}」{reason or '挑战结束'}",
+                detail="关卡已重置，可再次挑战",
+                seal_text="负",
+                primary_text="再试一次",
+                secondary_text="返回残局列表",
+            )
+
         if winner is None:
             return ResultPresentation(
                 kind="draw",
@@ -1101,6 +1506,11 @@ class MainWindow(QMainWindow):
         winner = view.winner
         game_over = view.is_game_over
         current_player = view.current_player
+        human = self._session.human_player
+        puzzle_over = (
+            self._game_mode is GameMode.PUZZLE
+            and self._puzzle_result is not None
+        )
 
         for player, card in (
             (Player.BLACK, self.black_card),
@@ -1109,12 +1519,24 @@ class MainWindow(QMainWindow):
             display_name, base_caption = self._card_identity(player)
             card.set_identity(display_name, base_caption)
 
-            if winner is not None:
+            if puzzle_over:
+                success = bool(self._puzzle_result[0])
+                active = success and player is human
+                status = "破局" if success else "挑战结束"
+            elif winner is not None:
                 active = winner is player
                 status = "获胜" if active else "本局结束"
             elif view.is_draw:
                 active = False
                 status = "平局"
+            elif self._game_mode is GameMode.PUZZLE:
+                active = current_player is player
+                if active and player is human:
+                    status = "落子中"
+                elif active:
+                    status = "防守中"
+                else:
+                    status = "等待"
             elif self._game_mode is GameMode.AI:
                 active = current_player is player
                 if player is self._ai_player:
@@ -1127,7 +1549,11 @@ class MainWindow(QMainWindow):
 
             card.set_state(active, status)
 
-        if winner is not None:
+        if puzzle_over:
+            self.turn_pill.setText(
+                "破局成功" if self._puzzle_result[0] else "挑战失败"
+            )
+        elif winner is not None:
             if self._game_mode is GameMode.AI:
                 self.turn_pill.setText(
                     "你获胜" if winner is self._human_player else "AI 获胜"
@@ -1136,6 +1562,10 @@ class MainWindow(QMainWindow):
                 self.turn_pill.setText(f"{winner.label}获胜")
         elif view.is_draw:
             self.turn_pill.setText("本局平局")
+        elif self._game_mode is GameMode.PUZZLE:
+            self.turn_pill.setText(
+                "你的回合" if current_player is human else "AI 防守中…"
+            )
         elif self._game_mode is GameMode.AI:
             if current_player is self._human_player:
                 self.turn_pill.setText("你的回合")
@@ -1144,13 +1574,48 @@ class MainWindow(QMainWindow):
         else:
             self.turn_pill.setText(f"{current_player.label}回合")
 
-        self._set_result_style(game_over)
-        self.move_label.setText(f"第 {view.move_count} 手")
+        self._set_result_style(game_over or puzzle_over)
+        if isinstance(self._session, PuzzleSession):
+            self.move_label.setText(
+                f"第 {self._session.player_moves} / "
+                f"{self._session.move_limit} 手"
+            )
+        else:
+            self.move_label.setText(f"第 {view.move_count} 手")
         self.undo_button.setEnabled(self._session.can_undo)
-        self.undo_button.setToolTip(
-            "撤销上一手（Ctrl+Z）"
-            if self._game_mode is GameMode.LOCAL
-            else "撤销到你的上一次落子前（Ctrl+Z）"
+        if self._game_mode is GameMode.PUZZLE:
+            self.undo_button.setToolTip("残局挑战不支持悔棋")
+        elif self._game_mode is GameMode.LOCAL:
+            self.undo_button.setToolTip("撤销上一手（Ctrl+Z）")
+        else:
+            self.undo_button.setToolTip(
+                "撤销到你的上一次落子前（Ctrl+Z）"
+            )
+        hint_visible = self._game_mode in (GameMode.PUZZLE, GameMode.AI)
+        self.hint_button.setVisible(hint_visible)
+        if self._game_mode is GameMode.PUZZLE:
+            self.hint_button.setEnabled(not puzzle_over)
+            self.hint_button.setToolTip("查看当前残局的提示")
+        elif self._game_mode is GameMode.AI:
+            session = self._session
+            self.hint_button.setEnabled(
+                isinstance(session, AIGameSession)
+                and session.can_hint
+                and not game_over
+            )
+            if not self._hint_tooltip_active:
+                self.hint_button.setToolTip("让 AI 分析局面并推荐一手")
+        else:
+            self.hint_button.setEnabled(False)
+        self.restart_button.setText(
+            "重新挑战"
+            if self._game_mode is GameMode.PUZZLE
+            else "重新开局"
+        )
+        self.menu_back_button.setText(
+            "残局列表"
+            if self._game_mode is GameMode.PUZZLE
+            else "返回主菜单"
         )
 
         # BoardWidget 只消费快照；输入开关由会话能力和模态状态共同决定。
@@ -1167,6 +1632,18 @@ class MainWindow(QMainWindow):
 
         color = "黑" if player is Player.BLACK else "白"
         base_caption = f"执{color}，{order}"
+
+        if self._game_mode is GameMode.PUZZLE:
+            human = self._session.human_player
+            if player is human:
+                return "你", f"执{color}，先手"
+            difficulty = (
+                self._session.difficulty.label
+                if isinstance(self._session, PuzzleSession)
+                else "防守"
+            )
+            return f"防守 AI（{difficulty}）", f"执{color}，后手"
+
         if player is self._human_player:
             return "你", base_caption
         return f"AI（{self._difficulty.label}）", base_caption
@@ -1193,5 +1670,10 @@ class MainWindow(QMainWindow):
                 self._online_window.close()
             except RuntimeError:
                 self._online_window = None
+        if self._replay_window is not None:
+            try:
+                self._replay_window.close()
+            except RuntimeError:
+                self._replay_window = None
         self._session.shutdown()
         super().closeEvent(event)

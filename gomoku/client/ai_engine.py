@@ -24,11 +24,28 @@ from __future__ import annotations
 
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from threading import Event
 from typing import Optional, Sequence
 
+from gomoku.client.board_geometry import (
+    CELL_LINE_IDS as _CELL_LINE_IDS,
+    LINES as _LINES,
+)
+from gomoku.client.opening_book import OpeningBook
+from gomoku.client.threat_search import (
+    SearchBudget,
+    ThreatSearchCancelled,
+    find_vcf_win,
+    find_vct_win,
+)
+from gomoku.client.transposition import Bound, TranspositionTable
+from gomoku.client.zobrist import (
+    RULE_SET_KEY,
+    apply_move as _zobrist_apply,
+    compute_hash as _zobrist_hash,
+)
 from gomoku.shared.rules import (
     BOARD_CELL_COUNT,
     BOARD_SIZE,
@@ -57,6 +74,7 @@ class AIDifficulty(Enum):
     EASY = "easy"
     MEDIUM = "medium"
     HARD = "hard"
+    MASTER = "master"
 
     @property
     def label(self) -> str:
@@ -65,6 +83,7 @@ class AIDifficulty(Enum):
             AIDifficulty.EASY: "简单",
             AIDifficulty.MEDIUM: "中等",
             AIDifficulty.HARD: "困难",
+            AIDifficulty.MASTER: "大师",
         }[self]
 
 
@@ -85,6 +104,13 @@ class SearchConfig:
     random_top_k: int = 0
     rich_evaluation: bool = False
     iterative_deepening: bool = False
+    use_opening_book: bool = False
+    use_vcf: bool = False
+    use_vct: bool = False
+    use_transposition_table: bool = False
+    threat_time_limit: float = 0.0
+    threat_node_limit: int = 0
+    tt_max_entries: int = 0
 
 
 # 三档难度参数。实现后通过本机中盘局基准测试调优；时间单位是秒。
@@ -120,7 +146,34 @@ DIFFICULTY_CONFIGS: dict[AIDifficulty, SearchConfig] = {
         rich_evaluation=True,
         iterative_deepening=True,
     ),
+    AIDifficulty.MASTER: SearchConfig(
+        max_depth=7,
+        time_limit=2.0,
+        node_limit=120_000,
+        root_candidates=20,
+        inner_candidates=12,
+        defense_weight=1.16,
+        random_top_k=0,
+        rich_evaluation=True,
+        iterative_deepening=True,
+        use_opening_book=True,
+        use_vcf=True,
+        use_vct=True,
+        use_transposition_table=True,
+        threat_time_limit=0.55,
+        threat_node_limit=60_000,
+        tt_max_entries=100_000,
+    ),
 }
+
+
+# 提示/分析使用的短预算配置：比大师档更快，避免阻塞玩家思考。
+HINT_CONFIG: SearchConfig = replace(
+    DIFFICULTY_CONFIGS[AIDifficulty.MASTER],
+    time_limit=1.3,
+    node_limit=80_000,
+    threat_time_limit=0.4,
+)
 
 
 @dataclass(frozen=True)
@@ -133,84 +186,42 @@ class SearchStats:
     elapsed_seconds: float
     cancelled: bool = False
     timed_out: bool = False
+    source: str = "search"
+    vcf_found: bool = False
+    vct_found: bool = False
+    book_move: bool = False
+    tt_hits: int = 0
+
+
+@dataclass(frozen=True)
+class CandidateScore:
+    """分析结果中的单个候选着法及其评分。"""
+
+    move: Move
+    score: int
+
+
+@dataclass(frozen=True)
+class SearchAnalysis:
+    """一次搜索/分析的可读结果。"""
+
+    best_move: Optional[Move]
+    best_score: int
+    candidates: tuple[CandidateScore, ...]
+    player: Player
+    difficulty: AIDifficulty
+    completed_depth: int
+    nodes: int
+    elapsed_seconds: float
+    cancelled: bool
+    timed_out: bool
+    source: str
+    fallback_used: bool = False
 
 
 # ---------------------------------------------------------------------------
-# 预计算棋盘上的所有直线线段
+# 预计算棋盘上的所有直线线段（几何部分位于 board_geometry.py）
 # ---------------------------------------------------------------------------
-
-
-def _build_line_geometry() -> tuple[
-    tuple[tuple[Move, ...], ...],
-    tuple[tuple[tuple[int, ...], ...], ...],
-]:
-    """预计算所有长度 >= 5 的行、列、斜线及其反向索引。
-
-    增量评估只需要更新经过最后落点的四条线；预先存下线段避免了搜索时
-    为每个叶子重新生成整盘几何。
-    """
-    lines: list[tuple[Move, ...]] = []
-    cell_line_ids: list[list[list[int]]] = [
-        [[] for _ in range(BOARD_SIZE)] for _ in range(BOARD_SIZE)
-    ]
-
-    def add_line(coords: list[Move]) -> None:
-        if len(coords) < WIN_LENGTH:
-            return
-        line_id = len(lines)
-        lines.append(tuple(coords))
-        for row, col in coords:
-            cell_line_ids[row][col].append(line_id)
-
-    # 15 条横线、15 条竖线。
-    for row in range(BOARD_SIZE):
-        add_line([(row, col) for col in range(BOARD_SIZE)])
-    for col in range(BOARD_SIZE):
-        add_line([(row, col) for row in range(BOARD_SIZE)])
-
-    # 主对角线（向右下）。
-    for start_col in range(BOARD_SIZE):
-        coords: list[Move] = []
-        row, col = 0, start_col
-        while row < BOARD_SIZE and col < BOARD_SIZE:
-            coords.append((row, col))
-            row += 1
-            col += 1
-        add_line(coords)
-    for start_row in range(1, BOARD_SIZE):
-        coords = []
-        row, col = start_row, 0
-        while row < BOARD_SIZE and col < BOARD_SIZE:
-            coords.append((row, col))
-            row += 1
-            col += 1
-        add_line(coords)
-
-    # 副对角线（向右上/向左下）。
-    for start_col in range(BOARD_SIZE):
-        coords = []
-        row, col = 0, start_col
-        while row < BOARD_SIZE and col >= 0:
-            coords.append((row, col))
-            row += 1
-            col -= 1
-        add_line(coords)
-    for start_row in range(1, BOARD_SIZE):
-        coords = []
-        row, col = start_row, BOARD_SIZE - 1
-        while row < BOARD_SIZE and col >= 0:
-            coords.append((row, col))
-            row += 1
-            col -= 1
-        add_line(coords)
-
-    frozen_cell_lines = tuple(
-        tuple(tuple(ids) for ids in row) for row in cell_line_ids
-    )
-    return tuple(lines), frozen_cell_lines
-
-
-_LINES, _CELL_LINE_IDS = _build_line_geometry()
 
 # 中等/困难局面评估权重。索引表示一个无对手棋子的 5 格窗口中己方棋子数。
 _MEDIUM_WINDOW_WEIGHTS = (0, 1, 8, 110, 1_800, 80_000)
@@ -332,6 +343,8 @@ class _SearchContext:
         config: SearchConfig,
         cancel_event: Optional[Event],
         rng: random.Random,
+        opening_book: Optional[OpeningBook] = None,
+        move_history: Sequence[Move] = (),
     ) -> None:
         self.board: list[list[Cell]] = [list(row) for row in board_snapshot]
         self.ai_player = ai_player
@@ -340,11 +353,30 @@ class _SearchContext:
         self.config = config
         self.cancel_event = cancel_event
         self.rng = rng
+        self.opening_book = opening_book
+        self.move_history = tuple(move_history)
 
         self.deadline = time.monotonic() + config.time_limit
         self.nodes = 0
         self.completed_depth = 0
         self.timed_out = False
+
+        # 分析/诊断输出。
+        self.best_score = 0
+        self.last_root_scores: list[tuple[Move, int]] = []
+        self.source = "search"
+        self.vcf_found = False
+        self.vct_found = False
+        self.book_move = False
+        self.tt_hits = 0
+
+        # 增量 Zobrist 哈希；规则集键为未来禁手规则预留。
+        self._hash = (
+            _zobrist_hash(self.board, ai_player) ^ RULE_SET_KEY
+        )
+        self._tt: Optional[TranspositionTable] = None
+        if config.use_transposition_table and config.tt_max_entries > 0:
+            self._tt = TranspositionTable(config.tt_max_entries)
 
         # 每个空位周围两格内的已有棋子数，用于增量生成候选点。
         self._neighbor_counts: list[list[int]] = [
@@ -355,7 +387,9 @@ class _SearchContext:
         # 每条线段的双方评分缓存，以及双方累计分。
         self._line_scores: list[tuple[int, int]] = [(0, 0)] * len(_LINES)
         self._total_scores: list[int] = [0, 0]  # [黑棋累计, 白棋累计]
-        self._history: list[tuple[int, int, list[tuple[int, tuple[int, int]]]]] = []
+        self._history: list[
+            tuple[int, int, Player, list[tuple[int, tuple[int, int]]]]
+        ] = []
 
         # 初始化线段评分与邻域计数。初始化复杂度只与空盘 + 已有棋子有关。
         for line_id, coords in enumerate(_LINES):
@@ -401,11 +435,13 @@ class _SearchContext:
             self._line_scores[line_id] = new_pair
             changed.append((line_id, old_pair))
 
-        self._history.append((row, col, changed))
+        self._history.append((row, col, player, changed))
+        self._hash = _zobrist_apply(self._hash, player, row, col)
 
     def _undo_move(self) -> None:
         """撤销最近一次搜索落子，恢复棋盘、邻域与线评分。"""
-        row, col, changed = self._history.pop()
+        row, col, player, changed = self._history.pop()
+        self._hash = _zobrist_apply(self._hash, player, row, col)
         self.board[row][col] = None
         self._move_count -= 1
         self._update_neighbor_counts(row, col, -1)
@@ -607,11 +643,43 @@ class _SearchContext:
         if self._move_count >= BOARD_CELL_COUNT:
             return 0
 
+        alpha_orig = alpha
+        probe = None
+        if self._tt is not None:
+            probe = self._tt.probe(self._hash)
+            # 杀棋分数带有深度偏移，跨节点不可直接比较；只对普通评估值
+            # 使用边界裁剪，杀棋条目仍可用于着法排序。
+            if (
+                probe is not None
+                and probe.depth >= depth
+                and abs(probe.score) < WIN_SCORE // 2
+            ):
+                if probe.bound is Bound.EXACT:
+                    self.tt_hits += 1
+                    return probe.score
+                if probe.bound is Bound.LOWER:
+                    alpha = max(alpha, probe.score)
+                elif probe.bound is Bound.UPPER:
+                    beta = min(beta, probe.score)
+                if alpha >= beta:
+                    self.tt_hits += 1
+                    return probe.score
+
         moves = self._ordered_candidates(
             current_player, self.config.inner_candidates
         )
         if not moves:
             return self._evaluate()
+
+        if (
+            probe is not None
+            and probe.best_move is not None
+            and probe.best_move in moves
+        ):
+            moves.remove(probe.best_move)
+            moves.insert(0, probe.best_move)
+
+        best_move: Move = moves[0]
 
         if current_player is self.ai_player:
             value = -INFINITY
@@ -627,38 +695,57 @@ class _SearchContext:
                 finally:
                     self._undo_move()
 
-                value = max(value, score)
+                if score > value:
+                    value = score
+                    best_move = (row, col)
                 alpha = max(alpha, value)
                 if alpha >= beta:
                     break
-            return value
+        else:
+            value = INFINITY
+            for row, col in moves:
+                self._apply_move(row, col, current_player)
+                try:
+                    if find_winning_line(self.board, row, col, current_player):
+                        score = -WIN_SCORE - depth
+                    else:
+                        score = self._search(
+                            depth - 1, alpha, beta, current_player.opponent
+                        )
+                finally:
+                    self._undo_move()
 
-        value = INFINITY
-        for row, col in moves:
-            self._apply_move(row, col, current_player)
-            try:
-                if find_winning_line(self.board, row, col, current_player):
-                    score = -WIN_SCORE - depth
-                else:
-                    score = self._search(
-                        depth - 1, alpha, beta, current_player.opponent
-                    )
-            finally:
-                self._undo_move()
+                if score < value:
+                    value = score
+                    best_move = (row, col)
+                beta = min(beta, value)
+                if alpha >= beta:
+                    break
 
-            value = min(value, score)
-            beta = min(beta, value)
-            if alpha >= beta:
-                break
+        if self._tt is not None:
+            if value <= alpha_orig:
+                bound = Bound.UPPER
+            elif value >= beta:
+                bound = Bound.LOWER
+            else:
+                bound = Bound.EXACT
+            self._tt.store(
+                self._hash,
+                depth,
+                value,
+                bound,
+                best_move,
+            )
         return value
 
     def _root_search(
         self, depth: int, root_moves: Sequence[Move]
-    ) -> tuple[int, list[Move]]:
-        """在根节点遍历全部候选，返回最高分及同分着法。"""
+    ) -> tuple[int, list[Move], list[tuple[Move, int]]]:
+        """在根节点遍历全部候选，返回最高分、同分着法与各着评分。"""
         alpha = -INFINITY
         best_score = -INFINITY
         best_moves: list[Move] = []
+        scored: list[tuple[Move, int]] = []
 
         for row, col in root_moves:
             self._visit_node()  # 根节点自身也要参与时间/取消检查。
@@ -675,6 +762,7 @@ class _SearchContext:
             finally:
                 self._undo_move()
 
+            scored.append(((row, col), score))
             if score > best_score:
                 best_score = score
                 best_moves = [(row, col)]
@@ -684,7 +772,8 @@ class _SearchContext:
             alpha = max(alpha, best_score)
             self._raise_if_stopped_tail()
 
-        return best_score, best_moves
+        self.best_score = best_score
+        return best_score, best_moves, scored
 
     def _raise_if_stopped_tail(self) -> None:
         """根节点每处理完一个分支就检查一次取消/时间。"""
@@ -710,6 +799,9 @@ class _SearchContext:
 
         # 空盘首手固定天元，既符合常见开局，也避免候选集为空。
         if self._move_count == 0:
+            self.source = "center"
+            self.best_score = 0
+            self.last_root_scores = [((_BOARD_CENTER, _BOARD_CENTER), 0)]
             return (_BOARD_CENTER, _BOARD_CENTER)
 
         local_cells = self._neighbor_empty_cells()
@@ -719,17 +811,36 @@ class _SearchContext:
         # 所有难度共用同一层强制战术，避免难度越低越像“随机送子”。
         own_wins = self._immediate_winning_cells(local_cells, self.ai_player)
         if own_wins:
+            self.source = "forced"
+            self.best_score = WIN_SCORE
+            self.last_root_scores = [(own_wins[0], WIN_SCORE)]
             return own_wins[0]
 
         opponent_wins = self._immediate_winning_cells(local_cells, self.opponent)
         if opponent_wins:
             # 多个立即胜点时实际上无法全堵；选择局部价值最高的一个。
-            return max(
+            move = max(
                 opponent_wins,
                 key=lambda cell: self._ordering_score(
                     cell[0], cell[1], self.ai_player
                 ),
             )
+            self.source = "block"
+            self.best_score = -WIN_SCORE
+            self.last_root_scores = [(move, -WIN_SCORE)]
+            return move
+
+        book_move = self._lookup_opening_book()
+        if book_move is not None:
+            self.book_move = True
+            self.source = "book"
+            self.best_score = 0
+            self.last_root_scores = [(book_move, 0)]
+            return book_move
+
+        threat_move = self._try_threat_search()
+        if threat_move is not None:
+            return threat_move
 
         root_candidates = self._ranked_candidates(
             local_cells, self.ai_player, self.config.root_candidates
@@ -739,7 +850,13 @@ class _SearchContext:
 
         if not self.config.iterative_deepening:
             self.completed_depth = 1
-            return self._choose_easy_move(root_candidates)
+            chosen = self._choose_easy_move(root_candidates)
+            self.source = "search"
+            self.best_score = 0
+            self.last_root_scores = [
+                (move, 0) for move in root_candidates
+            ]
+            return chosen
 
         best_move = root_candidates[0]
         ordered_root = list(root_candidates)
@@ -749,12 +866,15 @@ class _SearchContext:
                 # 放在 try 内，保证“上一轮已有结果、本轮开始前正好超时”
                 # 的情况仍能返回上一层完整结果，而不是退回兜底点。
                 self._raise_if_stopped()
-                score, tied_moves = self._root_search(depth, ordered_root)
+                score, tied_moves, scored = self._root_search(
+                    depth, ordered_root
+                )
             except _SearchTimeout:
                 self.timed_out = True
                 break
 
             self.completed_depth = depth
+            self.last_root_scores = scored
             best_move = self.rng.choice(tied_moves)
 
             # 如果已经找到必胜/必败的确定结果，不必继续加深。
@@ -766,7 +886,101 @@ class _SearchContext:
                 move for move in root_candidates if move != best_move
             ]
 
+        self.source = "search"
         return best_move
+
+    def _lookup_opening_book(self) -> Optional[Move]:
+        """在开局库中查找当前局面对应应手。"""
+        if not self.config.use_opening_book or self.opening_book is None:
+            return None
+        # 历史必须与棋盘一致，避免误用旧局面或测试注入的错误序列。
+        if len(self.move_history) != self._move_count:
+            return None
+        if len(self.move_history) > 10:
+            return None
+
+        move = self.opening_book.lookup(
+            self.move_history, self.board, self.rng
+        )
+        if move is None:
+            return None
+        row, col = move
+        if (
+            not 0 <= row < BOARD_SIZE
+            or not 0 <= col < BOARD_SIZE
+            or self.board[row][col] is not None
+        ):
+            return None
+        return move
+
+    def _try_threat_search(self) -> Optional[Move]:
+        """在常规搜索前尝试 VCF/VCT 强制胜。"""
+        if not (self.config.use_vcf or self.config.use_vct):
+            return None
+
+        remaining = self.deadline - time.monotonic()
+        total_time = min(
+            self.config.threat_time_limit,
+            max(0.0, remaining - 0.15),
+        )
+        if total_time <= 0.0:
+            return None
+
+        node_limit = max(1, self.config.threat_node_limit or 40_000)
+        used_nodes = 0
+        try:
+            if self.config.use_vcf:
+                vcf_budget = SearchBudget(
+                    deadline=time.monotonic() + total_time * 0.65,
+                    node_limit=max(1, int(node_limit * 0.65)),
+                    cancel_event=self.cancel_event,
+                )
+                try:
+                    line = find_vcf_win(
+                        self.board,
+                        self.ai_player,
+                        budget=vcf_budget,
+                        max_depth=12,
+                    )
+                finally:
+                    used_nodes += vcf_budget.nodes
+                if line is not None and line.moves:
+                    self.vcf_found = True
+                    self.source = "vcf"
+                    self.best_score = WIN_SCORE
+                    self.last_root_scores = [(line.moves[0], WIN_SCORE)]
+                    return line.moves[0]
+
+            if self.config.use_vct:
+                remaining = self.deadline - time.monotonic() - 0.1
+                if remaining <= 0.02:
+                    return None
+                vct_time = min(total_time * 0.35, remaining)
+                vct_budget = SearchBudget(
+                    deadline=time.monotonic() + vct_time,
+                    node_limit=max(1, int(node_limit * 0.35)),
+                    cancel_event=self.cancel_event,
+                )
+                try:
+                    line = find_vct_win(
+                        self.board,
+                        self.ai_player,
+                        budget=vct_budget,
+                    )
+                finally:
+                    used_nodes += vct_budget.nodes
+                if line is not None and line.moves:
+                    self.vct_found = True
+                    self.source = "vct"
+                    self.best_score = WIN_SCORE
+                    self.last_root_scores = [(line.moves[0], WIN_SCORE)]
+                    return line.moves[0]
+        except ThreatSearchCancelled as exc:
+            raise _SearchCancelled from exc
+        finally:
+            self.nodes += used_nodes
+
+        return None
 
 
 # 天元坐标。
@@ -776,13 +990,22 @@ _BOARD_CENTER = BOARD_SIZE // 2
 class GomokuAI:
     """五子棋 AI 的对外入口。
 
-    该类不依赖 Qt；``find_move`` 每次调用都创建独立搜索上下文，
-    因此可以从后台线程安全调用，并且不会污染调用方棋盘快照。
+    该类不依赖 Qt；``find_move``/``analyze`` 每次调用都创建独立搜索
+    上下文，因此可以从后台线程安全调用，并且不会污染调用方棋盘快照。
     """
 
-    def __init__(self, seed: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        seed: Optional[int] = None,
+        *,
+        opening_book: Optional[OpeningBook] = None,
+        move_history: Sequence[Move] = (),
+    ) -> None:
         self._rng = random.Random(seed)
         self.last_stats: Optional[SearchStats] = None
+        self.last_analysis: Optional[SearchAnalysis] = None
+        self._opening_book = opening_book
+        self._move_history = tuple(move_history)
 
     def find_move(
         self,
@@ -802,41 +1025,125 @@ class GomokuAI:
         返回：
             合法空点 ``(row, col)``；没有空位、输入非法或用户取消时为 None。
         """
+        analysis = self._run(
+            board_snapshot,
+            player,
+            difficulty,
+            cancel_event,
+            top_n=1,
+            config_override=None,
+        )
+        return analysis.best_move if analysis is not None else None
+
+    def analyze(
+        self,
+        board_snapshot: BoardLike,
+        player: Player,
+        difficulty: AIDifficulty,
+        cancel_event: Optional[Event] = None,
+        *,
+        top_n: int = 3,
+        config_override: Optional[SearchConfig] = None,
+    ) -> Optional[SearchAnalysis]:
+        """分析当前局面，返回推荐着法及候选评分。
+
+        评分从 ``player`` 的视角计算；``top_n`` 控制返回的候选数量。
+        提示 UI 可以传入更短的 ``config_override``（见 ``HINT_CONFIG``）。
+        """
+        return self._run(
+            board_snapshot,
+            player,
+            difficulty,
+            cancel_event,
+            top_n=max(1, int(top_n)),
+            config_override=config_override,
+        )
+
+    def _run(
+        self,
+        board_snapshot: BoardLike,
+        player: Player,
+        difficulty: AIDifficulty,
+        cancel_event: Optional[Event],
+        *,
+        top_n: int,
+        config_override: Optional[SearchConfig],
+    ) -> Optional[SearchAnalysis]:
         started = time.monotonic()
-        config = DIFFICULTY_CONFIGS[difficulty]
+        config = config_override or DIFFICULTY_CONFIGS[difficulty]
         stats_nodes = 0
         stats_depth = 0
         cancelled = False
         timed_out = False
+        source = "search"
+        vcf_found = False
+        vct_found = False
+        book_move = False
+        tt_hits = 0
+
+        def build_analysis(
+            best_move: Optional[Move],
+            best_score: int,
+            candidates: Sequence[CandidateScore],
+            *,
+            fallback_used: bool = False,
+        ) -> SearchAnalysis:
+            elapsed = time.monotonic() - started
+            analysis = SearchAnalysis(
+                best_move=best_move,
+                best_score=best_score,
+                candidates=tuple(candidates[:top_n]),
+                player=player,
+                difficulty=difficulty,
+                completed_depth=stats_depth,
+                nodes=stats_nodes,
+                elapsed_seconds=elapsed,
+                cancelled=cancelled,
+                timed_out=timed_out,
+                source=source,
+                fallback_used=fallback_used,
+            )
+            self.last_analysis = analysis
+            return analysis
 
         try:
             if cancel_event is not None and cancel_event.is_set():
                 cancelled = True
-                return None
+                source = "cancelled"
+                return build_analysis(None, 0, ())
 
             if (
                 not isinstance(player, Player)
                 or len(board_snapshot) != BOARD_SIZE
                 or any(len(row) != BOARD_SIZE for row in board_snapshot)
             ):
-                return None
+                source = "invalid"
+                return build_analysis(None, 0, ())
 
             if all(
                 cell is not None
                 for row in board_snapshot
                 for cell in row
             ):
-                return None
+                source = "full"
+                return build_analysis(None, 0, ())
 
             empty_count = sum(
                 1 for row in board_snapshot for cell in row if cell is None
             )
             if empty_count == 0:
-                return None
+                source = "full"
+                return build_analysis(None, 0, ())
 
             # 空盘首手在天元，直接返回；这也是 UI 中“AI 先手”的常见表现。
             if empty_count == BOARD_CELL_COUNT:
-                return (_BOARD_CENTER, _BOARD_CENTER)
+                center = (_BOARD_CENTER, _BOARD_CENTER)
+                source = "center"
+                return build_analysis(
+                    center,
+                    0,
+                    [CandidateScore(center, 0)],
+                )
 
             context = _SearchContext(
                 board_snapshot=board_snapshot,
@@ -845,13 +1152,15 @@ class GomokuAI:
                 config=config,
                 cancel_event=cancel_event,
                 rng=self._rng,
+                opening_book=self._opening_book,
+                move_history=self._move_history,
             )
             stats_nodes = context.nodes
             try:
                 move = context.find_best_move()
             except _SearchCancelled:
                 cancelled = True
-                return None
+                move = None
             except _SearchTimeout:
                 timed_out = True
                 move = None
@@ -859,6 +1168,15 @@ class GomokuAI:
                 stats_nodes = context.nodes
                 stats_depth = context.completed_depth
                 timed_out = timed_out or context.timed_out
+                source = context.source
+                vcf_found = context.vcf_found
+                vct_found = context.vct_found
+                book_move = context.book_move
+                tt_hits = context.tt_hits
+
+            if cancelled:
+                source = "cancelled"
+                return build_analysis(None, 0, ())
 
             # 结果必须在原始快照中仍为空位，双重防御线程取消/棋盘变更竞态。
             if move is not None:
@@ -868,14 +1186,41 @@ class GomokuAI:
                     and 0 <= col < BOARD_SIZE
                     and board_snapshot[row][col] is None
                 ):
-                    return move
+                    ordered = sorted(
+                        context.last_root_scores,
+                        key=lambda item: item[1],
+                        reverse=True,
+                    )
+                    candidates = [
+                        CandidateScore(candidate, score)
+                        for candidate, score in ordered
+                    ]
+                    if not any(
+                        candidate.move == move for candidate in candidates
+                    ):
+                        candidates.insert(
+                            0, CandidateScore(move, context.best_score)
+                        )
+                    return build_analysis(
+                        move,
+                        context.best_score,
+                        candidates,
+                    )
 
             # 极端情况下搜索被截断但没有得到结果：给 UI 一个合法兜底点。
+            source = "fallback"
             for row in range(BOARD_SIZE):
                 for col in range(BOARD_SIZE):
                     if board_snapshot[row][col] is None:
-                        return (row, col)
-            return None
+                        fallback = (row, col)
+                        return build_analysis(
+                            fallback,
+                            0,
+                            [CandidateScore(fallback, 0)],
+                            fallback_used=True,
+                        )
+            source = "full"
+            return build_analysis(None, 0, ())
 
         finally:
             elapsed = time.monotonic() - started
@@ -886,4 +1231,9 @@ class GomokuAI:
                 elapsed_seconds=elapsed,
                 cancelled=cancelled,
                 timed_out=timed_out,
+                source=source,
+                vcf_found=vcf_found,
+                vct_found=vct_found,
+                book_move=book_move,
+                tt_hits=tt_hits,
             )
