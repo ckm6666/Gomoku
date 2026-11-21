@@ -14,6 +14,7 @@ from typing import AsyncIterator, Optional
 from fastapi import FastAPI, Request
 
 from server.app.api.auth import router as auth_router
+from server.app.api.games import router as games_router
 from server.app.api.ranked import router as ranked_router
 from server.app.config import Settings
 from server.app.db import (
@@ -65,11 +66,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     app = FastAPI(
         title="Gomoku Online Service",
-        version="0.2.0",
+        version="0.3.0",
         lifespan=lifespan,
     )
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(ranked_router, prefix="/api/v1")
+    app.include_router(games_router, prefix="/api/v1")
     app.include_router(ws_router, prefix="/api/v1")
 
     @app.get("/api/v1/health")

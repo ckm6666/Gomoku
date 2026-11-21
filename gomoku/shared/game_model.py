@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from typing import Sequence
+
 from gomoku.shared.rules import (
     BOARD_CELL_COUNT,
     BOARD_SIZE,
@@ -35,6 +37,24 @@ class GameModel:
         self._winner: Player | None = None
         self._winning_line: tuple[tuple[int, int], ...] = ()
         self._is_draw = False
+
+    @classmethod
+    def from_moves(cls, moves: Sequence[Move]) -> "GameModel":
+        """从完整落子历史重建模型。
+
+        用于载入残局初始局面和复盘棋谱。历史必须从空棋盘开始、黑白交替、
+        每手合法；一旦对局已经结束仍有后续落子，则拒绝载入。非法历史抛出
+        ``ValueError``，调用方应把它当作数据损坏处理。
+        """
+        model = cls()
+        for index, move in enumerate(moves, start=1):
+            if not isinstance(move, Move):
+                raise ValueError(f"第 {index} 手不是 Move 对象")
+            if move.player is not model._current_player:
+                raise ValueError(f"第 {index} 手棋手顺序不正确")
+            if not model.place_stone(move.row, move.col):
+                raise ValueError(f"第 {index} 手落子非法")
+        return model
 
     # ------------------------------------------------------------------
     # 只读状态：界面/会话层读取这些属性，不直接改动内部数据
@@ -87,6 +107,15 @@ class GameModel:
     # ------------------------------------------------------------------
     # 规则操作
     # ------------------------------------------------------------------
+    def is_legal_move(self, row: int, col: int) -> bool:
+        """判断在当前局面下，本手是否可以落在指定交叉点。"""
+        return (
+            not self.is_game_over
+            and 0 <= row < BOARD_SIZE
+            and 0 <= col < BOARD_SIZE
+            and self._board[row][col] is None
+        )
+
     def place_stone(self, row: int, col: int) -> bool:
         """在指定交叉点落下当前棋手的棋子。
 

@@ -7,6 +7,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -16,7 +17,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from gomoku.client.ai_engine import AIDifficulty  # noqa: E402
+from gomoku.client.ai_engine import (  # noqa: E402
+    AIDifficulty,
+    CandidateScore,
+    SearchAnalysis,
+)
 from gomoku.client.sessions import (  # noqa: E402
     AIGameSession,
     LocalGameSession,
@@ -53,6 +58,57 @@ def wait_until(predicate, timeout: float = 5.0) -> bool:
         time.sleep(0.005)
     QT_APP.processEvents()
     return bool(predicate())
+
+
+def _fake_analyze(
+    self,
+    board_snapshot,
+    player,
+    difficulty,
+    cancel_event=None,
+    *,
+    top_n=3,
+    config_override=None,
+):
+    """测试注入：立即返回第一个空点作为推荐落点。"""
+    del self, difficulty, cancel_event, top_n, config_override
+    for row in range(BOARD_SIZE):
+        for col in range(BOARD_SIZE):
+            if board_snapshot[row][col] is None:
+                move = (row, col)
+                return SearchAnalysis(
+                    best_move=move,
+                    best_score=1,
+                    candidates=(CandidateScore(move, 1),),
+                    player=player,
+                    difficulty=AIDifficulty.MASTER,
+                    completed_depth=1,
+                    nodes=1,
+                    elapsed_seconds=0.0,
+                    cancelled=False,
+                    timed_out=False,
+                    source="search",
+                )
+    return None
+
+
+def _slow_analyze(
+    self,
+    board_snapshot,
+    player,
+    difficulty,
+    cancel_event=None,
+    *,
+    top_n=3,
+    config_override=None,
+):
+    """测试注入：阻塞到取消事件触发，用于验证陈旧结果丢弃。"""
+    del self, board_snapshot, player, difficulty, top_n, config_override
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if cancel_event is not None and cancel_event.wait(0.01):
+            return None
+    return None
 
 
 def blank_board() -> list[list[str | None]]:
@@ -216,6 +272,107 @@ class AISessionTests(unittest.TestCase):
             self.assertEqual(len(placed), 2)
             self.assertTrue(session.request_undo())
             self.assertEqual(len(placed), 2)
+        finally:
+            session.shutdown()
+
+    def test_hint_ready_on_human_turn(self) -> None:
+        """玩家回合请求提示，后台分析结果通过信号返回且不锁定对局。"""
+        session = AIGameSession(Player.BLACK, AIDifficulty.EASY)
+        hints: list[SearchAnalysis] = []
+        session.hint_ready.connect(hints.append)
+        try:
+            self.assertTrue(session.request_move(7, 7))
+            self.assertTrue(
+                wait_until(
+                    lambda: session.view.move_count == 2
+                    and session.ai_thread is None
+                )
+            )
+            self.assertTrue(session.can_hint)
+
+            with mock.patch(
+                "gomoku.client.ai_worker.GomokuAI.analyze",
+                new=_fake_analyze,
+            ):
+                self.assertTrue(session.request_hint())
+                self.assertFalse(session.can_hint)
+                # 提示分析不影响正常对局输入/忙碌状态。
+                self.assertFalse(session.busy)
+                self.assertTrue(session.accepts_human_input)
+                self.assertTrue(
+                    wait_until(
+                        lambda: hints and session.hint_thread is None
+                    )
+                )
+
+            self.assertEqual(len(hints), 1)
+            analysis = hints[0]
+            self.assertIsNotNone(analysis.best_move)
+            row, col = analysis.best_move
+            self.assertIsNone(session.view.board[row][col])
+        finally:
+            session.shutdown()
+
+    def test_hint_rejected_during_ai_turn(self) -> None:
+        """AI 回合不能请求提示。"""
+        session = AIGameSession(Player.WHITE, AIDifficulty.EASY)
+        try:
+            self.assertFalse(session.can_hint)
+            self.assertFalse(session.request_hint())
+            self.assertTrue(
+                wait_until(
+                    lambda: session.view.move_count == 1
+                    and session.ai_thread is None
+                )
+            )
+        finally:
+            session.shutdown()
+
+    def test_hint_cancelled_by_move_and_undo(self) -> None:
+        """玩家落子/悔棋会使在途提示失效，迟到的分析结果被丢弃。"""
+        session = AIGameSession(Player.BLACK, AIDifficulty.EASY)
+        hints: list[SearchAnalysis] = []
+        session.hint_ready.connect(hints.append)
+        try:
+            self.assertTrue(session.request_move(7, 7))
+            self.assertTrue(
+                wait_until(
+                    lambda: session.view.move_count == 2
+                    and session.ai_thread is None
+                )
+            )
+
+            with mock.patch(
+                "gomoku.client.ai_worker.GomokuAI.analyze",
+                new=_slow_analyze,
+            ):
+                self.assertTrue(session.request_hint())
+                self.assertIsNotNone(session.hint_thread)
+                # (0,0) 远离中心，不会被 EASY 的 AI 应手占用。
+                self.assertTrue(session.request_move(0, 0))
+                self.assertTrue(
+                    wait_until(lambda: session.hint_thread is None)
+                )
+                self.assertEqual(hints, [])
+
+            # 等待 AI 回合并回到玩家回合，再次发起提示后用悔棋取消。
+            self.assertTrue(
+                wait_until(
+                    lambda: session.view.move_count == 4
+                    and session.ai_thread is None
+                )
+            )
+            with mock.patch(
+                "gomoku.client.ai_worker.GomokuAI.analyze",
+                new=_slow_analyze,
+            ):
+                self.assertTrue(session.request_hint())
+                self.assertIsNotNone(session.hint_thread)
+                self.assertTrue(session.request_undo())
+                self.assertTrue(
+                    wait_until(lambda: session.hint_thread is None)
+                )
+                self.assertEqual(hints, [])
         finally:
             session.shutdown()
 
