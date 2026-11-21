@@ -10,6 +10,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     UniqueConstraint,
@@ -17,6 +18,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
+from gomoku.shared.avatar import DEFAULT_AVATAR
 from server.app.db import Base, utcnow_naive
 from server.app.ratings import START_RATING
 
@@ -34,6 +36,12 @@ class User(Base):
         String(32), unique=True, index=True, nullable=False
     )
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    avatar: Mapped[str] = mapped_column(
+        String(16),
+        default=DEFAULT_AVATAR,
+        server_default=text(f"'{DEFAULT_AVATAR}'"),
+        nullable=False,
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=utcnow_naive, nullable=False
@@ -189,10 +197,72 @@ class RatingEvent(Base):
     )
 
 
+class Friendship(Base):
+    """好友关系：user_a/user_b 为排序后的用户对，requested_by 记录申请人。"""
+
+    __tablename__ = "friendships"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_a: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), index=True, nullable=False
+    )
+    user_b: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), index=True, nullable=False
+    )
+    requested_by: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), default="pending", index=True, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow_naive, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow_naive, nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("user_a", "user_b", name="uq_friendships_pair"),
+    )
+
+
+class DirectMessage(Base):
+    """好友私聊消息，用于历史记录与离线补收。"""
+
+    __tablename__ = "direct_messages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    sender_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), index=True, nullable=False
+    )
+    recipient_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), index=True, nullable=False
+    )
+    content: Mapped[str] = mapped_column(String(500), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow_naive, nullable=False
+    )
+    read_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_direct_messages_pair",
+            "sender_id",
+            "recipient_id",
+            "created_at",
+        ),
+    )
+
+
 __all__ = [
     "User",
     "RefreshSession",
     "Game",
     "Move",
     "RatingEvent",
+    "Friendship",
+    "DirectMessage",
 ]

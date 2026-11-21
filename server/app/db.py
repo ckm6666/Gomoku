@@ -71,6 +71,7 @@ _ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("wins", "INTEGER NOT NULL DEFAULT 0"),
         ("losses", "INTEGER NOT NULL DEFAULT 0"),
         ("draws", "INTEGER NOT NULL DEFAULT 0"),
+        ("avatar", "VARCHAR(16) NOT NULL DEFAULT 'yun'"),
     ),
     "games": (
         ("rating_applied", "BOOLEAN NOT NULL DEFAULT {false}"),

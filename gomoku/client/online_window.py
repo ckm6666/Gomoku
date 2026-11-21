@@ -1,18 +1,19 @@
-"""联机对战独立窗口：登录、好友房大厅和在线棋盘。
+"""联机对战独立窗口：登录、自建房/好友大厅和在线棋盘。
 
 离线双人/AI 窗口保持不变；用户通过主窗口“联机对战”按钮打开本窗口。
-登录成功后使用 HTTPS 认证 + WebSocket 好友房；在线落子只由服务器权威快照
-驱动，不在本地抢先更新。
+登录成功后使用 HTTPS 认证 + WebSocket 自建房/排位；在线落子只由服务器
+权威快照驱动，不在本地抢先更新。
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from dataclasses import replace
 from datetime import datetime
 from typing import Mapping, Optional
 
-from PySide6.QtCore import QSettings, QUrl, Qt, QTimer
+from PySide6.QtCore import QSettings, QSize, QUrl, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -36,13 +37,19 @@ from PySide6.QtWidgets import (
 
 from gomoku.client.audio import get_audio_manager
 from gomoku.client.auth import AuthSession
+from gomoku.client.avatar_widgets import AvatarButton, avatar_icon
 from gomoku.client.board_view import BoardView
 from gomoku.client.chat_widgets import (
     ChatLogPanel,
     EmojiPickerButton,
     PresetCommentButton,
 )
+from gomoku.client.confirm_dialog import ConfirmDialog
+from gomoku.client.friends_window import FriendsWindow
 from gomoku.client.history_records import record_from_game_detail
+from gomoku.client.net.social_api import SocialHTTPClient
+from gomoku.client.private_chat_window import PrivateChatWindow
+from gomoku.client.profile_window import AvatarPickerDialog, ProfileWindow
 from gomoku.client.ui_theme import ONLINE_BACKDROP_SPEC, InkBackdrop
 from gomoku.client.board_widget import BoardWidget
 from gomoku.client.config import AppConfig
@@ -61,6 +68,7 @@ from gomoku.client.net.websocket_transport import QtWebSocketTransport
 from gomoku.client.replay_window import ReplayWindow
 from gomoku.client.sessions.online import OnlineGameSession
 from gomoku.client.sound_control import SoundButton
+from gomoku.shared.avatar import normalize_avatar
 from gomoku.shared.chat import (
     CHAT_KIND_EMOJI,
     CHAT_KIND_TEXT,
@@ -71,6 +79,7 @@ from gomoku.shared.errors import TransportError
 from gomoku.shared.protocol import GameSnapshot
 from gomoku.shared.record import GameRecord, RecordError
 from gomoku.shared.rules import BOARD_SIZE, Cell, Player
+from gomoku.shared.social import DirectMessage, FriendEvent
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +131,8 @@ def _result_label(value: object) -> str:
 class OnlinePlayerCard(QFrame):
     """在线对局身份卡，可随再战交换黑白更新颜色。"""
 
+    profile_requested = Signal(str)
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setObjectName("playerCard")
@@ -132,6 +143,9 @@ class OnlinePlayerCard(QFrame):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(14, 10, 14, 10)
         layout.setSpacing(12)
+
+        self.avatar_button = AvatarButton("", "", 36, self)
+        self.avatar_button.clicked_id.connect(self.profile_requested)
 
         self._stone = QLabel(self)
         self._stone.setObjectName("stoneBadgeBlack")
@@ -151,6 +165,9 @@ class OnlinePlayerCard(QFrame):
         text_layout.addWidget(self._name)
         text_layout.addWidget(self._caption)
 
+        layout.addWidget(
+            self.avatar_button, 0, Qt.AlignmentFlag.AlignVCenter
+        )
         layout.addWidget(self._stone, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addLayout(text_layout, 1)
 
@@ -161,7 +178,10 @@ class OnlinePlayerCard(QFrame):
         active: bool,
         status: str,
         rating: Optional[int] = None,
+        avatar: str = "",
+        user_id: str = "",
     ) -> None:
+        self.avatar_button.set_avatar(avatar, user_id)
         badge_name = (
             "stoneBadgeBlack" if color is Player.BLACK else "stoneBadgeWhite"
         )
@@ -185,7 +205,7 @@ class OnlinePlayerCard(QFrame):
 
 
 class OnlineWindow(QMainWindow):
-    """登录、好友房和联机对局窗口。"""
+    """登录、自建房/好友大厅和联机对局窗口。"""
 
     def __init__(self, config: Optional[AppConfig] = None) -> None:
         super().__init__()
@@ -260,6 +280,23 @@ class OnlineWindow(QMainWindow):
         )
         self._recent_games_entries: list = []
         self._replay_window: Optional[ReplayWindow] = None
+
+        self._social_client = SocialHTTPClient(
+            self._api_base_url or None,
+            timeout_seconds=self.config.request_timeout_seconds,
+            parent=self,
+        )
+        self._social_client.response_ready.connect(self._on_social_ready)
+        self._social_client.failed.connect(self._on_social_failed)
+        self._social_client.unauthorized.connect(
+            self._on_social_unauthorized
+        )
+        self._friends_data: dict = {}
+        self._friends_window: Optional[FriendsWindow] = None
+        self._profile_window: Optional[ProfileWindow] = None
+        self._chat_windows: dict[str, PrivateChatWindow] = {}
+        self._pending_profile_user_id = ""
+        self._pending_chat_user: Optional[dict] = None
 
         self._heartbeat_timer = QTimer(self)
         self._heartbeat_timer.setInterval(20_000)
@@ -380,7 +417,7 @@ class OnlineWindow(QMainWindow):
         title = QLabel("五子棋 - 联机对战", card)
         title.setObjectName("onlineTitle")
         subtitle = QLabel(
-            "登录后可参加排位匹配、查看排行榜，也可创建好友房。",
+            "登录后可参加排位匹配、查看排行榜，也可创建自建房邀请好友。",
             card,
         )
         subtitle.setObjectName("onlineSubtitle")
@@ -476,14 +513,23 @@ class OnlineWindow(QMainWindow):
         layout.setSpacing(9)
 
         header = QHBoxLayout()
+        self.self_avatar = AvatarButton("", "", 42, card)
+        self.self_avatar.clicked_id.connect(self._open_user_profile)
+        self.self_avatar.setVisible(False)
         title = QLabel("对战大厅", card)
         title.setObjectName("onlineTitle")
         self.rating_badge_label = QLabel("未定级", card)
         self.rating_badge_label.setObjectName("rankBadge")
         self.rating_badge_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.rating_badge_label.setMinimumWidth(64)
+        self.friends_button = QPushButton("好友", card)
+        self.friends_button.setObjectName("smallButton")
+        self.friends_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.friends_button.setAutoDefault(False)
+        header.addWidget(self.self_avatar)
         header.addWidget(title)
         header.addStretch(1)
+        header.addWidget(self.friends_button)
         header.addWidget(self.rating_badge_label)
         layout.addLayout(header)
 
@@ -500,7 +546,7 @@ class OnlineWindow(QMainWindow):
         ranked_title = QLabel("排位匹配，计入段位积分", card)
         ranked_title.setObjectName("sectionTitle")
         ranked_hint = QLabel(
-            "按积分匹配对手；胜者加分、负者扣分，好友房不计分。", card
+            "按积分匹配对手；胜者加分、负者扣分，自建房不计分。", card
         )
         ranked_hint.setObjectName("hintLabel")
         ranked_hint.setWordWrap(True)
@@ -521,34 +567,20 @@ class OnlineWindow(QMainWindow):
         layout.addWidget(self.match_status_label)
 
         layout.addSpacing(4)
-        friend_title = QLabel("好友房，休闲对局（不计分）", card)
+        friend_title = QLabel("自建房，休闲对局（不计分）", card)
         friend_title.setObjectName("sectionTitle")
         friend_hint = QLabel(
-            "创建房间并把房间码发给好友，或输入好友的房间码加入。", card
+            "创建后直接从好友列表邀请在线好友加入，无需房间码。", card
         )
         friend_hint.setObjectName("hintLabel")
         friend_hint.setWordWrap(True)
 
-        self.create_room_button = QPushButton("创建好友房", card)
+        self.create_room_button = QPushButton("创建自建房", card)
         self.create_room_button.setObjectName("undoButton")
         self.create_room_button.setCursor(Qt.CursorShape.PointingHandCursor)
-
-        room_row = QHBoxLayout()
-        room_row.setSpacing(8)
-        self.room_code_edit = QLineEdit(card)
-        self.room_code_edit.setObjectName("onlineInput")
-        self.room_code_edit.setPlaceholderText("输入 8 位好友房码")
-        self.room_code_edit.setMaxLength(12)
-        self.room_code_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.join_room_button = QPushButton("加入", card)
-        self.join_room_button.setObjectName("undoButton")
-        self.join_room_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        room_row.addWidget(self.room_code_edit, 1)
-        room_row.addWidget(self.join_room_button)
         layout.addWidget(friend_title)
         layout.addWidget(friend_hint)
         layout.addWidget(self.create_room_button)
-        layout.addLayout(room_row)
 
         layout.addSpacing(4)
         leaderboard_header = QHBoxLayout()
@@ -574,9 +606,13 @@ class OnlineWindow(QMainWindow):
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
         self.leaderboard_table.setSelectionMode(
-            QAbstractItemView.SelectionMode.NoSelection
+            QAbstractItemView.SelectionMode.SingleSelection
         )
-        self.leaderboard_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.leaderboard_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.leaderboard_table.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.leaderboard_table.setIconSize(QSize(20, 20))
         self.leaderboard_table.setShowGrid(False)
         self.leaderboard_table.setAlternatingRowColors(True)
         self.leaderboard_table.setHorizontalScrollBarPolicy(
@@ -708,8 +744,10 @@ class OnlineWindow(QMainWindow):
 
         self.quick_match_button.clicked.connect(self._on_quick_match)
         self.create_room_button.clicked.connect(self._on_create_room)
-        self.join_room_button.clicked.connect(self._on_join_room)
-        self.room_code_edit.returnPressed.connect(self._on_join_room)
+        self.friends_button.clicked.connect(self._open_friends_window)
+        self.leaderboard_table.cellClicked.connect(
+            self._on_leaderboard_cell_clicked
+        )
         self.refresh_leaderboard_button.clicked.connect(
             self._on_refresh_leaderboard
         )
@@ -737,12 +775,20 @@ class OnlineWindow(QMainWindow):
         layout.setSpacing(8)
 
         top = QHBoxLayout()
-        self.room_title_label = QLabel("好友房", page)
+        self.room_title_label = QLabel("自建房", page)
         self.room_title_label.setObjectName("onlineRoomTitle")
+        self.invite_friend_button = QPushButton("邀请好友", page)
+        self.invite_friend_button.setObjectName("smallButton")
+        self.invite_friend_button.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.invite_friend_button.setAutoDefault(False)
+        self.invite_friend_button.setVisible(False)
         self.connection_label = QLabel("未连接", page)
         self.connection_label.setObjectName("onlineStatus")
         self.connection_label.setAlignment(Qt.AlignmentFlag.AlignRight)
         top.addWidget(self.room_title_label)
+        top.addWidget(self.invite_friend_button)
         top.addStretch(1)
         top.addWidget(self.connection_label)
         layout.addLayout(top)
@@ -751,6 +797,10 @@ class OnlineWindow(QMainWindow):
         cards.setSpacing(12)
         self.you_card = OnlinePlayerCard(page)
         self.opponent_card = OnlinePlayerCard(page)
+        self.you_card.profile_requested.connect(self._open_user_profile)
+        self.opponent_card.profile_requested.connect(
+            self._open_user_profile
+        )
         cards.addWidget(self.you_card, 1)
         cards.addWidget(self.opponent_card, 1)
         layout.addLayout(cards)
@@ -874,6 +924,9 @@ class OnlineWindow(QMainWindow):
         self.resign_button.clicked.connect(self._on_resign)
         self.rematch_button.clicked.connect(self._on_rematch)
         self.leave_button.clicked.connect(self._on_leave_room)
+        self.invite_friend_button.clicked.connect(
+            self._on_invite_friend_clicked
+        )
         self.emoji_button.emoji_picked.connect(self._on_emoji_picked)
         self.preset_comment_button.comment_picked.connect(
             self._on_preset_comment_picked
@@ -946,12 +999,7 @@ class OnlineWindow(QMainWindow):
             "取消排位匹配" if queued else "开始排位匹配"
         )
         friend_enabled = connected and not pending and not queued
-        for widget in (
-            self.create_room_button,
-            self.room_code_edit,
-            self.join_room_button,
-        ):
-            widget.setEnabled(friend_enabled)
+        self.create_room_button.setEnabled(friend_enabled)
         self.refresh_leaderboard_button.setEnabled(
             connected and not self._profile_client.busy
         )
@@ -1048,6 +1096,7 @@ class OnlineWindow(QMainWindow):
         self._profile_client.fetch_profile(token)
         self._profile_client.fetch_leaderboard(token, 50)
         self._history_client.fetch_recent(token, 20)
+        self._social_client.fetch_friends(token)
 
     def _on_refresh_leaderboard(self) -> None:
         if self._auth_session is None:
@@ -1062,6 +1111,7 @@ class OnlineWindow(QMainWindow):
         raw_user = data.get("user")
         if isinstance(raw_user, Mapping):
             self._profile_user = dict(raw_user)
+        self._update_self_avatar()
         self._update_rating_summary()
 
     def _on_leaderboard_ready(self, data: object) -> None:
@@ -1110,6 +1160,14 @@ class OnlineWindow(QMainWindow):
                         Qt.AlignmentFlag.AlignVCenter
                         | Qt.AlignmentFlag.AlignLeft
                     )
+                    item.setIcon(
+                        avatar_icon(
+                            entry.get("avatar"),
+                            str(entry.get("user_id", "")),
+                            20,
+                        )
+                    )
+                    item.setToolTip("点击玩家查看个人信息")
                 else:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 table.setItem(row, column, item)
@@ -1145,6 +1203,547 @@ class OnlineWindow(QMainWindow):
         if hasattr(self, "refresh_leaderboard_button"):
             self._refresh_lobby_controls()
 
+    def _on_leaderboard_cell_clicked(self, row: int, column: int) -> None:
+        """点击排行榜玩家列打开个人信息。"""
+        if column != 1:
+            return
+        if 0 <= row < len(self._leaderboard_entries):
+            entry = self._leaderboard_entries[row]
+            if isinstance(entry, Mapping):
+                user_id = entry.get("user_id")
+                if isinstance(user_id, str) and user_id:
+                    self._open_user_profile(user_id)
+
+    # ------------------------------------------------------------------
+    # 个人信息/头像
+    # ------------------------------------------------------------------
+    def _update_self_avatar(self) -> None:
+        if self._auth_session is None:
+            return
+        user = self._auth_session.user
+        self.self_avatar.set_avatar(user.avatar, user.id)
+        self.self_avatar.setVisible(True)
+
+    def _self_profile(self) -> dict:
+        user = dict(self._profile_user or {})
+        if self._auth_session is not None:
+            auth_user = self._auth_session.user
+            user.setdefault("id", auth_user.id)
+            user.setdefault("username", auth_user.username)
+            user.setdefault("avatar", auth_user.avatar)
+            user.setdefault("rating", auth_user.rating)
+            user.setdefault("peak_rating", auth_user.peak_rating)
+            user.setdefault("rated_games", auth_user.rated_games)
+            user.setdefault("wins", auth_user.wins)
+            user.setdefault("losses", auth_user.losses)
+            user.setdefault("draws", auth_user.draws)
+            user.setdefault("rank_name", auth_user.rank_name)
+            user.setdefault("win_rate", auth_user.win_rate)
+        return {"user": user, "online": True, "friendship": "self"}
+
+    def _open_user_profile(self, user_id: str) -> None:
+        if not user_id or self._auth_session is None:
+            return
+        self._pending_profile_user_id = user_id
+        if self._auth_session.user.id == user_id:
+            self._show_profile_window(self._self_profile())
+            return
+        self._social_client.fetch_user(
+            self._auth_session.access_token, user_id
+        )
+
+    def _show_profile_window(self, profile: object) -> None:
+        if not isinstance(profile, Mapping):
+            return
+        self._current_profile = dict(profile)
+        if self._profile_window is None:
+            window = ProfileWindow(self)
+            window.add_friend_requested.connect(
+                self._send_friend_request
+            )
+            window.message_requested.connect(
+                self._open_private_chat
+            )
+            window.remove_friend_requested.connect(self._remove_friend)
+            window.avatar_requested.connect(self._open_avatar_picker)
+            window.open_friends_requested.connect(
+                self._open_friends_window
+            )
+            window.destroyed.connect(
+                lambda *_: setattr(self, "_profile_window", None)
+            )
+            self._profile_window = window
+        self._profile_window.set_profile(profile)
+        self._profile_window.show()
+        self._profile_window.raise_()
+        self._profile_window.activateWindow()
+
+    def _open_avatar_picker(self) -> None:
+        if self._auth_session is None:
+            return
+        picker = AvatarPickerDialog(
+            self._auth_session.user.avatar, self
+        )
+        picker.avatar_selected.connect(self._on_avatar_selected)
+        picker.exec()
+
+    def _on_avatar_selected(self, avatar: str) -> None:
+        if self._auth_session is None:
+            return
+        self._social_client.update_avatar(
+            self._auth_session.access_token, avatar
+        )
+
+    def _apply_avatar_update(self, data: object) -> None:
+        if not isinstance(data, Mapping) or self._auth_session is None:
+            return
+        avatar = data.get("avatar")
+        if not isinstance(avatar, str):
+            return
+        user = replace(
+            self._auth_session.user,
+            avatar=normalize_avatar(
+                avatar, self._auth_session.user.id
+            ),
+        )
+        self._auth_session = replace(self._auth_session, user=user)
+        if self._profile_user is not None:
+            self._profile_user["avatar"] = user.avatar
+        self._update_self_avatar()
+        if self._profile_window is not None:
+            self._profile_window.set_avatar(user.avatar)
+        self._show_status("头像已更新")
+
+    # ------------------------------------------------------------------
+    # 好友
+    # ------------------------------------------------------------------
+    def _refresh_friends(self) -> None:
+        if self._auth_session is None:
+            return
+        self._social_client.fetch_friends(
+            self._auth_session.access_token
+        )
+
+    def _update_friends_badge(self) -> None:
+        incoming = self._friends_data.get("incoming", [])
+        count = len(incoming) if isinstance(incoming, list) else 0
+        self.friends_button.setText(
+            f"好友 ({count})" if count else "好友"
+        )
+
+    def _open_friends_window(self, invite_mode: bool = False) -> None:
+        if self._auth_session is None:
+            return
+        if self._friends_window is not None:
+            self._friends_window.show()
+            self._friends_window.raise_()
+            self._friends_window.activateWindow()
+            return
+        window = FriendsWindow(self, invite_mode=invite_mode)
+        window.profile_requested.connect(self._open_user_profile)
+        window.chat_requested.connect(self._open_private_chat)
+        window.invite_requested.connect(self._invite_friend)
+        window.add_requested.connect(self._send_friend_request)
+        window.accept_requested.connect(self._accept_friend_request)
+        window.decline_requested.connect(self._decline_friend_request)
+        window.remove_requested.connect(self._remove_friend)
+        window.search_requested.connect(self._search_users)
+        window.refresh_requested.connect(self._refresh_friends)
+        window.destroyed.connect(
+            lambda *_: setattr(self, "_friends_window", None)
+        )
+        self._friends_window = window
+        if self._friends_data:
+            window.set_data(self._friends_data)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        self._refresh_friends()
+
+    def _send_friend_request(self, user_id: str) -> None:
+        if self._auth_session is None or not user_id:
+            return
+        self._social_client.send_friend_request(
+            self._auth_session.access_token, user_id
+        )
+        self._show_status("正在发送好友申请…")
+
+    def _accept_friend_request(self, request_id: str) -> None:
+        if self._auth_session is None or not request_id:
+            return
+        self._social_client.accept_friend_request(
+            self._auth_session.access_token, request_id
+        )
+
+    def _decline_friend_request(self, request_id: str) -> None:
+        if self._auth_session is None or not request_id:
+            return
+        self._social_client.decline_friend_request(
+            self._auth_session.access_token, request_id
+        )
+
+    def _remove_friend(self, user_id: str) -> None:
+        if self._auth_session is None or not user_id:
+            return
+        username, _ = self._username_avatar(user_id)
+        dialog = ConfirmDialog(
+            "删除好友",
+            f"确定删除好友「{username}」吗？",
+            confirm_text="删除",
+            cancel_text="取消",
+            seal_text="友",
+            parent=self,
+        )
+        dialog.exec()
+        if not dialog.confirm_requested:
+            return
+        self._social_client.remove_friend(
+            self._auth_session.access_token, user_id
+        )
+
+    def _search_users(self, query: str) -> None:
+        if self._auth_session is None:
+            return
+        if self._friends_window is not None:
+            self._friends_window.set_status("正在搜索…")
+        self._social_client.search_users(
+            self._auth_session.access_token, query
+        )
+
+    def _refresh_open_profile(self) -> None:
+        if (
+            self._profile_window is not None
+            and self._pending_profile_user_id
+            and self._auth_session is not None
+        ):
+            self._social_client.fetch_user(
+                self._auth_session.access_token,
+                self._pending_profile_user_id,
+            )
+
+    def _username_avatar(
+        self, user_id: str, fallback: str = ""
+    ) -> tuple[str, str]:
+        current = getattr(self, "_current_profile", None)
+        if isinstance(current, Mapping):
+            user = current.get("user")
+            if isinstance(user, Mapping) and user.get("id") == user_id:
+                return (
+                    str(user.get("username", fallback or "好友")),
+                    str(user.get("avatar", "")),
+                )
+        for section in ("friends", "incoming", "outgoing"):
+            entries = self._friends_data.get(section, [])
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, Mapping):
+                    continue
+                entry_id = entry.get("user_id") or entry.get("id")
+                if entry_id == user_id:
+                    return (
+                        str(entry.get("username", fallback or "好友")),
+                        str(entry.get("avatar", "")),
+                    )
+        return fallback or "好友", ""
+
+    # ------------------------------------------------------------------
+    # 私聊
+    # ------------------------------------------------------------------
+    def _open_private_chat(
+        self, user_id: str, username: str = ""
+    ) -> None:
+        if not user_id:
+            return
+        existing = self._chat_windows.get(user_id)
+        if existing is not None:
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            return
+        resolved_name, avatar = self._username_avatar(user_id, username)
+        window = PrivateChatWindow(
+            user_id, resolved_name, avatar, self
+        )
+        window.send_requested.connect(
+            lambda text, uid=user_id: self._send_private_message(
+                uid, text
+            )
+        )
+        window.destroyed.connect(
+            lambda *_: self._chat_windows.pop(user_id, None)
+        )
+        self._chat_windows[user_id] = window
+        window.set_send_enabled(True)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        if self._auth_session is not None:
+            self._social_client.fetch_messages(
+                self._auth_session.access_token, user_id
+            )
+
+    def _send_private_message(self, user_id: str, text: str) -> None:
+        if self._auth_session is None or not text.strip():
+            return
+        window = self._chat_windows.get(user_id)
+        if window is not None:
+            window.set_status("发送中…")
+        self._social_client.send_message(
+            self._auth_session.access_token, user_id, text
+        )
+
+    def _on_direct_message(self, message: object) -> None:
+        if not isinstance(message, DirectMessage):
+            return
+        payload = {
+            "sender_id": message.sender_id,
+            "sender_name": message.sender_name,
+            "content": message.content,
+            "sent_at_ms": message.sent_at_ms,
+        }
+        self_id = (
+            self._auth_session.user.id if self._auth_session else ""
+        )
+        window = self._chat_windows.get(message.sender_id)
+        if window is not None:
+            window.append_message(payload, self_id)
+            window.set_status("")
+        else:
+            self._show_status(f"收到 {message.sender_name} 的新消息")
+            self._refresh_friends()
+
+    # ------------------------------------------------------------------
+    # 好友事件/自建房邀请
+    # ------------------------------------------------------------------
+    def _on_friend_event(self, event: object) -> None:
+        if not isinstance(event, FriendEvent):
+            return
+        if event.event == "request":
+            self._show_status(f"{event.username} 想加你为好友")
+            if (
+                self.stack.currentWidget() is self.lobby_page
+                and event.request_id
+            ):
+                dialog = ConfirmDialog(
+                    "好友申请",
+                    f"{event.username} 想加你为好友，是否接受？",
+                    confirm_text="接受",
+                    cancel_text="稍后处理",
+                    seal_text="友",
+                    parent=self,
+                )
+                dialog.exec()
+                if dialog.confirm_requested:
+                    self._accept_friend_request(event.request_id)
+        elif event.event == "accepted":
+            self._show_status(f"你和 {event.username} 已成为好友")
+        elif event.event == "removed":
+            self._show_status(f"{event.username} 已从好友列表中移除")
+        elif event.event == "declined":
+            self._show_status(f"{event.username} 拒绝了你的好友申请")
+        self._refresh_friends()
+
+    def _on_room_invited(self, payload: object) -> None:
+        if (
+            self._session is None
+            or not isinstance(payload, Mapping)
+        ):
+            return
+        invite_id = payload.get("invite_id")
+        inviter = payload.get("inviter")
+        if not isinstance(invite_id, str) or not isinstance(
+            inviter, Mapping
+        ):
+            return
+        name = str(inviter.get("username", "好友"))
+        if self._session.in_room:
+            self._session.respond_room_invite(invite_id, False)
+            self._show_status(
+                "你正在对局中，已拒绝好友邀请", error=True
+            )
+            return
+        dialog = ConfirmDialog(
+            "对局邀请",
+            f"{name} 邀请你进行一局自建房对局，是否接受？",
+            confirm_text="接受",
+            cancel_text="拒绝",
+            seal_text="邀",
+            parent=self,
+        )
+        dialog.exec()
+        accept = dialog.confirm_requested
+        self._session.respond_room_invite(invite_id, accept)
+        self._show_status(
+            "已接受邀请，正在进入房间…"
+            if accept
+            else "已拒绝好友邀请"
+        )
+
+    def _on_room_invite_result(self, payload: object) -> None:
+        if not isinstance(payload, Mapping):
+            return
+        status = payload.get("status")
+        user = payload.get("user")
+        name = (
+            str(user.get("username", "好友"))
+            if isinstance(user, Mapping)
+            else "好友"
+        )
+        reason = str(payload.get("reason", ""))
+        if status == "sent":
+            self._show_status(f"已向 {name} 发送对局邀请")
+        elif status == "accepted":
+            self._show_status(f"{name} 已接受邀请，正在开始对局")
+        elif status == "declined":
+            self._show_status(f"{name} 拒绝了邀请", error=True)
+        elif status == "cancelled":
+            self._show_status(
+                f"对局邀请已失效{('：' + reason) if reason else ''}",
+                error=True,
+            )
+
+    def _on_invite_friend_clicked(self) -> None:
+        self._open_friends_window(invite_mode=True)
+
+    def _invite_friend(self, user_id: str, username: str) -> None:
+        if self._session is None or not user_id:
+            return
+        if not self._session.waiting_for_opponent:
+            self._show_status("请先创建自建房", error=True)
+            return
+        if self._session.invite_to_room(user_id):
+            self._show_status(f"已向 {username} 发送对局邀请")
+
+    # ------------------------------------------------------------------
+    # 社交响应
+    # ------------------------------------------------------------------
+    def _on_social_ready(self, kind: str, data: object) -> None:
+        if not isinstance(kind, str):
+            return
+        if kind.startswith("user:"):
+            self._show_profile_window(data)
+            return
+        if kind == "avatar":
+            self._apply_avatar_update(data)
+            return
+        if kind == "search":
+            entries = (
+                data.get("entries", [])
+                if isinstance(data, Mapping)
+                else []
+            )
+            if self._friends_window is not None:
+                self._friends_window.set_search_results(entries)
+                self._friends_window.set_status(
+                    f"找到 {len(entries)} 位玩家"
+                )
+            return
+        if kind == "friends":
+            if isinstance(data, Mapping):
+                self._friends_data = dict(data)
+            self._update_friends_badge()
+            if self._friends_window is not None:
+                self._friends_window.set_data(self._friends_data)
+            return
+        if kind == "friend_request":
+            self._show_status("好友申请已发送")
+            self._refresh_friends()
+            self._refresh_open_profile()
+            return
+        if kind == "friend_accept":
+            self._show_status("已添加好友")
+            self._refresh_friends()
+            self._refresh_open_profile()
+            return
+        if kind in ("friend_decline", "friend_remove"):
+            self._refresh_friends()
+            self._refresh_open_profile()
+            return
+        if kind.startswith("messages:"):
+            user_id = kind.split(":", 1)[1]
+            window = self._chat_windows.get(user_id)
+            if window is None:
+                return
+            messages = (
+                data.get("messages", [])
+                if isinstance(data, Mapping)
+                else []
+            )
+            self_id = (
+                self._auth_session.user.id
+                if self._auth_session
+                else ""
+            )
+            window.set_history(messages, self_id)
+            window.set_status("")
+            window.set_send_enabled(True)
+            return
+        if kind.startswith("message_send:"):
+            user_id = kind.split(":", 1)[1]
+            window = self._chat_windows.get(user_id)
+            if window is not None and isinstance(data, Mapping):
+                self_id = (
+                    self._auth_session.user.id
+                    if self._auth_session
+                    else ""
+                )
+                window.append_message(data, self_id)
+                window.set_status("")
+
+    def _on_social_failed(self, kind: str, message: str) -> None:
+        logger.warning("社交请求失败 kind=%s：%s", kind, message)
+        if kind.startswith("messages:") or kind.startswith(
+            "message_send:"
+        ):
+            user_id = kind.split(":", 1)[1]
+            window = self._chat_windows.get(user_id)
+            if window is not None:
+                window.set_status(message or "发送失败")
+                return
+        if self._friends_window is not None and kind in (
+            "friends",
+            "friend_request",
+            "friend_accept",
+            "friend_decline",
+            "friend_remove",
+            "search",
+        ):
+            self._friends_window.set_status(message)
+        self._show_status(message or "操作失败", error=True)
+
+    def _on_social_unauthorized(self, _kind: str) -> None:
+        if self._auth_session is None or self._auth_client.busy:
+            return
+        self._refresh_after_auth_refresh = True
+        if not self._auth_client.refresh():
+            self._refresh_after_auth_refresh = False
+            self._force_relogin("登录已过期，请重新登录")
+
+    def _show_status(self, text: str, error: bool = False) -> None:
+        if self.stack.currentWidget() is self.game_page:
+            self.game_error_label.setText(text)
+        else:
+            self._set_lobby_status(text, error=error)
+
+    def _close_social_windows(self) -> None:
+        for window in (self._friends_window, self._profile_window):
+            if window is not None:
+                try:
+                    window.close()
+                except RuntimeError:
+                    pass
+        for window in list(self._chat_windows.values()):
+            try:
+                window.close()
+            except RuntimeError:
+                pass
+        self._friends_window = None
+        self._profile_window = None
+        self._chat_windows.clear()
+        self._friends_data = {}
+        self._pending_profile_user_id = ""
+
     # ------------------------------------------------------------------
     # 最近对局/复盘
     # ------------------------------------------------------------------
@@ -1179,7 +1778,7 @@ class OnlineWindow(QMainWindow):
                 _format_game_time(entry.get("ended_at")),
                 str(entry.get("opponent_username", "对手")),
                 _result_label(entry.get("result")),
-                "排位" if entry.get("rated") else "好友房",
+                "排位" if entry.get("rated") else "自建房",
                 str(entry.get("move_no", 0)),
             )
             for column, text in enumerate(values):
@@ -1202,7 +1801,7 @@ class OnlineWindow(QMainWindow):
             )
         else:
             self.history_status_label.setText(
-                "暂无已完成对局，完成一局排位或好友房后会显示在这里"
+                "暂无已完成对局，完成一局排位或自建房后会显示在这里"
             )
         self.replay_history_button.setEnabled(False)
 
@@ -1397,8 +1996,10 @@ class OnlineWindow(QMainWindow):
         self._teardown_ws()
         self._profile_client.abort_all()
         self._history_client.abort_all()
+        self._social_client.abort_all()
         self._auth_client.logout()
         self._auth_session = None
+        self._close_social_windows()
         self._clear_profile_ui()
         self._show_auth_page()
         self._set_auth_status("已退出登录")
@@ -1408,6 +2009,8 @@ class OnlineWindow(QMainWindow):
         self._auth_session = None
         self._profile_client.abort_all()
         self._history_client.abort_all()
+        self._social_client.abort_all()
+        self._close_social_windows()
         self._clear_profile_ui()
         self._show_auth_page()
         self._set_auth_status("已退出登录")
@@ -1440,6 +2043,10 @@ class OnlineWindow(QMainWindow):
         session.matched.connect(self._on_match_found)
         session.chat_received.connect(self._on_chat_received)
         session.chat_failed.connect(self._on_chat_failed)
+        session.room_invited.connect(self._on_room_invited)
+        session.room_invite_result.connect(self._on_room_invite_result)
+        session.friend_event.connect(self._on_friend_event)
+        session.direct_message.connect(self._on_direct_message)
 
         self._open_transport(reset_status=True)
 
@@ -1479,9 +2086,11 @@ class OnlineWindow(QMainWindow):
             self._auth_session.user.username if self._auth_session else ""
         )
         self.lobby_welcome_label.setText(f"已登录：{username}")
+        self._update_self_avatar()
         self._show_lobby_page("已连接联机服务器")
         self._set_match_status("")
         self._refresh_profile_data()
+        self._refresh_friends()
         self._refresh_lobby_controls()
 
     def _on_ws_disconnected(self, reason: str) -> None:
@@ -1559,7 +2168,9 @@ class OnlineWindow(QMainWindow):
         self._teardown_ws()
         self._profile_client.abort_all()
         self._history_client.abort_all()
+        self._social_client.abort_all()
         self._auth_session = None
+        self._close_social_windows()
         self._clear_profile_ui()
         self._show_auth_page()
         self._set_auth_status(message, error=True)
@@ -1589,28 +2200,11 @@ class OnlineWindow(QMainWindow):
         if self._room_action_pending:
             return
         self._room_action_pending = True
-        self._set_lobby_status("正在创建好友房…")
+        self._set_lobby_status("正在创建自建房…")
         self._refresh_lobby_controls()
         if not self._session.create_room():
             self._room_action_pending = False
             self._set_lobby_status("无法创建房间，请检查连接", error=True)
-            self._refresh_lobby_controls()
-
-    def _on_join_room(self) -> None:
-        if self._session is None:
-            return
-        code = self.room_code_edit.text().strip().upper()
-        if not code:
-            self._set_lobby_status("请输入好友的房间码", error=True)
-            return
-        if self._room_action_pending:
-            return
-        self._room_action_pending = True
-        self._set_lobby_status("正在加入好友房…")
-        self._refresh_lobby_controls()
-        if not self._session.join_room(code):
-            self._room_action_pending = False
-            self._set_lobby_status("无法加入房间，请检查连接", error=True)
             self._refresh_lobby_controls()
 
     def _on_quick_match(self) -> None:
@@ -1669,7 +2263,6 @@ class OnlineWindow(QMainWindow):
         self._room_action_pending = False
         # 新房间 = 新的对话上下文，旧房间的聊天记录不再保留。
         self._clear_chat_area()
-        self.room_code_edit.clear()
         self._set_match_status("")
         self._show_game_page()
 
@@ -1678,7 +2271,6 @@ class OnlineWindow(QMainWindow):
         self._audio_game_id = None
         self.clock_label.setText("—")
         self._deadline_monotonic = None
-        self.room_code_edit.clear()
         self.game_rating_label.clear()
         self.game_rating_label.setVisible(False)
         self._set_match_status("")
@@ -1908,7 +2500,6 @@ class OnlineWindow(QMainWindow):
         if not session.is_authenticated:
             return
         if session.waiting_for_opponent or session.snapshot is not None:
-            self.room_code_edit.clear()
             self._show_game_page()
             self._sync_game_page()
         elif self.stack.currentWidget() is self.game_page:
@@ -1939,10 +2530,16 @@ class OnlineWindow(QMainWindow):
             if waiting
             else f"对手，{session.opponent_username}"
         )
-        self.room_title_label.setText(
-            "排位赛，积分对局"
-            if rated
-            else f"好友房，{session.room_code or '------'}"
+        if rated:
+            room_title = "排位赛，积分对局"
+        elif waiting:
+            room_title = "自建房，等待好友"
+        else:
+            room_title = "自建房，休闲对局"
+        self.room_title_label.setText(room_title)
+        self.invite_friend_button.setVisible(waiting)
+        self.invite_friend_button.setEnabled(
+            waiting and self._ws_connected
         )
         self.connection_label.setText(
             "已连接" if self._ws_connected else "连接中断"
@@ -1960,9 +2557,48 @@ class OnlineWindow(QMainWindow):
             else session.opponent_rating
         )
 
+        self_id = self._auth_session.user.id if self._auth_session else ""
+        self_avatar = (
+            self._auth_session.user.avatar if self._auth_session else ""
+        )
+        if snapshot is not None:
+            black_id = snapshot.black_user_id
+            white_id = snapshot.white_user_id
+            black_avatar = snapshot.black_avatar
+            white_avatar = snapshot.white_avatar
+        else:
+            black_id = self_id if your_color is Player.BLACK else ""
+            white_id = self_id if your_color is Player.WHITE else ""
+            black_avatar = (
+                self_avatar if your_color is Player.BLACK else ""
+            )
+            white_avatar = (
+                self_avatar if your_color is Player.WHITE else ""
+            )
+        you_id = black_id if your_color is Player.BLACK else white_id
+        opponent_id = (
+            white_id if your_color is Player.BLACK else black_id
+        )
+        you_avatar = (
+            black_avatar
+            if your_color is Player.BLACK
+            else white_avatar
+        )
+        opponent_avatar = (
+            white_avatar
+            if your_color is Player.BLACK
+            else black_avatar
+        )
+
         if waiting:
             self.you_card.set_content(
-                you_name, your_color, False, "等待对手", your_rating
+                you_name,
+                your_color,
+                False,
+                "等待对手",
+                your_rating,
+                avatar=you_avatar,
+                user_id=you_id,
             )
             self.opponent_card.set_content(
                 opponent_name,
@@ -1970,9 +2606,11 @@ class OnlineWindow(QMainWindow):
                 False,
                 "等待对手加入",
                 opponent_rating,
+                avatar="",
+                user_id="",
             )
             self._set_game_pill("等待对手", result=False)
-            self.clock_label.setText("把房间码分享给好友")
+            self.clock_label.setText("等待好友加入…")
             self.move_label.setText("第 0 手")
             self.game_rating_label.clear()
             self.game_rating_label.setVisible(False)
@@ -1987,7 +2625,13 @@ class OnlineWindow(QMainWindow):
             return
 
         self.you_card.set_content(
-            you_name, your_color, False, "等待", your_rating
+            you_name,
+            your_color,
+            False,
+            "等待",
+            your_rating,
+            avatar=you_avatar,
+            user_id=you_id,
         )
         self.opponent_card.set_content(
             opponent_name,
@@ -1995,6 +2639,8 @@ class OnlineWindow(QMainWindow):
             False,
             "等待" if session.opponent_online else "已离线",
             opponent_rating,
+            avatar=opponent_avatar,
+            user_id=opponent_id,
         )
         if snapshot is None:
             self.clock_label.setText("—")
@@ -2035,6 +2681,8 @@ class OnlineWindow(QMainWindow):
                 if winner is your_color
                 else ("平局" if winner is None else "本局结束"),
                 your_rating,
+                avatar=you_avatar,
+                user_id=you_id,
             )
             self.opponent_card.set_content(
                 opponent_name,
@@ -2044,6 +2692,8 @@ class OnlineWindow(QMainWindow):
                 if winner is opponent_color
                 else ("平局" if winner is None else "本局结束"),
                 opponent_rating,
+                avatar=opponent_avatar,
+                user_id=opponent_id,
             )
             if winner is None:
                 self._set_game_pill("本局平局", result=True)
@@ -2199,6 +2849,8 @@ class OnlineWindow(QMainWindow):
         self._auth_client.abort()
         self._profile_client.abort_all()
         self._history_client.abort_all()
+        self._social_client.abort_all()
+        self._close_social_windows()
         if self._replay_window is not None:
             try:
                 self._replay_window.close()

@@ -21,9 +21,10 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from starlette.websockets import WebSocket
 
+from gomoku.shared.avatar import DEFAULT_AVATAR, normalize_avatar
 from gomoku.shared.chat import (
     CHAT_BURST,
     CHAT_WINDOW_SECONDS,
@@ -34,6 +35,7 @@ from gomoku.shared.game_model import GameModel
 from gomoku.shared.protocol import (
     SERVER_ERROR,
     SERVER_CHAT,
+    SERVER_FRIEND_EVENT,
     SERVER_GAME_STATE,
     SERVER_MATCH_FOUND,
     SERVER_MOVE_REJECTED,
@@ -42,17 +44,31 @@ from gomoku.shared.protocol import (
     SERVER_REMATCH_STATUS,
     SERVER_ROOM_CLOSED,
     SERVER_ROOM_CREATED,
+    SERVER_ROOM_INVITATION,
+    SERVER_ROOM_INVITE_RESULT,
     make_message,
 )
 from gomoku.shared.rules import BOARD_SIZE, Player
+from gomoku.shared.social import (
+    FRIEND_EVENT_OFFLINE,
+    FRIEND_EVENT_ONLINE,
+)
 from server.app.config import Settings
 from server.app.db import utcnow_naive
-from server.app.models import Game, Move, RatingEvent, User, new_id
+from server.app.models import (
+    Friendship,
+    Game,
+    Move,
+    RatingEvent,
+    User,
+    new_id,
+)
 from server.app.ratings import calculate_pair, rank_for_rating
 
 logger = logging.getLogger(__name__)
 
 _ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+_INVITE_TTL_SECONDS = 60.0
 
 
 def _now_ms() -> int:
@@ -81,6 +97,8 @@ class ClientConnection:
     user_id: str
     username: str
     websocket: WebSocket
+    avatar: str = DEFAULT_AVATAR
+    rating: int = 0
     connected: bool = True
     _send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -126,6 +144,8 @@ class Room:
     black_name: str
     white_name: str
     turn_seconds: int
+    black_avatar: str = DEFAULT_AVATAR
+    white_avatar: str = DEFAULT_AVATAR
     game: GameModel = field(default_factory=GameModel)
     status: str = "waiting"  # waiting/playing/black_won/white_won/draw
     winner_user_id: Optional[str] = None
@@ -170,12 +190,30 @@ class Room:
             return self.white_name
         return "对手"
 
+    def avatar_for(self, user_id: str) -> str:
+        if user_id == self.black_user_id:
+            return normalize_avatar(self.black_avatar, user_id)
+        if user_id == self.white_user_id:
+            return normalize_avatar(self.white_avatar, user_id)
+        return DEFAULT_AVATAR
+
     def participant_ids(self) -> list[str]:
         return [
             uid
             for uid in (self.black_user_id, self.white_user_id)
             if uid
         ]
+
+
+@dataclass
+class RoomInvite:
+    """房主向在线好友发出的对局邀请（单进程内存状态）。"""
+
+    invite_id: str
+    room: Room
+    inviter_id: str
+    invitee_id: str
+    created_at: float
 
 
 class RoomManager:
@@ -192,6 +230,9 @@ class RoomManager:
         self._room_by_user: dict[str, Room] = {}
         self._connections: dict[str, ClientConnection] = {}
         self._queue: dict[str, QueuedPlayer] = {}
+        self._invites: dict[str, RoomInvite] = {}
+        # 好友 id 缓存：连接建立时刷新，断开时只读缓存，避免关闭路径再查库。
+        self._friend_cache: dict[str, frozenset[str]] = {}
         self._state_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
@@ -199,6 +240,28 @@ class RoomManager:
     # ------------------------------------------------------------------
     def _is_current_connection(self, conn: ClientConnection) -> bool:
         return self._connections.get(conn.user_id) is conn
+
+    def is_online(self, user_id: str) -> bool:
+        """用户当前是否有一条活动连接。"""
+        conn = self._connections.get(user_id)
+        return conn is not None and conn.connected
+
+    async def send_to_user(self, user_id: str, message: dict) -> bool:
+        """向指定用户的当前连接发送一条消息。"""
+        conn = self._connections.get(user_id)
+        if conn is None or not conn.connected:
+            return False
+        return await conn.send(message)
+
+    def _connection_user_payload(self, conn: ClientConnection) -> dict:
+        """连接用户的好友/邀请摘要。"""
+        return {
+            "id": conn.user_id,
+            "username": conn.username,
+            "avatar": normalize_avatar(conn.avatar, conn.user_id),
+            "rating": conn.rating,
+            "rank_name": rank_for_rating(conn.rating).name,
+        }
 
     async def _send_error(
         self,
@@ -339,6 +402,14 @@ class RoomManager:
             "room_code": "" if room.matchmade else room.code,
             "black_name": room.black_name,
             "white_name": room.white_name,
+            "black_user_id": room.black_user_id,
+            "white_user_id": room.white_user_id or "",
+            "black_avatar": room.avatar_for(room.black_user_id),
+            "white_avatar": (
+                room.avatar_for(room.white_user_id)
+                if room.white_user_id
+                else DEFAULT_AVATAR
+            ),
             "turn_deadline_ms": room.turn_deadline_ms,
             "server_now_ms": _now_ms(),
             "move_timeout_seconds": room.turn_seconds,
@@ -399,6 +470,65 @@ class RoomManager:
     # ------------------------------------------------------------------
     # 连接生命周期
     # ------------------------------------------------------------------
+    async def _load_friend_ids(self, user_id: str) -> list[str]:
+        """查询已接受好友的 id 列表并刷新缓存；数据库异常时返回空表。"""
+        try:
+            async with self._session_factory() as session:
+                rows = (
+                    await session.scalars(
+                        select(Friendship).where(
+                            Friendship.status == "accepted",
+                            or_(
+                                Friendship.user_a == user_id,
+                                Friendship.user_b == user_id,
+                            ),
+                        )
+                    )
+                ).all()
+        except Exception:
+            logger.exception("查询好友列表失败 user=%s", user_id)
+            return []
+        ids = [
+            row.user_b if row.user_a == user_id else row.user_a
+            for row in rows
+        ]
+        self._friend_cache[user_id] = frozenset(ids)
+        return ids
+
+    async def refresh_friend_cache(self, user_id: str) -> None:
+        """好友关系变化后刷新缓存（供 REST 接口调用）。"""
+        await self._load_friend_ids(user_id)
+
+    async def _notify_friends_presence(
+        self, conn: ClientConnection, online: bool
+    ) -> None:
+        """向在线好友推送上下线事件。"""
+        if online:
+            friend_ids = await self._load_friend_ids(conn.user_id)
+        else:
+            # 断开时不再查库，使用连接建立时缓存的快照。
+            friend_ids = list(
+                self._friend_cache.get(conn.user_id, frozenset())
+            )
+        if not friend_ids:
+            return
+        message = make_message(
+            SERVER_FRIEND_EVENT,
+            {
+                "event": (
+                    FRIEND_EVENT_ONLINE
+                    if online
+                    else FRIEND_EVENT_OFFLINE
+                ),
+                "user": self._connection_user_payload(conn),
+                "online": online,
+            },
+        )
+        for friend_id in friend_ids:
+            target = self._connections.get(friend_id)
+            if target is not None:
+                await target.send(message)
+
     async def attach(self, conn: ClientConnection) -> None:
         """认证后的连接注册；若用户在房间中则重连并发送权威快照。"""
         old_conn: Optional[ClientConnection] = None
@@ -412,26 +542,29 @@ class RoomManager:
         if old_conn is not None and old_conn is not conn:
             await old_conn.close(4001, "账号已在另一处连接")
 
-        room = self._room_by_user.get(conn.user_id)
-        if room is None:
-            if queued is not None:
-                await self._send_queue_status(conn)
-            return
-
-        async with room.lock:
-            if conn.user_id not in room.participant_ids():
+        try:
+            room = self._room_by_user.get(conn.user_id)
+            if room is None:
+                if queued is not None:
+                    await self._send_queue_status(conn)
                 return
-            room.connections[conn.user_id] = conn
-            if room.status == "waiting":
-                if conn.user_id == room.black_user_id:
-                    await self._send_room_created(conn, room)
-            else:
-                await self._send_game_state(room, conn)
-                opponent = room.opponent_id(conn.user_id)
-                if opponent:
-                    await self._send_opponent_status(
-                        room, opponent, True, conn.username
-                    )
+
+            async with room.lock:
+                if conn.user_id not in room.participant_ids():
+                    return
+                room.connections[conn.user_id] = conn
+                if room.status == "waiting":
+                    if conn.user_id == room.black_user_id:
+                        await self._send_room_created(conn, room)
+                else:
+                    await self._send_game_state(room, conn)
+                    opponent = room.opponent_id(conn.user_id)
+                    if opponent:
+                        await self._send_opponent_status(
+                            room, opponent, True, conn.username
+                        )
+        finally:
+            await self._notify_friends_presence(conn, True)
 
     async def detach(self, conn: ClientConnection) -> None:
         """连接断开；旧连接被新连接替换时不做任何房间变更。"""
@@ -440,6 +573,8 @@ class RoomManager:
                 return
             self._connections.pop(conn.user_id, None)
             self._queue.pop(conn.user_id, None)
+
+        await self._notify_friends_presence(conn, False)
 
         room = self._room_by_user.get(conn.user_id)
         if room is None:
@@ -458,6 +593,7 @@ class RoomManager:
                 # 等待中的房主断线：房间没有对手，直接作废。
                 cleanup = True
                 room_closed_reason = "房主已离开，房间已关闭"
+                await self._cancel_room_invites(room, "房主已离开")
                 await self._mark_waiting_game_abandoned(room, "host_disconnected")
             else:
                 opponent = room.opponent_id(conn.user_id)
@@ -539,6 +675,7 @@ class RoomManager:
                         black_name=conn.username,
                         white_name="",
                         turn_seconds=self._settings.turn_seconds,
+                        black_avatar=conn.avatar,
                         connections={conn.user_id: conn},
                     )
                     self._rooms_by_code[code] = room
@@ -547,6 +684,54 @@ class RoomManager:
             await self._send_error(conn, error, request_id)
         elif room is not None:
             await self._send_room_created(conn, room)
+
+    async def _join_waiting_room(
+        self,
+        conn: ClientConnection,
+        room: Room,
+        request_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """把连接加入等待中的普通房间；返回错误文本或 None。
+
+        调用方负责在锁外广播新的 game_state。这里只做校验、数据库写穿
+        和内存状态变更。
+        """
+        error: Optional[str] = None
+        async with room.lock:
+            if room.matchmade:
+                error = "排位对局不能通过房间码加入"
+            elif room.status != "waiting" or room.white_user_id is not None:
+                error = "房间已经开始或已满"
+            elif room.black_user_id == conn.user_id:
+                error = "不能加入自己创建的房间"
+            elif room.black_user_id not in room.connections:
+                error = "房主已离线，房间已关闭"
+                self._remove_room_locked(room)
+                await self._mark_waiting_game_abandoned(
+                    room, "host_offline"
+                )
+            else:
+                try:
+                    async with self._session_factory() as session:
+                        game_row = await session.get(Game, room.game_id)
+                        if game_row is None:
+                            raise RuntimeError("game row missing")
+                        game_row.white_user_id = conn.user_id
+                        game_row.status = "playing"
+                        game_row.started_at = utcnow_naive()
+                        await session.commit()
+                except Exception:
+                    logger.exception("加入房间数据库写入失败")
+                    error = "服务器无法开始对局"
+                else:
+                    room.white_user_id = conn.user_id
+                    room.white_name = conn.username
+                    room.white_avatar = conn.avatar
+                    room.status = "playing"
+                    room.connections[conn.user_id] = conn
+                    self._room_by_user[conn.user_id] = room
+                    self._start_timeout_locked(room)
+        return error
 
     async def join_room(
         self,
@@ -569,49 +754,267 @@ class RoomManager:
                 if room is None:
                     error = "房间不存在或已关闭"
                 else:
-                    async with room.lock:
-                        if room.matchmade:
-                            error = "排位对局不能通过房间码加入"
-                        elif (
-                            room.status != "waiting"
-                            or room.white_user_id is not None
-                        ):
-                            error = "房间已经开始或已满"
-                        elif room.black_user_id == conn.user_id:
-                            error = "不能加入自己创建的房间"
-                        elif room.black_user_id not in room.connections:
-                            error = "房主已离线，房间已关闭"
-                            self._remove_room_locked(room)
-                            await self._mark_waiting_game_abandoned(
-                                room, "host_offline"
-                            )
-                        else:
-                            try:
-                                async with self._session_factory() as session:
-                                    game_row = await session.get(
-                                        Game, room.game_id
-                                    )
-                                    if game_row is None:
-                                        raise RuntimeError("game row missing")
-                                    game_row.white_user_id = conn.user_id
-                                    game_row.status = "playing"
-                                    game_row.started_at = utcnow_naive()
-                                    await session.commit()
-                            except Exception:
-                                logger.exception("加入房间数据库写入失败")
-                                error = "服务器无法开始对局"
-                            else:
-                                room.white_user_id = conn.user_id
-                                room.white_name = conn.username
-                                room.status = "playing"
-                                room.connections[conn.user_id] = conn
-                                self._room_by_user[conn.user_id] = room
-                                self._start_timeout_locked(room)
-                                joined_room = room
+                    error = await self._join_waiting_room(
+                        conn, room, request_id
+                    )
+                    if error is None:
+                        joined_room = room
 
         if error:
             await self._send_error(conn, error, request_id)
         elif joined_room is not None:
+            async with joined_room.lock:
+                await self._broadcast_game_state(joined_room)
+
+    # ------------------------------------------------------------------
+    # 自建房邀请
+    # ------------------------------------------------------------------
+    def _invite_payload(self, invite: RoomInvite) -> dict:
+        inviter = self._connections.get(invite.inviter_id)
+        user = (
+            self._connection_user_payload(inviter)
+            if inviter is not None
+            else {
+                "id": invite.inviter_id,
+                "username": "好友",
+                "avatar": DEFAULT_AVATAR,
+                "rating": 0,
+                "rank_name": "",
+            }
+        )
+        return {
+            "invite_id": invite.invite_id,
+            "inviter": user,
+            "rated": False,
+        }
+
+    @staticmethod
+    def _invite_result_payload(
+        invite: RoomInvite,
+        status: str,
+        accepted: Optional[bool],
+        user: dict,
+        reason: str = "",
+    ) -> dict:
+        return {
+            "invite_id": invite.invite_id,
+            "status": status,
+            "accepted": accepted,
+            "user": user,
+            "reason": reason,
+        }
+
+    async def _are_friends(self, user_a: str, user_b: str) -> bool:
+        low, high = (
+            (user_a, user_b) if user_a <= user_b else (user_b, user_a)
+        )
+        try:
+            async with self._session_factory() as session:
+                status = await session.scalar(
+                    select(Friendship.status).where(
+                        Friendship.user_a == low,
+                        Friendship.user_b == high,
+                    )
+                )
+        except Exception:
+            logger.exception("查询好友关系失败")
+            return False
+        return status == "accepted"
+
+    async def invite_to_room(
+        self,
+        conn: ClientConnection,
+        invitee_id: str,
+        request_id: Optional[str] = None,
+    ) -> None:
+        """房主邀请一位在线好友加入自己的等待房间。"""
+        if not self._is_current_connection(conn):
+            return
+        if not isinstance(invitee_id, str) or not invitee_id:
+            await self._send_error(conn, "邀请对象非法", request_id)
+            return
+        if invitee_id == conn.user_id:
+            await self._send_error(conn, "不能邀请自己", request_id)
+            return
+
+        room = self._room_by_user.get(conn.user_id)
+        if (
+            room is None
+            or room.black_user_id != conn.user_id
+            or room.status != "waiting"
+            or room.white_user_id is not None
+        ):
+            await self._send_error(conn, "请先创建自建房", request_id)
+            return
+
+        target = self._connections.get(invitee_id)
+        if target is None or not target.connected:
+            await self._send_error(conn, "好友不在线", request_id)
+            return
+        if not await self._are_friends(conn.user_id, invitee_id):
+            await self._send_error(conn, "只能邀请好友", request_id)
+            return
+
+        for existing in self._invites.values():
+            if (
+                existing.room is room
+                and existing.invitee_id == invitee_id
+            ):
+                await self._send_error(conn, "已向该好友发送邀请", request_id)
+                return
+
+        invite = RoomInvite(
+            invite_id=new_id(),
+            room=room,
+            inviter_id=conn.user_id,
+            invitee_id=invitee_id,
+            created_at=time.monotonic(),
+        )
+        self._invites[invite.invite_id] = invite
+        sent = await target.send(
+            make_message(SERVER_ROOM_INVITATION, self._invite_payload(invite))
+        )
+        if not sent:
+            self._invites.pop(invite.invite_id, None)
+            await self._send_error(conn, "好友不在线", request_id)
+            return
+
+        await conn.send(
+            make_message(
+                SERVER_ROOM_INVITE_RESULT,
+                self._invite_result_payload(
+                    invite,
+                    "sent",
+                    None,
+                    self._connection_user_payload(target),
+                ),
+            )
+        )
+
+    async def _cancel_room_invites(self, room: Room, reason: str) -> None:
+        """房间关闭/已满时通知其余被邀请者。"""
+        invites = [
+            invite
+            for invite in self._invites.values()
+            if invite.room is room
+        ]
+        for invite in invites:
+            self._invites.pop(invite.invite_id, None)
+            target = self._connections.get(invite.invitee_id)
+            if target is None:
+                continue
+            inviter = self._connections.get(invite.inviter_id)
+            user = (
+                self._connection_user_payload(inviter)
+                if inviter is not None
+                else {
+                    "id": invite.inviter_id,
+                    "username": "好友",
+                    "avatar": DEFAULT_AVATAR,
+                    "rating": 0,
+                    "rank_name": "",
+                }
+            )
+            await target.send(
+                make_message(
+                    SERVER_ROOM_INVITE_RESULT,
+                    self._invite_result_payload(
+                        invite, "cancelled", False, user, reason
+                    ),
+                )
+            )
+
+    async def respond_room_invite(
+        self,
+        conn: ClientConnection,
+        invite_id: str,
+        accept: bool,
+        request_id: Optional[str] = None,
+    ) -> None:
+        """被邀请者接受/拒绝自建房邀请。"""
+        if not self._is_current_connection(conn):
+            return
+        invite = (
+            self._invites.get(invite_id)
+            if isinstance(invite_id, str)
+            else None
+        )
+        if invite is None:
+            await self._send_error(conn, "邀请已失效", request_id)
+            return
+        if invite.invitee_id != conn.user_id:
+            await self._send_error(conn, "无权处理该邀请", request_id)
+            return
+        if time.monotonic() - invite.created_at > _INVITE_TTL_SECONDS:
+            self._invites.pop(invite.invite_id, None)
+            await self._send_error(conn, "邀请已过期", request_id)
+            return
+
+        self._invites.pop(invite.invite_id, None)
+        host = self._connections.get(invite.inviter_id)
+        invitee_user = self._connection_user_payload(conn)
+
+        if not accept:
+            if host is not None:
+                await host.send(
+                    make_message(
+                        SERVER_ROOM_INVITE_RESULT,
+                        self._invite_result_payload(
+                            invite,
+                            "declined",
+                            False,
+                            invitee_user,
+                        ),
+                    )
+                )
+            return
+
+        room = invite.room
+        error: Optional[str] = None
+        joined_room: Optional[Room] = None
+        async with self._state_lock:
+            if conn.user_id in self._room_by_user:
+                error = "你已经在房间中"
+            elif room.status != "waiting" or room.white_user_id is not None:
+                error = "房间已满或已关闭"
+            elif room.black_user_id not in room.connections:
+                error = "房主已离开"
+                self._remove_room_locked(room)
+                await self._mark_waiting_game_abandoned(
+                    room, "host_offline"
+                )
+            else:
+                error = await self._join_waiting_room(
+                    conn, room, request_id
+                )
+                if error is None:
+                    joined_room = room
+
+        if error:
+            await self._send_error(conn, error, request_id)
+            if host is not None:
+                await host.send(
+                    make_message(
+                        SERVER_ROOM_INVITE_RESULT,
+                        self._invite_result_payload(
+                            invite, "declined", False, invitee_user
+                        ),
+                    )
+                )
+            await self._cancel_room_invites(room, "邀请已失效")
+            return
+
+        if host is not None:
+            await host.send(
+                make_message(
+                    SERVER_ROOM_INVITE_RESULT,
+                    self._invite_result_payload(
+                        invite, "accepted", True, invitee_user
+                    ),
+                )
+            )
+        await self._cancel_room_invites(room, "房间已满")
+        if joined_room is not None:
             async with joined_room.lock:
                 await self._broadcast_game_state(joined_room)
 
@@ -751,6 +1154,8 @@ class RoomManager:
             black_name=black.conn.username,
             white_name=white.conn.username,
             turn_seconds=self._settings.turn_seconds,
+            black_avatar=black.conn.avatar,
+            white_avatar=white.conn.avatar,
             status="playing",
             connections={
                 black.conn.user_id: black.conn,
@@ -820,6 +1225,7 @@ class RoomManager:
                 error = "进行中的对局请先认输"
             else:
                 if room.status == "waiting":
+                    await self._cancel_room_invites(room, "房主已离开")
                     await self._mark_waiting_game_abandoned(room, "left")
                 for other in list(room.connections.values()):
                     await other.send(message)
@@ -1010,11 +1416,15 @@ class RoomManager:
                             old_white = room.white_user_id
                             old_black_name = room.black_name
                             old_white_name = room.white_name
+                            old_black_avatar = room.black_avatar
+                            old_white_avatar = room.white_avatar
                             room.game_id = new_game.id
                             room.black_user_id = old_white
                             room.white_user_id = old_black
                             room.black_name = old_white_name
                             room.white_name = old_black_name
+                            room.black_avatar = old_white_avatar
+                            room.white_avatar = old_black_avatar
                             room.game = GameModel()
                             room.status = "playing"
                             room.winner_user_id = None

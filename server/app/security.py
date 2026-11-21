@@ -1,4 +1,4 @@
-"""密码、令牌与登录限流。"""
+"""密码与令牌辅助。"""
 
 from __future__ import annotations
 
@@ -8,8 +8,6 @@ import secrets
 import time
 import unicodedata
 import uuid
-from collections import defaultdict
-from dataclasses import dataclass
 from typing import Optional
 
 import jwt
@@ -104,70 +102,6 @@ def decode_access_token(token: str, settings: Settings) -> str:
     return user_id
 
 
-@dataclass
-class LoginThrottleDecision:
-    allowed: bool
-    retry_after_seconds: int = 0
-
-
-class LoginThrottle:
-    """小型单进程登录失败限流器。
-
-    生产多实例时应迁移到 Redis；当前 Stage 1 单 worker 足够阻止明显的
-    在线暴力猜测。
-    """
-
-    def __init__(
-        self,
-        max_failures: int = 5,
-        window_seconds: int = 300,
-        lockout_seconds: int = 60,
-    ) -> None:
-        self._max_failures = max_failures
-        self._window = window_seconds
-        self._lockout = lockout_seconds
-        self._failures: dict[str, list[float]] = defaultdict(list)
-        self._locked_until: dict[str, float] = {}
-        self._lock = asyncio.Lock()
-
-    async def check(self, key: str) -> LoginThrottleDecision:
-        now = time.monotonic()
-        async with self._lock:
-            locked_until = self._locked_until.get(key, 0.0)
-            if locked_until > now:
-                return LoginThrottleDecision(
-                    False, max(1, int(locked_until - now + 0.999))
-                )
-            recent = [
-                stamp
-                for stamp in self._failures.get(key, [])
-                if now - stamp <= self._window
-            ]
-            self._failures[key] = recent
-            if len(recent) >= self._max_failures:
-                self._locked_until[key] = now + self._lockout
-                return LoginThrottleDecision(False, self._lockout)
-            return LoginThrottleDecision(True)
-
-    async def record_failure(self, key: str) -> None:
-        now = time.monotonic()
-        async with self._lock:
-            recent = [
-                stamp
-                for stamp in self._failures.get(key, [])
-                if now - stamp <= self._window
-            ]
-            recent.append(now)
-            self._failures[key] = recent
-            if len(recent) >= self._max_failures:
-                self._locked_until[key] = now + self._lockout
-
-    async def clear(self, key: str) -> None:
-        async with self._lock:
-            self._failures.pop(key, None)
-            self._locked_until.pop(key, None)
-
-
 __all__ = [
     "normalize_username",
     "validate_username",
@@ -178,6 +112,4 @@ __all__ = [
     "generate_refresh_token",
     "create_access_token",
     "decode_access_token",
-    "LoginThrottle",
-    "LoginThrottleDecision",
 ]

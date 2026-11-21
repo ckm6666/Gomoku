@@ -14,8 +14,11 @@ from typing import AsyncIterator, Optional
 from fastapi import FastAPI, Request
 
 from server.app.api.auth import router as auth_router
+from server.app.api.friends import router as friends_router
 from server.app.api.games import router as games_router
+from server.app.api.messages import router as messages_router
 from server.app.api.ranked import router as ranked_router
+from server.app.api.users import router as users_router
 from server.app.config import Settings
 from server.app.db import (
     create_engine,
@@ -23,7 +26,6 @@ from server.app.db import (
     create_tables,
     mark_unfinished_games_abandoned,
 )
-from server.app.security import LoginThrottle
 from server.app.ws.endpoint import router as ws_router
 from server.app.ws.rooms import RoomManager
 
@@ -44,7 +46,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         app.state.settings = service_settings
         app.state.engine = engine
         app.state.session_factory = session_factory
-        app.state.login_throttle = LoginThrottle()
         app.state.registration_lock = asyncio.Lock()
         app.state.room_manager = RoomManager(
             service_settings, session_factory
@@ -72,6 +73,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(ranked_router, prefix="/api/v1")
     app.include_router(games_router, prefix="/api/v1")
+    app.include_router(users_router, prefix="/api/v1")
+    app.include_router(friends_router, prefix="/api/v1")
+    app.include_router(messages_router, prefix="/api/v1")
     app.include_router(ws_router, prefix="/api/v1")
 
     @app.get("/api/v1/health")

@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
+from gomoku.shared.avatar import DEFAULT_AVATAR, normalize_avatar
 from gomoku.shared.errors import ProtocolError
 
 
@@ -34,6 +35,7 @@ def _optional_int(
 class AuthUser:
     id: str
     username: str
+    avatar: str = DEFAULT_AVATAR
     # Stage 2：服务器认证响应携带的排位资料；旧服务器缺省时客户端仍可登录。
     rating: int = 1200
     peak_rating: int = 1200
@@ -86,9 +88,11 @@ class AuthSession:
             and not isinstance(raw_win_rate, bool)
             else 0.0
         )
+        user_id = _str_field(raw_user, "id")
         user = AuthUser(
-            id=_str_field(raw_user, "id"),
+            id=user_id,
             username=_str_field(raw_user, "username"),
+            avatar=normalize_avatar(raw_user.get("avatar"), user_id),
             rating=_optional_int(raw_user, "rating", 1200),
             peak_rating=_optional_int(raw_user, "peak_rating", 1200),
             rated_games=_optional_int(raw_user, "rated_games", 0),

@@ -101,6 +101,11 @@ def _sanitize_comment(text: str) -> str:
     return " ".join("".join(parts).split())
 
 
+def sanitize_comment(text: str) -> str:
+    """公开的文本净化入口，供私聊等复用。"""
+    return _sanitize_comment(text)
+
+
 def normalize_chat_content(kind: str, content: object) -> str:
     """校验并规范化待发送的表情/评论；非法输入抛 ProtocolError。"""
     if kind not in CHAT_KINDS:
@@ -192,6 +197,7 @@ __all__ = [
     "CHAT_WINDOW_SECONDS",
     "CHAT_BURST",
     "ChatMessage",
+    "sanitize_comment",
     "normalize_chat_content",
     "build_chat_payload",
     "parse_chat_message",

@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from gomoku.shared.avatar import normalize_avatar
 from server.app.dependencies import get_current_user, get_db
 from server.app.models import RatingEvent, User
 from server.app.ratings import rank_for_rating
@@ -51,6 +52,7 @@ async def leaderboard(
             position=offset + index + 1,
             user_id=user.id,
             username=user.username,
+            avatar=normalize_avatar(user.avatar, user.id),
             rating=user.rating,
             rank_name=rank_for_rating(user.rating).name,
             rated_games=user.rated_games,

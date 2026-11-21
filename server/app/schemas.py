@@ -13,6 +13,7 @@ from pydantic import (
     field_validator,
 )
 
+from gomoku.shared.avatar import DEFAULT_AVATAR
 from server.app.ratings import (
     START_RATING,
     rank_for_rating,
@@ -58,6 +59,7 @@ class UserResponse(BaseModel):
 
     id: str
     username: str
+    avatar: str = DEFAULT_AVATAR
     created_at: datetime
     rating: int = START_RATING
     peak_rating: int = START_RATING
@@ -106,6 +108,7 @@ class LeaderboardEntry(BaseModel):
     position: int
     user_id: str
     username: str
+    avatar: str = DEFAULT_AVATAR
     rating: int
     rank_name: str
     rated_games: int
@@ -159,6 +162,79 @@ class RecentGamesResponse(BaseModel):
     total: int
 
 
+class AvatarUpdateRequest(BaseModel):
+    avatar: Annotated[str, Field(min_length=1, max_length=16)]
+
+
+class PublicProfileResponse(BaseModel):
+    user: UserResponse
+    online: bool = False
+    friendship: str = "none"  # none/pending_out/pending_in/friends/self
+
+
+class UserSearchEntry(BaseModel):
+    id: str
+    username: str
+    avatar: str = DEFAULT_AVATAR
+    rating: int = START_RATING
+    rank_name: str
+    online: bool = False
+
+
+class UserSearchResponse(BaseModel):
+    entries: list[UserSearchEntry]
+    total: int
+
+
+class FriendEntry(BaseModel):
+    user_id: str
+    username: str
+    avatar: str = DEFAULT_AVATAR
+    rating: int = START_RATING
+    rank_name: str
+    online: bool = False
+    unread: int = 0
+
+
+class FriendRequestEntry(BaseModel):
+    request_id: str
+    user_id: str
+    username: str
+    avatar: str = DEFAULT_AVATAR
+    rating: int = START_RATING
+    rank_name: str
+    created_at: datetime
+
+
+class FriendsResponse(BaseModel):
+    friends: list[FriendEntry]
+    incoming: list[FriendRequestEntry]
+    outgoing: list[FriendRequestEntry]
+
+
+class FriendRequestCreate(BaseModel):
+    user_id: Annotated[str, Field(min_length=1, max_length=36)]
+
+
+class DirectMessageEntry(BaseModel):
+    id: str
+    sender_id: str
+    sender_name: str
+    sender_avatar: str = DEFAULT_AVATAR
+    recipient_id: str
+    content: str
+    created_at: datetime
+    sent_at_ms: int
+
+
+class DirectMessagesResponse(BaseModel):
+    messages: list[DirectMessageEntry]
+
+
+class SendDirectMessageRequest(BaseModel):
+    content: Annotated[str, Field(min_length=1, max_length=200)]
+
+
 class GameDetailResponse(BaseModel):
     game_id: str
     rated: bool
@@ -193,4 +269,15 @@ __all__ = [
     "RecentGameEntry",
     "RecentGamesResponse",
     "GameDetailResponse",
+    "AvatarUpdateRequest",
+    "PublicProfileResponse",
+    "UserSearchEntry",
+    "UserSearchResponse",
+    "FriendEntry",
+    "FriendRequestEntry",
+    "FriendsResponse",
+    "FriendRequestCreate",
+    "DirectMessageEntry",
+    "DirectMessagesResponse",
+    "SendDirectMessageRequest",
 ]

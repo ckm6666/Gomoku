@@ -49,6 +49,28 @@ class AuthAPITests(ServerTestBase):
         )
         self.assertEqual(bad.status_code, 401)
 
+    def test_repeated_bad_passwords_do_not_lock_out(self) -> None:
+        """多次输错密码只返回 401，不再因次数过多拒绝登录。"""
+        self.assertEqual(self.register("patient_user").status_code, 201)
+        for _ in range(8):
+            bad = self.client.post(
+                "/api/v1/auth/login",
+                json={
+                    "username": "patient_user",
+                    "password": "wrong-password",
+                },
+            )
+            self.assertEqual(bad.status_code, 401, bad.text)
+
+        good = self.client.post(
+            "/api/v1/auth/login",
+            json={
+                "username": "patient_user",
+                "password": "correct horse battery",
+            },
+        )
+        self.assertEqual(good.status_code, 200, good.text)
+
     def test_refresh_rotation_and_reuse_detection(self) -> None:
         data = self.register("refresh_user").json()
         old_refresh = data["refresh_token"]
