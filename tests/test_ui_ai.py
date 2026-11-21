@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import os
 import sys
-import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -36,15 +35,10 @@ from PySide6.QtWidgets import (  # noqa: E402
     QPushButton,
 )
 
-from gomoku.client.ai_engine import (  # noqa: E402
-    AIDifficulty,
-    CandidateScore,
-    SearchAnalysis,
-)
+from gomoku.client.ai_engine import AIDifficulty  # noqa: E402
 from gomoku.client.audio import get_audio_manager  # noqa: E402
 from gomoku.client.constants import APP_TITLE  # noqa: E402
 from gomoku.client.main_window import GameMode, MainWindow  # noqa: E402
-from gomoku.client.records import LocalRecordStore  # noqa: E402
 from gomoku.client.result_dialog import ResultDialog  # noqa: E402
 from gomoku.client.ui_theme import apply_app_theme  # noqa: E402
 from gomoku.shared.rules import Player  # noqa: E402
@@ -88,41 +82,6 @@ def _slow_find_move(
     return None
 
 
-def _fake_analyze(
-    self,
-    board_snapshot,
-    player,
-    difficulty,
-    cancel_event=None,
-    *,
-    top_n=3,
-    config_override=None,
-):
-    """测试注入：立即返回第一个空点作为提示落点。"""
-    del self, difficulty, cancel_event, top_n, config_override
-    for row in range(15):
-        for col in range(15):
-            if board_snapshot[row][col] is None:
-                move = (row, col)
-                return SearchAnalysis(
-                    best_move=move,
-                    best_score=42,
-                    candidates=(
-                        CandidateScore(move, 42),
-                        CandidateScore((7, 8), 12),
-                    ),
-                    player=player,
-                    difficulty=AIDifficulty.MASTER,
-                    completed_depth=2,
-                    nodes=10,
-                    elapsed_seconds=0.0,
-                    cancelled=False,
-                    timed_out=False,
-                    source="search",
-                )
-    return None
-
-
 class UIAndAITests(unittest.TestCase):
     """覆盖双人回归、AI 自动落子、AI 先手、悔棋、设置锁定和关窗清理。"""
 
@@ -142,12 +101,7 @@ class UIAndAITests(unittest.TestCase):
         apply_app_theme(app)
 
     def setUp(self) -> None:
-        self._tmpdir = tempfile.TemporaryDirectory()
-        self.window = MainWindow(
-            record_store=LocalRecordStore(
-                Path(self._tmpdir.name) / "records"
-            ),
-        )
+        self.window = MainWindow()
         self.window.setAttribute(
             Qt.WidgetAttribute.WA_DontShowOnScreen, True
         )
@@ -157,7 +111,6 @@ class UIAndAITests(unittest.TestCase):
     def tearDown(self) -> None:
         self.window.close()
         self.app.processEvents()
-        self._tmpdir.cleanup()
 
     def _click_cell(self, row: int, col: int) -> None:
         """通过棋盘点击落子，真实覆盖坐标映射与输入开关。"""
@@ -346,8 +299,6 @@ class UIAndAITests(unittest.TestCase):
         self.assertEqual(online.quick_match_button.text(), "开始排位匹配")
         self.assertEqual(online.rating_badge_label.text(), "未定级")
         self.assertEqual(online.leaderboard_table.columnCount(), 5)
-        self.assertEqual(online.recent_games_table.columnCount(), 5)
-        self.assertFalse(online.replay_history_button.isEnabled())
 
         online._fill_leaderboard(
             [
@@ -383,26 +334,6 @@ class UIAndAITests(unittest.TestCase):
             online.leaderboard_table.item(0, 2).text(), "大师"
         )
         self.assertIn("共 2 名", online.leaderboard_status_label.text())
-
-        online._recent_games_entries = [
-            {
-                "game_id": "game-1",
-                "rated": True,
-                "opponent_username": "对手甲",
-                "result": "win",
-                "move_no": 9,
-                "ended_at": "2026-01-01T00:00:00",
-            }
-        ]
-        online._fill_recent_games(online._recent_games_entries, 1)
-        self.app.processEvents()
-        self.assertEqual(online.recent_games_table.rowCount(), 1)
-        self.assertEqual(
-            online.recent_games_table.item(0, 1).text(), "对手甲"
-        )
-        self.assertEqual(
-            online.recent_games_table.item(0, 2).text(), "胜"
-        )
         online.close()
         self.app.processEvents()
 
@@ -553,23 +484,16 @@ class UIAndAITests(unittest.TestCase):
         self.assertFalse(self.window.difficulty_combo.isEnabled())
         self.assertFalse(self.window.first_combo.isEnabled())
 
-    def test_menu_is_initial_page_with_six_entries(self) -> None:
-        """启动默认显示主菜单，六个入口顺序固定。"""
+    def test_menu_is_initial_page_with_five_entries(self) -> None:
+        """启动默认显示主菜单，五个入口顺序固定。"""
         self.assertIs(
             self.window.stack.currentWidget(), self.window.menu_page
         )
-        self.assertEqual(self.window.stack.count(), 3)
+        self.assertEqual(self.window.stack.count(), 2)
         buttons = self.window.menu_page.findChildren(QPushButton)
         self.assertEqual(
             [button.text() for button in buttons],
-            [
-                "联机对战",
-                "双人对战",
-                "人机对战",
-                "残局挑战",
-                "棋谱复盘",
-                "退出游戏",
-            ],
+            ["联机对战", "双人对战", "人机对战", "残局挑战", "退出游戏"],
         )
         self.assertTrue(all(button.isEnabled() for button in buttons))
         self.assertFalse(hasattr(self.window, "mode_combo"))
@@ -657,133 +581,18 @@ class UIAndAITests(unittest.TestCase):
             wait_until(lambda: False, 0.25, self.app)
             self.assertEqual(self.window.game.move_count, moves_before)
 
-    def test_local_mode_hides_hint_button(self) -> None:
-        """本地双人模式不显示 AI 提示按钮。"""
-        self._start_local()
-        self.assertTrue(self.window.hint_button.isHidden())
-        self.assertFalse(self.window.hint_button.isEnabled())
-
-    def test_ai_hint_shows_marker_and_clears_on_move(self) -> None:
-        """人机模式提示会显示推荐标记，玩家落子后清除。"""
-        self._start_ai(difficulty_index=0)  # 简单
-        self._click_cell(7, 7)
-        self.assertTrue(
-            wait_until(
-                lambda: self.window.game.move_count == 2
-                and self.window._ai_thread is None,
-                6.0,
-                self.app,
-            )
-        )
-        self.assertFalse(self.window.hint_button.isHidden())
-        self.assertTrue(self.window.hint_button.isEnabled())
-
-        with mock.patch(
-            "gomoku.client.ai_worker.GomokuAI.analyze",
-            new=_fake_analyze,
-        ):
-            self.window.hint_button.click()
-            self.app.processEvents()
-            self.assertIn("提示", self.window.puzzle_hint_label.text())
-            self.assertTrue(
-                wait_until(
-                    lambda: self.window.board_widget._hint_cell is not None,
-                    3.0,
-                    self.app,
-                )
-            )
-
-        self.assertFalse(self.window.puzzle_hint_label.isHidden())
-        hint_cell = self.window.board_widget._hint_cell
-        self.assertIsNotNone(hint_cell)
-        row, col = hint_cell
-        self.assertIsNone(self.window.game.board[row][col])
-
-        # 任选一个非提示点的空位落子，提示应立即清除。
-        empty = None
-        for r in range(15):
-            for c in range(15):
-                if (
-                    self.window.game.board[r][c] is None
-                    and (r, c) != hint_cell
-                ):
-                    empty = (r, c)
-                    break
-            if empty is not None:
-                break
-        self.assertIsNotNone(empty)
-        self._click_cell(*empty)
-        self.app.processEvents()
-        self.assertIsNone(self.window.board_widget._hint_cell)
-        self.assertTrue(self.window.puzzle_hint_label.isHidden())
-
-    def test_ai_hint_disabled_while_ai_thinking(self) -> None:
-        """AI 思考期间提示按钮不可用，悔棋取消后恢复。"""
-        self._start_ai(difficulty_index=0)
-        with mock.patch(
-            "gomoku.client.ai_worker.GomokuAI.find_move",
-            new=_slow_find_move,
-        ):
-            self._click_cell(7, 7)
-            self.assertTrue(
-                wait_until(
-                    lambda: self.window._ai_thread is not None
-                    and self.window._ai_thread.isRunning(),
-                    2.0,
-                    self.app,
-                )
-            )
-            self.assertFalse(self.window.hint_button.isEnabled())
-
-            self.window.undo_button.click()
-            self.app.processEvents()
-            self.assertTrue(
-                wait_until(
-                    lambda: self.window._ai_thread is None,
-                    5.0,
-                    self.app,
-                )
-            )
-        self.assertTrue(self.window.hint_button.isEnabled())
-
-    def test_puzzle_page_navigation_and_game_start(self) -> None:
-        """残局入口打开关卡列表，选关后进入对局并可返回列表。"""
+    def test_puzzle_placeholder_shows_coming_soon_message(self) -> None:
+        """残局挑战入口显示即将上线提示，且不改变对局状态。"""
+        seen = self._click_modal_button("知道了")
         self.window.puzzle_button.click()
         self.app.processEvents()
+        self.assertEqual(seen["count"], 1)
+        self.assertIn("即将上线", seen["text"])
+        self.assertIn("敬请期待", seen["text"])
         self.assertIs(
-            self.window.stack.currentWidget(), self.window.puzzle_page
+            self.window.stack.currentWidget(), self.window.menu_page
         )
-        self.assertIsNotNone(self.window.puzzle_page)
-        self.assertGreater(len(self.window._puzzles), 0)
-
-        cards = [
-            button
-            for button in self.window.puzzle_page.findChildren(QPushButton)
-            if button.objectName() == "puzzleCard"
-        ]
-        self.assertTrue(cards)
-        cards[0].click()
-        self.app.processEvents()
-        self.assertIs(
-            self.window.stack.currentWidget(), self.window.game_page
-        )
-        self.assertIs(self.window._game_mode, GameMode.PUZZLE)
-        self.assertIsNotNone(self.window._current_puzzle)
-        self.assertFalse(self.window.undo_button.isEnabled())
-        self.assertFalse(self.window.hint_button.isHidden())
-        self.assertEqual(self.window.menu_back_button.text(), "残局列表")
-
-        self.window.hint_button.click()
-        self.app.processEvents()
-        self.assertFalse(self.window.puzzle_hint_label.isHidden())
-        self.assertIn("提示", self.window.puzzle_hint_label.text())
-
-        self.window.menu_back_button.click()
-        self.app.processEvents()
-        self.assertIs(
-            self.window.stack.currentWidget(), self.window.puzzle_page
-        )
-        self.assertFalse(self.window._undo_shortcut.isEnabled())
+        self.assertEqual(self.window.game.move_count, 0)
 
     def test_shortcuts_disabled_on_menu(self) -> None:
         """菜单页 Ctrl+Z/Ctrl+N 不生效，进入对局后恢复。"""

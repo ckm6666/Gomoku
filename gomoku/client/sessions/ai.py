@@ -14,10 +14,10 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, QTimer
 
-from gomoku.client.ai_engine import AIDifficulty, HINT_CONFIG
-from gomoku.client.ai_worker import AIHintWorker, AIWorker
+from gomoku.client.ai_engine import AIDifficulty
+from gomoku.client.ai_worker import AIWorker
 from gomoku.client.board_view import BoardView
 from gomoku.client.sessions.base import GameSession
 from gomoku.shared.game_model import GameModel
@@ -27,12 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class AIGameSession(GameSession):
-    """玩家与本地四档 AI 的对局会话。"""
-
-    # 提示分析完成；参数为 SearchAnalysis。
-    hint_ready = Signal(object)
-    # 提示分析失败；参数为用户可读说明。
-    hint_failed = Signal(str)
+    """玩家与本地三档 AI 的对局会话。"""
 
     def __init__(
         self,
@@ -51,10 +46,6 @@ class AIGameSession(GameSession):
         self._ai_thread: Optional[AIWorker] = None
         self._ai_request_seq = 0
         self._ai_start_pending = False
-
-        self._hint_thread: Optional[AIHintWorker] = None
-        self._hint_request_seq = 0
-        self._hint_move_count = -1
 
         # AI 执黑时在构造完成后自动开局。使用 0ms 定时器让 MainWindow
         # 有机会先连接信号、装配界面，再进入异步搜索。
@@ -90,27 +81,11 @@ class AIGameSession(GameSession):
         return self._ai_thread
 
     @property
-    def hint_thread(self) -> Optional[AIHintWorker]:
-        """供测试/诊断读取当前提示分析线程。"""
-        return self._hint_thread
-
-    @property
     def busy(self) -> bool:
         """轮到 AI 的整个期间都视为忙，锁定设置和棋盘输入。"""
         return (
             not self._model.is_game_over
             and self._model.current_player is self._ai_player
-        )
-
-    @property
-    def can_hint(self) -> bool:
-        """玩家回合且没有正在进行的提示分析时，可以请求提示。"""
-        return (
-            not self._closed
-            and not self._paused
-            and not self._model.is_game_over
-            and self._model.current_player is self._human_player
-            and self._hint_thread is None
         )
 
     @property
@@ -137,35 +112,7 @@ class AIGameSession(GameSession):
             return False
         if not self._model.place_stone(row, col):
             return False
-        self._cancel_hint_search()
         self._after_any_move()
-        return True
-
-    def request_hint(self) -> bool:
-        """启动一次后台局面分析；结果通过 ``hint_ready`` 返回。"""
-        if not self.can_hint:
-            return False
-
-        self._hint_request_seq += 1
-        request_id = self._hint_request_seq
-        self._hint_move_count = self._model.move_count
-
-        worker = AIHintWorker(
-            request_id=request_id,
-            board_snapshot=self._model.board,
-            player=self._human_player,
-            difficulty=AIDifficulty.MASTER,
-            move_history=tuple(
-                (move.row, move.col) for move in self._model.moves
-            ),
-            config_override=HINT_CONFIG,
-        )
-        worker.analysis_ready.connect(self._on_hint_ready)
-        worker.search_failed.connect(self._on_hint_failed)
-        worker.finished.connect(self._on_hint_thread_finished)
-        self._hint_thread = worker
-        worker.start()
-        self.state_changed.emit()
         return True
 
     def request_undo(self) -> bool:
@@ -173,7 +120,6 @@ class AIGameSession(GameSession):
             return False
 
         self._cancel_ai_search()
-        self._cancel_hint_search()
         last_move = self._model.last_move
         if last_move is None:
             return False
@@ -197,7 +143,6 @@ class AIGameSession(GameSession):
             return False
         self._paused = False
         self._cancel_ai_search()
-        self._cancel_hint_search()
         self._model.reset()
         self.state_changed.emit()
         QTimer.singleShot(0, self._maybe_start_ai)
@@ -208,7 +153,6 @@ class AIGameSession(GameSession):
         if not isinstance(difficulty, AIDifficulty) or difficulty is self._difficulty:
             return
         self._difficulty = difficulty
-        self._cancel_hint_search()
         self.state_changed.emit()
 
     # ------------------------------------------------------------------
@@ -220,7 +164,6 @@ class AIGameSession(GameSession):
             return
         self._paused = True
         self._cancel_ai_search()
-        self._cancel_hint_search()
         self.state_changed.emit()
 
     def resume(self) -> None:
@@ -237,15 +180,14 @@ class AIGameSession(GameSession):
         self._closed = True
         self._paused = True
         self._cancel_ai_search()
-        self._cancel_hint_search()
 
-        for worker in (self._ai_thread, self._hint_thread):
-            if worker is not None:
-                worker.cancel()
-                if not worker.wait(3000):
-                    # 引擎每次检查都有超时和取消，正常不会走到这里；不调用
-                    # terminate()，继续等待以换取进程退出安全。
-                    worker.wait()
+        worker = self._ai_thread
+        if worker is not None:
+            worker.cancel()
+            if not worker.wait(3000):
+                # 引擎每次检查都有超时和取消，正常不会走到这里；不调用
+                # terminate()，继续等待以换取进程退出安全。
+                worker.wait()
 
     # ------------------------------------------------------------------
     # AI 线程编排
@@ -288,9 +230,6 @@ class AIGameSession(GameSession):
             board_snapshot=self._model.board,
             player=self._ai_player,
             difficulty=self._difficulty,
-            move_history=tuple(
-                (move.row, move.col) for move in self._model.moves
-            ),
         )
         worker.move_ready.connect(self._on_ai_move_ready)
         worker.search_failed.connect(self._on_ai_search_failed)
@@ -370,62 +309,6 @@ class AIGameSession(GameSession):
             return
         # 若旧线程是在暂停/取消后结束，且当前仍需 AI 搜索，这里补启动。
         QTimer.singleShot(0, self._maybe_start_ai)
-
-    # ------------------------------------------------------------------
-    # 提示分析线程
-    # ------------------------------------------------------------------
-    def _cancel_hint_search(self) -> None:
-        """使当前提示请求失效并请求取消。"""
-        self._hint_request_seq += 1
-        worker = self._hint_thread
-        if worker is not None:
-            worker.cancel()
-
-    def _on_hint_ready(self, request_id: int, analysis: object) -> None:
-        if (
-            self._closed
-            or self._paused
-            or request_id != self._hint_request_seq
-            or self._model.move_count != self._hint_move_count
-            or not self.accepts_human_input
-        ):
-            return
-
-        best_move = getattr(analysis, "best_move", None)
-        cancelled = getattr(analysis, "cancelled", False)
-        if cancelled or best_move is None:
-            return
-
-        row, col = best_move
-        if (
-            not 0 <= row < len(self._model.board)
-            or not 0 <= col < len(self._model.board)
-            or self._model.board[row][col] is not None
-        ):
-            return
-        self.hint_ready.emit(analysis)
-
-    def _on_hint_failed(self, request_id: int, message: str) -> None:
-        if (
-            self._closed
-            or self._paused
-            or request_id != self._hint_request_seq
-            or not self.accepts_human_input
-        ):
-            return
-        self.hint_failed.emit(message)
-
-    def _on_hint_thread_finished(self) -> None:
-        worker = self.sender()
-        if worker is None:
-            worker = self._hint_thread
-
-        if worker is self._hint_thread:
-            self._hint_thread = None
-        if worker is not None:
-            worker.deleteLater()
-        if not self._closed:
-            self.state_changed.emit()
 
 
 __all__ = ["AIGameSession"]

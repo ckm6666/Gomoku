@@ -4,12 +4,10 @@ from gomoku.client.sessions.base import GameSession
 from gomoku.client.sessions.local import LocalGameSession
 from gomoku.client.sessions.ai import AIGameSession
 from gomoku.client.sessions.online import OnlineGameSession
-from gomoku.client.sessions.puzzle import PuzzleSession
 
 __all__ = [
     "GameSession",
     "LocalGameSession",
     "AIGameSession",
     "OnlineGameSession",
-    "PuzzleSession",
 ]

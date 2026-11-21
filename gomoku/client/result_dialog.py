@@ -34,8 +34,6 @@ class ResultPresentation:
     subtitle: str
     detail: str
     seal_text: str
-    primary_text: str = "再来一局"
-    secondary_text: str = "查看棋盘"
 
 
 class ResultDialog(QDialog):
@@ -106,18 +104,14 @@ class ResultDialog(QDialog):
         buttons = QHBoxLayout()
         buttons.setSpacing(14)
         buttons.addStretch(1)
-        self.restart_button = QPushButton(
-            presentation.primary_text, self
-        )
+        self.restart_button = QPushButton("再来一局", self)
         self.restart_button.setObjectName("resultPrimaryButton")
         self.restart_button.setDefault(True)
         self.restart_button.setAutoDefault(True)
         self.restart_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.restart_button.setMinimumWidth(112)
         self.restart_button.setMinimumHeight(38)
-        self.view_button = QPushButton(
-            presentation.secondary_text, self
-        )
+        self.view_button = QPushButton("查看棋盘", self)
         self.view_button.setObjectName("resultSecondaryButton")
         self.view_button.setAutoDefault(False)
         self.view_button.setCursor(Qt.CursorShape.PointingHandCursor)

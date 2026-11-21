@@ -17,17 +17,11 @@ MainWindow 统一管理；本模块只保证：
 from __future__ import annotations
 
 import threading
-from typing import Optional, Sequence
+from typing import Optional
 
 from PySide6.QtCore import QThread, Signal
 
-from gomoku.client.ai_engine import (
-    AIDifficulty,
-    GomokuAI,
-    SearchAnalysis,
-    SearchConfig,
-)
-from gomoku.client.opening_book import get_default_opening_book
+from gomoku.client.ai_engine import AIDifficulty, GomokuAI
 from gomoku.shared.rules import BoardLike, Player
 
 
@@ -51,7 +45,6 @@ class AIWorker(QThread):
         difficulty: AIDifficulty,
         parent=None,
         seed: Optional[int] = None,
-        move_history: Sequence[tuple[int, int]] = (),
     ) -> None:
         super().__init__(parent)
         self._request_id = request_id
@@ -59,7 +52,6 @@ class AIWorker(QThread):
         self._player = player
         self._difficulty = difficulty
         self._seed = seed
-        self._move_history = tuple(move_history)
         self._cancel_event = threading.Event()
 
     @property
@@ -82,11 +74,7 @@ class AIWorker(QThread):
             if self._cancel_event.is_set():
                 return
 
-            engine = GomokuAI(
-                seed=self._seed,
-                opening_book=get_default_opening_book(),
-                move_history=self._move_history,
-            )
+            engine = GomokuAI(seed=self._seed)
             move = engine.find_move(
                 board_snapshot=self._board_snapshot,
                 player=self._player,
@@ -113,91 +101,4 @@ class AIWorker(QThread):
                 self.search_failed.emit(
                     self._request_id,
                     f"AI 搜索异常：{type(exc).__name__}: {exc}",
-                )
-
-
-class AIHintWorker(QThread):
-    """一次性 AI 局面分析线程，用于人机模式提示。
-
-    与 :class:`AIWorker` 相同，只接触纯 Python 引擎和只读棋盘快照；结果
-    通过 ``analysis_ready`` 信号回到主线程。
-    """
-
-    # (request_id, SearchAnalysis)
-    analysis_ready = Signal(int, object)
-    # (request_id, 用户可读的错误说明)
-    search_failed = Signal(int, str)
-
-    def __init__(
-        self,
-        request_id: int,
-        board_snapshot: BoardLike,
-        player: Player,
-        difficulty: AIDifficulty,
-        parent=None,
-        seed: Optional[int] = None,
-        move_history: Sequence[tuple[int, int]] = (),
-        config_override: Optional[SearchConfig] = None,
-        top_n: int = 3,
-    ) -> None:
-        super().__init__(parent)
-        self._request_id = request_id
-        self._board_snapshot = board_snapshot
-        self._player = player
-        self._difficulty = difficulty
-        self._seed = seed
-        self._move_history = tuple(move_history)
-        self._config_override = config_override
-        self._top_n = top_n
-        self._cancel_event = threading.Event()
-
-    @property
-    def request_id(self) -> int:
-        """本次分析请求编号。"""
-        return self._request_id
-
-    def cancel(self) -> None:
-        """请求停止分析；引擎会在最近的安全检查点退出。"""
-        self._cancel_event.set()
-
-    @property
-    def cancelled(self) -> bool:
-        """线程是否已经被请求取消。"""
-        return self._cancel_event.is_set()
-
-    def run(self) -> None:
-        """在后台线程中执行分析，不触碰任何 Qt 控件。"""
-        try:
-            if self._cancel_event.is_set():
-                return
-
-            engine = GomokuAI(
-                seed=self._seed,
-                opening_book=get_default_opening_book(),
-                move_history=self._move_history,
-            )
-            analysis: Optional[SearchAnalysis] = engine.analyze(
-                board_snapshot=self._board_snapshot,
-                player=self._player,
-                difficulty=self._difficulty,
-                cancel_event=self._cancel_event,
-                top_n=self._top_n,
-                config_override=self._config_override,
-            )
-
-            if self._cancel_event.is_set():
-                return
-
-            if analysis is None:
-                self.search_failed.emit(
-                    self._request_id,
-                    "AI 分析未返回结果",
-                )
-            else:
-                self.analysis_ready.emit(self._request_id, analysis)
-        except Exception as exc:  # noqa: BLE001 - 线程必须自带最终兜底
-            if not self._cancel_event.is_set():
-                self.search_failed.emit(
-                    self._request_id,
-                    f"AI 分析异常：{type(exc).__name__}: {exc}",
                 )

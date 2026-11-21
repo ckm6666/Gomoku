@@ -14,7 +14,7 @@ from typing import Final
 # ---------------------------------------------------------------------------
 APP_NAME: Final[str] = "五子棋"
 APP_TITLE: Final[str] = "五子棋 · 本地对弈与联机排位"
-APP_VERSION: Final[str] = "1.7.0"
+APP_VERSION: Final[str] = "1.5.1"
 APP_ORGANIZATION: Final[str] = "Gomoku"
 APP_STORAGE_NAME: Final[str] = "Gomoku"
 
@@ -81,5 +81,4 @@ STONE_WHITE_EDGE: Final[str] = "#C9C2B4"
 STONE_WHITE_BORDER: Final[str] = "#A9A194"
 
 LAST_MOVE_COLOR: Final[str] = "#C7442E"
-HINT_MARKER_COLOR: Final[str] = "#C7442E"
 WIN_HIGHLIGHT_COLOR: Final[str] = "#C0392B"
