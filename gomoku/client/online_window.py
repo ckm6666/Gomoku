@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime
 from typing import Mapping, Optional
 
 from PySide6.QtCore import QUrl, Qt, QTimer
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
 from gomoku.client.audio import get_audio_manager
 from gomoku.client.auth import AuthSession
 from gomoku.client.board_view import BoardView
+from gomoku.client.history_records import record_from_game_detail
 from gomoku.client.ui_theme import ONLINE_BACKDROP_SPEC, InkBackdrop
 from gomoku.client.board_widget import BoardWidget
 from gomoku.client.config import AppConfig
@@ -45,13 +47,16 @@ from gomoku.client.constants import (
     WINDOW_MIN_WIDTH,
     WINDOW_SCREEN_MARGIN,
 )
+from gomoku.client.net.game_history_api import GameHistoryHTTPClient
 from gomoku.client.net.http_api import AuthHTTPClient
 from gomoku.client.net.profile_api import ProfileHTTPClient
 from gomoku.client.net.websocket_transport import QtWebSocketTransport
+from gomoku.client.replay_window import ReplayWindow
 from gomoku.client.sessions.online import OnlineGameSession
 from gomoku.client.sound_control import SoundButton
 from gomoku.shared.errors import TransportError
 from gomoku.shared.protocol import GameSnapshot
+from gomoku.shared.record import GameRecord, RecordError
 from gomoku.shared.rules import BOARD_SIZE, Cell, Player
 
 logger = logging.getLogger(__name__)
@@ -72,6 +77,28 @@ def _empty_view() -> BoardView:
         is_game_over=False,
         move_count=0,
     )
+
+
+def _format_game_time(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        return "—"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value[:16]
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone()
+    return parsed.strftime("%m-%d %H:%M")
+
+
+def _result_label(value: object) -> str:
+    if not isinstance(value, str):
+        return "—"
+    return {
+        "win": "胜",
+        "loss": "负",
+        "draw": "和",
+    }.get(value, "—")
 
 
 class OnlinePlayerCard(QFrame):
@@ -192,6 +219,25 @@ class OnlineWindow(QMainWindow):
         self._profile_client.busy_changed.connect(
             self._on_profile_busy_changed
         )
+
+        self._history_client = GameHistoryHTTPClient(
+            self._api_base_url or None,
+            timeout_seconds=self.config.request_timeout_seconds,
+            parent=self,
+        )
+        self._history_client.recent_ready.connect(
+            self._on_history_recent_ready
+        )
+        self._history_client.game_ready.connect(self._on_history_game_ready)
+        self._history_client.failed.connect(self._on_history_failed)
+        self._history_client.unauthorized.connect(
+            self._on_history_unauthorized
+        )
+        self._history_client.busy_changed.connect(
+            self._on_history_busy_changed
+        )
+        self._recent_games_entries: list = []
+        self._replay_window: Optional[ReplayWindow] = None
 
         self._heartbeat_timer = QTimer(self)
         self._heartbeat_timer.setInterval(20_000)
@@ -555,6 +601,70 @@ class OnlineWindow(QMainWindow):
         self.leaderboard_status_label.setWordWrap(True)
         layout.addWidget(self.leaderboard_status_label)
 
+        layout.addSpacing(4)
+        recent_header = QHBoxLayout()
+        recent_title = QLabel("最近对局", card)
+        recent_title.setObjectName("sectionTitle")
+        self.replay_history_button = QPushButton("复盘选中对局", card)
+        self.replay_history_button.setObjectName("undoButton")
+        self.replay_history_button.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.replay_history_button.setEnabled(False)
+        self.refresh_history_button = QPushButton("刷新", card)
+        self.refresh_history_button.setObjectName("smallButton")
+        self.refresh_history_button.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        recent_header.addWidget(recent_title)
+        recent_header.addStretch(1)
+        recent_header.addWidget(self.replay_history_button)
+        recent_header.addWidget(self.refresh_history_button)
+        layout.addLayout(recent_header)
+
+        self.recent_games_table = QTableWidget(0, 5, card)
+        self.recent_games_table.setObjectName("leaderboardTable")
+        self.recent_games_table.setHorizontalHeaderLabels(
+            ["时间", "对手", "结果", "模式", "手数"]
+        )
+        self.recent_games_table.verticalHeader().setVisible(False)
+        self.recent_games_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.recent_games_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.recent_games_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.recent_games_table.setShowGrid(False)
+        self.recent_games_table.setAlternatingRowColors(True)
+        self.recent_games_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.recent_games_table.verticalHeader().setDefaultSectionSize(30)
+        self.recent_games_table.setFixedHeight(198)
+        recent_header_view = self.recent_games_table.horizontalHeader()
+        recent_header_view.setHighlightSections(False)
+        recent_header_view.setStretchLastSection(False)
+        recent_header_view.setMinimumSectionSize(42)
+        for column, width in ((0, 92), (2, 48), (3, 64), (4, 48)):
+            recent_header_view.setSectionResizeMode(
+                column, QHeaderView.ResizeMode.Fixed
+            )
+            self.recent_games_table.setColumnWidth(column, width)
+        recent_header_view.setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        layout.addWidget(self.recent_games_table)
+
+        self.history_status_label = QLabel(
+            "登录后自动加载最近对局", card
+        )
+        self.history_status_label.setObjectName("hintLabel")
+        self.history_status_label.setWordWrap(True)
+        layout.addWidget(self.history_status_label)
+
         footer = QHBoxLayout()
         self.lobby_status_label = QLabel(card)
         self.lobby_status_label.setObjectName("onlineStatus")
@@ -584,6 +694,18 @@ class OnlineWindow(QMainWindow):
         self.room_code_edit.returnPressed.connect(self._on_join_room)
         self.refresh_leaderboard_button.clicked.connect(
             self._on_refresh_leaderboard
+        )
+        self.refresh_history_button.clicked.connect(
+            self._on_refresh_history
+        )
+        self.replay_history_button.clicked.connect(
+            self._on_replay_history
+        )
+        self.recent_games_table.itemSelectionChanged.connect(
+            self._on_recent_selection_changed
+        )
+        self.recent_games_table.cellDoubleClicked.connect(
+            self._on_recent_double_clicked
         )
         self.logout_button.clicked.connect(self._logout)
 
@@ -742,6 +864,16 @@ class OnlineWindow(QMainWindow):
         self.refresh_leaderboard_button.setEnabled(
             connected and not self._profile_client.busy
         )
+        if hasattr(self, "refresh_history_button"):
+            self.refresh_history_button.setEnabled(
+                connected and not self._history_client.busy
+            )
+            has_selection = self.recent_games_table.currentRow() >= 0
+            self.replay_history_button.setEnabled(
+                connected
+                and has_selection
+                and bool(self._recent_games_entries)
+            )
         self.logout_button.setEnabled(
             not self._auth_client.busy and not pending
         )
@@ -824,6 +956,7 @@ class OnlineWindow(QMainWindow):
         token = self._auth_session.access_token
         self._profile_client.fetch_profile(token)
         self._profile_client.fetch_leaderboard(token, 50)
+        self._history_client.fetch_recent(token, 20)
 
     def _on_refresh_leaderboard(self) -> None:
         if self._auth_session is None:
@@ -921,12 +1054,157 @@ class OnlineWindow(QMainWindow):
         if hasattr(self, "refresh_leaderboard_button"):
             self._refresh_lobby_controls()
 
+    # ------------------------------------------------------------------
+    # 最近对局/复盘
+    # ------------------------------------------------------------------
+    def _on_refresh_history(self) -> None:
+        if self._auth_session is None:
+            return
+        self._history_client.fetch_recent(
+            self._auth_session.access_token, 20
+        )
+
+    def _on_history_recent_ready(self, data: object) -> None:
+        if self._auth_session is None or self._logging_out:
+            return
+        if not isinstance(data, Mapping):
+            return
+        raw_entries = data.get("entries")
+        entries = raw_entries if isinstance(raw_entries, list) else []
+        self._recent_games_entries = [
+            entry for entry in entries if isinstance(entry, Mapping)
+        ]
+        total = data.get("total", len(self._recent_games_entries))
+        if not isinstance(total, int) or isinstance(total, bool):
+            total = len(self._recent_games_entries)
+        self._fill_recent_games(self._recent_games_entries, total)
+        self._refresh_lobby_controls()
+
+    def _fill_recent_games(self, entries: list, total: int) -> None:
+        table = self.recent_games_table
+        table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            values = (
+                _format_game_time(entry.get("ended_at")),
+                str(entry.get("opponent_username", "对手")),
+                _result_label(entry.get("result")),
+                "排位" if entry.get("rated") else "好友房",
+                str(entry.get("move_no", 0)),
+            )
+            for column, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                item.setFlags(
+                    item.flags() & ~Qt.ItemFlag.ItemIsEditable
+                )
+                if column == 1:
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignVCenter
+                        | Qt.AlignmentFlag.AlignLeft
+                    )
+                else:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                table.setItem(row, column, item)
+
+        if entries:
+            self.history_status_label.setText(
+                f"共 {total} 局已完成对局，双击可复盘"
+            )
+        else:
+            self.history_status_label.setText(
+                "暂无已完成对局，完成一局排位或好友房后会显示在这里"
+            )
+        self.replay_history_button.setEnabled(False)
+
+    def _on_history_game_ready(self, data: object) -> None:
+        if self._auth_session is None or self._logging_out:
+            return
+        if not isinstance(data, Mapping):
+            return
+        try:
+            record = record_from_game_detail(data)
+        except (RecordError, TypeError, ValueError) as exc:
+            logger.warning("棋谱数据无效：%s", exc)
+            self.history_status_label.setText("该局棋谱无法复盘")
+            return
+        self._open_replay(record)
+
+    def _open_replay(self, record: GameRecord) -> None:
+        existing = self._replay_window
+        if existing is not None:
+            try:
+                existing.close()
+            except RuntimeError:
+                pass
+            self._replay_window = None
+
+        window = ReplayWindow([record], self)
+        window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        window.destroyed.connect(self._on_replay_window_destroyed)
+        self._replay_window = window
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _on_replay_window_destroyed(self, *_args) -> None:
+        if self.sender() is self._replay_window:
+            self._replay_window = None
+
+    def _on_history_failed(self, message: str) -> None:
+        logger.warning("读取最近对局失败：%s", message)
+        if self.stack.currentWidget() is self.lobby_page:
+            self.history_status_label.setText(
+                message or "无法加载最近对局"
+            )
+        self._refresh_lobby_controls()
+
+    def _on_history_unauthorized(self) -> None:
+        if self._auth_session is None or self._auth_client.busy:
+            return
+        self._refresh_after_auth_refresh = True
+        if not self._auth_client.refresh():
+            self._refresh_after_auth_refresh = False
+            self._force_relogin("登录已过期，请重新登录")
+
+    def _on_history_busy_changed(self, _busy: bool) -> None:
+        if hasattr(self, "refresh_history_button"):
+            self._refresh_lobby_controls()
+
+    def _on_recent_selection_changed(self) -> None:
+        self._refresh_lobby_controls()
+
+    def _on_recent_double_clicked(self, row: int, _column: int) -> None:
+        self._request_replay_row(row)
+
+    def _on_replay_history(self) -> None:
+        self._request_replay_row(self.recent_games_table.currentRow())
+
+    def _request_replay_row(self, row: int) -> None:
+        if self._auth_session is None:
+            return
+        if row < 0 or row >= len(self._recent_games_entries):
+            return
+        entry = self._recent_games_entries[row]
+        game_id = entry.get("game_id")
+        if not isinstance(game_id, str) or not game_id:
+            return
+        self.history_status_label.setText("正在加载棋谱…")
+        self._history_client.fetch_game(
+            self._auth_session.access_token, game_id
+        )
+
     def _clear_profile_ui(self) -> None:
         self._profile_user = None
         self._leaderboard_entries = []
         self.leaderboard_table.setRowCount(0)
         self.leaderboard_status_label.setText("登录后自动加载排行榜")
         self._update_rating_summary()
+        self._recent_games_entries = []
+        if hasattr(self, "recent_games_table"):
+            self.recent_games_table.setRowCount(0)
+            self.history_status_label.setText(
+                "登录后自动加载最近对局"
+            )
+            self.replay_history_button.setEnabled(False)
 
     # ------------------------------------------------------------------
     # 登录/注册/登出
@@ -1030,6 +1308,7 @@ class OnlineWindow(QMainWindow):
         self._reconnect_timer.stop()
         self._teardown_ws()
         self._profile_client.abort_all()
+        self._history_client.abort_all()
         self._auth_client.logout()
         self._auth_session = None
         self._clear_profile_ui()
@@ -1040,6 +1319,7 @@ class OnlineWindow(QMainWindow):
         self._logging_out = False
         self._auth_session = None
         self._profile_client.abort_all()
+        self._history_client.abort_all()
         self._clear_profile_ui()
         self._show_auth_page()
         self._set_auth_status("已退出登录")
@@ -1188,6 +1468,7 @@ class OnlineWindow(QMainWindow):
         self._heartbeat_timer.stop()
         self._teardown_ws()
         self._profile_client.abort_all()
+        self._history_client.abort_all()
         self._auth_session = None
         self._clear_profile_ui()
         self._show_auth_page()
@@ -1361,7 +1642,7 @@ class OnlineWindow(QMainWindow):
         self._sync_online_ui()
         if not self._closing:
             self._play_online_result_sound()
-        if self._session is not None and self._session.rated:
+        if self._session is not None:
             QTimer.singleShot(0, self._refresh_profile_data)
 
     def _play_online_result_sound(self) -> None:
@@ -1691,6 +1972,12 @@ class OnlineWindow(QMainWindow):
         self._reconnect_timer.stop()
         self._auth_client.abort()
         self._profile_client.abort_all()
+        self._history_client.abort_all()
+        if self._replay_window is not None:
+            try:
+                self._replay_window.close()
+            except RuntimeError:
+                self._replay_window = None
         self._teardown_ws()
         super().closeEvent(event)
 

@@ -45,6 +45,7 @@ from gomoku.client.constants import (
     BOARD_SURFACE_CORNER_RATIO,
     CLICK_TOLERANCE_RATIO,
     GRID_COLOR,
+    HINT_MARKER_COLOR,
     LAST_MOVE_COLOR,
     STAR_COLOR,
     STAR_POINTS,
@@ -91,6 +92,9 @@ class BoardWidget(QWidget):
 
         # 当前鼠标悬停的空交叉点；None 表示不显示预落子预览。
         self._hover_cell: Optional[tuple[int, int]] = None
+        # AI 提示标记及其对应的手数；手数变化后自动失效，避免旧提示残留。
+        self._hint_cell: Optional[tuple[int, int]] = None
+        self._hint_move_count = -1
         # AI 回合或终局时由主窗口关闭此开关，阻止鼠标事件与悬停高亮。
         self._interaction_enabled = True
 
@@ -123,6 +127,28 @@ class BoardWidget(QWidget):
         self._view = view
         # 状态切换时清除旧悬停，避免上一回合的幽灵棋子短暂残留。
         self._set_hover_cell(None)
+        self.update()
+
+    def set_hint_cell(
+        self,
+        cell: Optional[tuple[int, int]],
+        move_count: int,
+    ) -> None:
+        """设置 AI 推荐落点标记；``cell`` 为 None 时清除。"""
+        if cell is None:
+            self.clear_hint()
+            return
+        row, col = cell
+        self._hint_cell = (int(row), int(col))
+        self._hint_move_count = int(move_count)
+        self.update()
+
+    def clear_hint(self) -> None:
+        """清除推荐落点标记。"""
+        if self._hint_cell is None:
+            return
+        self._hint_cell = None
+        self._hint_move_count = -1
         self.update()
 
     def set_interaction_enabled(self, enabled: bool) -> None:
@@ -178,6 +204,7 @@ class BoardWidget(QWidget):
         self._draw_winning_line(painter)
         self._draw_hover_preview(painter)
         self._draw_last_move_marker(painter)
+        self._draw_hint_marker(painter)
         painter.end()
 
     def _ensure_static_cache(self) -> None:
@@ -645,3 +672,50 @@ class BoardWidget(QWidget):
         painter.setPen(QPen(QColor(255, 250, 239, 150), max(0.8, radius * 0.24)))
         painter.setBrush(QBrush(QColor(LAST_MOVE_COLOR)))
         painter.drawEllipse(center, radius, radius)
+
+    def _draw_hint_marker(self, painter: QPainter) -> None:
+        """绘制 AI 推荐落点的朱砂虚线圆环与四角短刻度。"""
+        if self._hint_cell is None or self._view.is_game_over:
+            return
+        # 手数不一致说明提示已过期（玩家已落子/悔棋/重开）。
+        if self._view.move_count != self._hint_move_count:
+            return
+
+        row, col = self._hint_cell
+        if not (0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE):
+            return
+        if self._view.board[row][col] is not None:
+            return
+
+        center = self._point_for(row, col)
+        radius = self._stone_radius() * 1.05
+        pen = QPen(
+            QColor(HINT_MARKER_COLOR),
+            max(1.6, self._spacing * 0.045),
+            Qt.PenStyle.DashLine,
+        )
+        pen.setDashPattern([3.0, 2.4])
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+
+        painter.save()
+        painter.setOpacity(0.92)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(center, radius, radius)
+
+        for angle in (
+            math.pi / 4,
+            3 * math.pi / 4,
+            5 * math.pi / 4,
+            7 * math.pi / 4,
+        ):
+            inner = QPointF(
+                center.x() + math.cos(angle) * radius * 1.02,
+                center.y() + math.sin(angle) * radius * 1.02,
+            )
+            outer = QPointF(
+                center.x() + math.cos(angle) * radius * 1.30,
+                center.y() + math.sin(angle) * radius * 1.30,
+            )
+            painter.drawLine(inner, outer)
+        painter.restore()
