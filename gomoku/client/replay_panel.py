@@ -1,4 +1,8 @@
-"""棋谱复盘窗口：只读棋盘、逐手导航与落子列表。"""
+"""棋谱复盘面板：只读棋盘、逐手导航与落子列表。
+
+复盘不再是独立窗口，而是主窗口页面栈中的一页：应用全局只保留一个
+原生窗口。
+"""
 
 from __future__ import annotations
 
@@ -6,15 +10,13 @@ import logging
 from datetime import datetime
 from typing import Optional, Sequence
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QApplication,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
-    QMainWindow,
     QPushButton,
     QSizePolicy,
     QSlider,
@@ -24,11 +26,6 @@ from PySide6.QtWidgets import (
 
 from gomoku.client.board_view import BoardView
 from gomoku.client.board_widget import BoardWidget
-from gomoku.client.constants import (
-    WINDOW_MIN_HEIGHT,
-    WINDOW_MIN_WIDTH,
-    WINDOW_SCREEN_MARGIN,
-)
 from gomoku.client.replay import ReplayError, ReplayTimeline
 from gomoku.client.ui_theme import GAME_BACKDROP_SPEC, InkBackdrop
 from gomoku.shared.record import GameRecord
@@ -86,41 +83,69 @@ def _format_time(value: str) -> str:
     return parsed.strftime("%Y-%m-%d %H:%M")
 
 
-class ReplayWindow(QMainWindow):
-    """独立复盘窗口；单条记录时隐藏左侧列表。"""
+class ReplayPanel(InkBackdrop):
+    """复盘面板；单条记录时隐藏左侧列表。"""
+
+    #: 用户点击“关闭”时发出，由主窗口切回来源页面。
+    closed = Signal()
 
     def __init__(
         self,
-        records: Sequence[GameRecord],
+        records: Sequence[GameRecord] = (),
         parent: Optional[QWidget] = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__(parent, spec=GAME_BACKDROP_SPEC)
+        self.setObjectName("replayPanel")
         self._records = tuple(records)
         self._timeline: Optional[ReplayTimeline] = None
         self._index = 0
         self._syncing = False
         self._closing = False
+        self._shortcuts: list[QShortcut] = []
 
         self._play_timer = QTimer(self)
         self._play_timer.setInterval(700)
         self._play_timer.timeout.connect(self._advance_play)
 
-        self.setWindowTitle("五子棋 - 棋谱复盘")
-        self.setMinimumSize(
-            max(WINDOW_MIN_WIDTH, 820), max(WINDOW_MIN_HEIGHT, 560)
-        )
         self._build_ui()
         self._create_shortcuts()
-        self._apply_initial_geometry()
         self._populate_records()
+
+    # ------------------------------------------------------------------
+    # 对外接口
+    # ------------------------------------------------------------------
+    def set_records(self, records: Sequence[GameRecord]) -> None:
+        """载入一组棋谱并复位到第一条。"""
+        self._records = tuple(records)
+        self._populate_records()
+
+    def shutdown(self) -> None:
+        """停止自动播放等后台活动。"""
+        self._closing = True
+        self._stop_play()
+
+    # ------------------------------------------------------------------
+    # 可见性
+    # ------------------------------------------------------------------
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        super().showEvent(event)
+        self._set_shortcuts_enabled(True)
+
+    def hideEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        super().hideEvent(event)
+        self._set_shortcuts_enabled(False)
+
+    def _set_shortcuts_enabled(self, enabled: bool) -> None:
+        """复盘快捷键只在面板可见时生效，避免抢走对局页的按键。"""
+        for shortcut in self._shortcuts:
+            shortcut.setEnabled(enabled)
+
 
     # ------------------------------------------------------------------
     # 构建
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        central = InkBackdrop(self, spec=GAME_BACKDROP_SPEC)
-        central.setObjectName("replayCentral")
-        root = QVBoxLayout(central)
+        root = QVBoxLayout(self)
         root.setContentsMargins(20, 16, 20, 16)
         root.setSpacing(10)
 
@@ -128,20 +153,20 @@ class ReplayWindow(QMainWindow):
         title_layout = QVBoxLayout()
         title_layout.setContentsMargins(0, 0, 0, 0)
         title_layout.setSpacing(0)
-        title = QLabel("棋谱复盘", central)
+        title = QLabel("棋谱复盘", self)
         title.setObjectName("brandTitle")
-        self.meta_label = QLabel("选择一条棋谱开始复盘", central)
+        self.meta_label = QLabel("选择一条棋谱开始复盘", self)
         self.meta_label.setObjectName("brandSubtitle")
         self.meta_label.setWordWrap(True)
         title_layout.addWidget(title)
         title_layout.addWidget(self.meta_label)
         header.addLayout(title_layout)
         header.addStretch(1)
-        self.close_button = QPushButton("关闭", central)
+        self.close_button = QPushButton("关闭", self)
         self.close_button.setObjectName("undoButton")
         self.close_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.close_button.clicked.connect(
-            lambda _checked=False: self.close()
+            lambda _checked=False: self.closed.emit()
         )
         header.addWidget(self.close_button, 0, Qt.AlignmentFlag.AlignVCenter)
         root.addLayout(header)
@@ -149,7 +174,7 @@ class ReplayWindow(QMainWindow):
         content = QHBoxLayout()
         content.setSpacing(12)
 
-        self.records_panel = QWidget(central)
+        self.records_panel = QWidget(self)
         self.records_panel.setObjectName("replayRecordsPanel")
         self.records_panel.setMaximumWidth(260)
         records_layout = QVBoxLayout(self.records_panel)
@@ -170,18 +195,18 @@ class ReplayWindow(QMainWindow):
 
         board_column = QVBoxLayout()
         board_column.setSpacing(8)
-        self.board_widget = BoardWidget(_empty_view(), central)
+        self.board_widget = BoardWidget(_empty_view(), self)
         self.board_widget.set_interaction_enabled(False)
         board_column.addWidget(self.board_widget, 1)
 
         controls = QHBoxLayout()
         controls.setSpacing(6)
-        self.first_button = self._make_control("|<", "第一手", central)
-        self.prev_button = self._make_control("<", "上一手", central)
-        self.play_button = self._make_control("播放", "自动播放", central)
+        self.first_button = self._make_control("|<", "第一手", self)
+        self.prev_button = self._make_control("<", "上一手", self)
+        self.play_button = self._make_control("播放", "自动播放", self)
         self.play_button.setMinimumWidth(64)
-        self.next_button = self._make_control(">", "下一手", central)
-        self.last_button = self._make_control(">|", "最后一手", central)
+        self.next_button = self._make_control(">", "下一手", self)
+        self.last_button = self._make_control(">|", "最后一手", self)
         for button in (
             self.first_button,
             self.prev_button,
@@ -191,27 +216,27 @@ class ReplayWindow(QMainWindow):
         ):
             controls.addWidget(button)
 
-        self.slider = QSlider(Qt.Orientation.Horizontal, central)
+        self.slider = QSlider(Qt.Orientation.Horizontal, self)
         self.slider.setObjectName("replaySlider")
         self.slider.setSingleStep(1)
         self.slider.setPageStep(5)
         self.slider.valueChanged.connect(self._on_slider_changed)
         controls.addWidget(self.slider, 1)
 
-        self.index_label = QLabel("第 0 手", central)
+        self.index_label = QLabel("第 0 手", self)
         self.index_label.setObjectName("moveInfo")
         self.index_label.setMinimumWidth(116)
         self.index_label.setAlignment(Qt.AlignmentFlag.AlignRight)
         controls.addWidget(self.index_label)
         board_column.addLayout(controls)
 
-        self.move_info_label = QLabel("起始局面", central)
+        self.move_info_label = QLabel("起始局面", self)
         self.move_info_label.setObjectName("hintLabel")
         self.move_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         board_column.addWidget(self.move_info_label)
         content.addLayout(board_column, 1)
 
-        moves_panel = QWidget(central)
+        moves_panel = QWidget(self)
         moves_panel.setObjectName("replayMovesPanel")
         moves_panel.setMaximumWidth(220)
         moves_layout = QVBoxLayout(moves_panel)
@@ -230,7 +255,6 @@ class ReplayWindow(QMainWindow):
         content.addWidget(moves_panel, 0)
 
         root.addLayout(content, 1)
-        self.setCentralWidget(central)
 
         self.first_button.clicked.connect(
             lambda _checked=False: self._set_index(0)
@@ -274,23 +298,9 @@ class ReplayWindow(QMainWindow):
             shortcut = QShortcut(QKeySequence(keys), self)
             shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
             shortcut.activated.connect(handler)
-
-    def _apply_initial_geometry(self) -> None:
-        screen = QApplication.primaryScreen()
-        if screen is None:
-            self.resize(1080, 820)
-            return
-        available = screen.availableGeometry()
-        width = min(
-            1080, max(820, available.width() - WINDOW_SCREEN_MARGIN)
-        )
-        height = min(
-            820, max(560, available.height() - WINDOW_SCREEN_MARGIN)
-        )
-        self.resize(width, height)
-        rect = self.frameGeometry()
-        rect.moveCenter(available.center())
-        self.move(rect.topLeft())
+            self._shortcuts.append(shortcut)
+        # 面板还没进入页面栈时先禁用，showEvent 里再打开。
+        self._set_shortcuts_enabled(False)
 
     # ------------------------------------------------------------------
     # 记录列表
@@ -452,14 +462,12 @@ class ReplayWindow(QMainWindow):
     # ------------------------------------------------------------------
     # 关闭
     # ------------------------------------------------------------------
-    def closeEvent(self, event: QCloseEvent) -> None:
-        self._closing = True
-        self._stop_play()
-        super().closeEvent(event)
+    # shutdown() 见上方“对外接口”一节：停止自动播放，面板本身由主窗口
+    # 的页面栈管理。
 
 
 def _mode_label(mode: str) -> str:
     return _MODE_LABELS.get(mode, mode)
 
 
-__all__ = ["ReplayWindow"]
+__all__ = ["ReplayPanel"]

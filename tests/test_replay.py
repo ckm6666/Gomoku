@@ -1,4 +1,4 @@
-"""棋谱时间线与复盘窗口测试。"""
+"""棋谱时间线与复盘面板测试。"""
 
 from __future__ import annotations
 
@@ -14,10 +14,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication,
+    QVBoxLayout,
+    QWidget,
+)
 
 from gomoku.client.replay import ReplayError, ReplayTimeline  # noqa: E402
-from gomoku.client.replay_window import ReplayWindow  # noqa: E402
+from gomoku.client.replay_panel import ReplayPanel  # noqa: E402
 from gomoku.client.ui_theme import apply_app_theme  # noqa: E402
 from gomoku.shared.record import GameRecord  # noqa: E402
 from gomoku.shared.rules import Move, Player  # noqa: E402
@@ -67,22 +71,28 @@ class ReplayTimelineTests(unittest.TestCase):
             ReplayTimeline.from_record(_record(winner=Player.WHITE))
 
 
-class ReplayWindowTests(unittest.TestCase):
+class ReplayPanelTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
         apply_app_theme(cls.app)
 
     def setUp(self) -> None:
-        self.window = ReplayWindow([_record()])
-        self.window.setAttribute(
+        # 复盘是主窗口页面栈中的一页，不是独立窗口；测试里用一个
+        # 宿主窗口承载它，可见性与布局断言才有意义。
+        self.host = QWidget()
+        self.host.setAttribute(
             Qt.WidgetAttribute.WA_DontShowOnScreen, True
         )
-        self.window.show()
+        self.host.setLayout(QVBoxLayout(self.host))
+        self.window = ReplayPanel([_record()], parent=self.host)
+        self.host.layout().addWidget(self.window)
+        self.host.show()
         self.app.processEvents()
 
     def tearDown(self) -> None:
-        self.window.close()
+        self.window.shutdown()
+        self.host.close()
         self.app.processEvents()
 
     def test_navigation_buttons_update_board(self) -> None:
@@ -108,12 +118,12 @@ class ReplayWindowTests(unittest.TestCase):
         self.assertEqual(self.window.board_widget._view.move_count, 0)
 
     def test_empty_records_show_placeholder(self) -> None:
-        window = ReplayWindow([])
+        panel = ReplayPanel([])
         try:
-            self.assertIn("暂无", window.move_info_label.text())
-            self.assertFalse(window.next_button.isEnabled())
+            self.assertIn("暂无", panel.move_info_label.text())
+            self.assertFalse(panel.next_button.isEnabled())
         finally:
-            window.close()
+            panel.shutdown()
 
 
 if __name__ == "__main__":

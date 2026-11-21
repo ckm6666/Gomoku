@@ -1,13 +1,15 @@
-"""古风确认弹窗：用于返回主菜单、重新开局、更改先手方等操作。"""
+"""古风确认弹窗：用于返回主菜单、重新开局、更改先手方等操作。
+
+弹窗不再创建独立窗口，而是作为主窗口内的一层模态遮罩（见
+:mod:`gomoku.client.modal_overlay`），因此应用全局始终只有一个窗口。
+"""
 
 from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import QRectF, QSize, Qt
-from PySide6.QtGui import QPainter, QPixmap
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -15,14 +17,22 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gomoku.client.modal_overlay import (
+    RESULT_ACCEPTED,
+    ModalOverlay,
+)
 from gomoku.client.ui_theme import (
     make_ink_divider,
     make_seal_pixmap,
     render_result_backdrop,
 )
 
+#: 确认卡片尺寸（逻辑像素）。
+CARD_WIDTH: int = 460
+CARD_HEIGHT: int = 320
 
-class ConfirmDialog(QDialog):
+
+class ConfirmDialog(ModalOverlay):
     """水墨宣纸风格的模态确认框。
 
     确认按钮文字由调用方决定（例如“返回主菜单”/“开始新对局”）；
@@ -39,44 +49,37 @@ class ConfirmDialog(QDialog):
         seal_text: str = "问",
         parent: Optional[QWidget] = None,
     ) -> None:
-        super().__init__(parent)
-        self._background: Optional[QPixmap] = None
-        self._background_key: Optional[tuple[int, int, float]] = None
+        super().__init__(parent, object_name="confirmDialog")
 
-        self.setObjectName("confirmDialog")
-        self.setWindowTitle(title)
-        self.setModal(True)
-        self.setWindowFlag(
-            Qt.WindowType.WindowContextHelpButtonHint, False
+        card = self.card
+        card.setObjectName("confirmCard")
+        card.setFixedSize(CARD_WIDTH, CARD_HEIGHT)
+        card.set_renderer(
+            lambda size, dpr: render_result_backdrop(size, dpr, "draw")
         )
-        self.resize(500, 340)
-        self.setMinimumSize(440, 300)
-        self.setSizeGripEnabled(False)
-        self.setAutoFillBackground(False)
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(46, 24, 46, 24)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(40, 22, 40, 22)
         layout.setSpacing(6)
 
-        dpr = self.devicePixelRatioF()
-        self.seal_label = QLabel(self)
+        dpr = card.devicePixelRatioF()
+        self.seal_label = QLabel(card)
         self.seal_label.setObjectName("confirmSeal")
         self.seal_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.seal_label.setPixmap(
             make_seal_pixmap(seal_text, 44, variant="confirm", dpr=dpr)
         )
 
-        self.title_label = QLabel(title, self)
+        self.title_label = QLabel(title, card)
         self.title_label.setObjectName("confirmTitle")
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.message_label = QLabel(message, self)
+        self.message_label = QLabel(message, card)
         self.message_label.setObjectName("confirmMessage")
         self.message_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.message_label.setWordWrap(True)
 
-        self.divider_label = QLabel(self)
+        self.divider_label = QLabel(card)
         self.divider_label.setObjectName("confirmDivider")
         self.divider_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.divider_label.setPixmap(make_ink_divider(170, 14, dpr=dpr))
@@ -90,13 +93,13 @@ class ConfirmDialog(QDialog):
         buttons = QHBoxLayout()
         buttons.setSpacing(14)
         buttons.addStretch(1)
-        self.confirm_button = QPushButton(confirm_text, self)
+        self.confirm_button = QPushButton(confirm_text, card)
         self.confirm_button.setObjectName("resultPrimaryButton")
         self.confirm_button.setAutoDefault(False)
         self.confirm_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.confirm_button.setMinimumWidth(112)
         self.confirm_button.setMinimumHeight(38)
-        self.cancel_button = QPushButton(cancel_text, self)
+        self.cancel_button = QPushButton(cancel_text, card)
         self.cancel_button.setObjectName("resultSecondaryButton")
         self.cancel_button.setDefault(True)
         self.cancel_button.setAutoDefault(True)
@@ -110,33 +113,13 @@ class ConfirmDialog(QDialog):
 
         self.confirm_button.clicked.connect(self.accept)
         self.cancel_button.clicked.connect(self.reject)
+        self.set_default_action(self.reject)
         self.cancel_button.setFocus()
 
     @property
     def confirm_requested(self) -> bool:
         """用户是否明确确认。"""
-        return self.result() == int(QDialog.DialogCode.Accepted)
-
-    def paintEvent(self, event) -> None:  # noqa: N802 - Qt 接口
-        del event
-        width = self.width()
-        height = self.height()
-        if width <= 0 or height <= 0:
-            return
-        dpr = max(1.0, self.devicePixelRatioF())
-        key = (width, height, round(dpr, 3))
-        if self._background is None or self._background_key != key:
-            self._background = render_result_backdrop(
-                QSize(width, height), dpr, "draw"
-            )
-            self._background_key = key
-        painter = QPainter(self)
-        painter.drawPixmap(
-            QRectF(0, 0, width, height),
-            self._background,
-            QRectF(self._background.rect()),
-        )
-        painter.end()
+        return self.result() == RESULT_ACCEPTED
 
 
-__all__ = ["ConfirmDialog"]
+__all__ = ["CARD_HEIGHT", "CARD_WIDTH", "ConfirmDialog"]
