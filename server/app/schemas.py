@@ -134,6 +134,50 @@ class ProfileResponse(BaseModel):
     recent_games: list[RecentRatingGame]
 
 
+class GameMove(BaseModel):
+    move_no: int
+    row: int
+    col: int
+    color: str
+    created_at: datetime
+
+
+class RecentGameEntry(BaseModel):
+    game_id: str
+    rated: bool
+    opponent_username: str
+    your_color: str
+    result: str  # win/loss/draw
+    result_reason: Optional[str] = None
+    move_no: int
+    ended_at: Optional[datetime] = None
+    rating_delta: Optional[int] = None
+
+
+class RecentGamesResponse(BaseModel):
+    entries: list[RecentGameEntry]
+    total: int
+
+
+class GameDetailResponse(BaseModel):
+    game_id: str
+    rated: bool
+    status: str
+    your_color: str
+    black_user_id: str
+    black_username: str
+    white_user_id: Optional[str] = None
+    white_username: str
+    winner_user_id: Optional[str] = None
+    result_reason: Optional[str] = None
+    move_no: int
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    rating_delta: Optional[int] = None
+    moves: list[GameMove]
+
+
 __all__ = [
     "RegisterRequest",
     "LoginRequest",
@@ -145,4 +189,8 @@ __all__ = [
     "LeaderboardResponse",
     "RecentRatingGame",
     "ProfileResponse",
+    "GameMove",
+    "RecentGameEntry",
+    "RecentGamesResponse",
+    "GameDetailResponse",
 ]
