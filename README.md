@@ -32,7 +32,7 @@
 
 ### 古风视觉
 
-- **水墨山水 + 宣纸**整体主题：主菜单、对局页和联机窗口共用宣纸纹理、淡墨渐晕、金线细框与朱砂印章。
+- **水墨山水 + 宣纸**整体主题：主菜单、对局页和联机页共用宣纸纹理、淡墨渐晕、金线细框与朱砂印章。
 - **画作**：方从义《山水墨戏》、米友仁《云山图》、陈洪绶《仿倪瓒山水》、彭序《墨梅》、
   佚名《墨竹》、盛懋《秋山行旅》，均来自克利夫兰艺术博物馆 Open Access（CC0），
   仅做运行期缩放/裁剪；详见 `gomoku/client/assets/THIRD_PARTY_NOTICES.md`。
@@ -44,6 +44,8 @@
   配朱砂印、书法标题、明确副标题与手数信息；取消/关闭等同“查看棋盘”。
 - **确认弹窗**：返回主菜单、重新开局、更改先手方统一使用同款水墨宣纸确认框
   （朱砂“问”印、书法标题、墨线分隔），取消为默认操作，避免误触。
+- **弹窗不新建窗口**：终局与确认弹窗是覆盖在主窗口之上的模态遮罩层
+  （半透明墨色压暗棋盘 + 居中宣纸卡片），应用始终只有一个窗口。
 - 所有画作、纸纹、印章、云纹均由 Qt 自绘，不依赖 QSS 图片 URL；素材缺失时自动回退纸色主题。
 
 ### 主菜单
@@ -51,7 +53,7 @@
 - 启动进入居中卡片式主菜单，六个入口：**联机对战、双人对战、人机对战、残局挑战、棋谱复盘、退出游戏**。
 - 双人/人机从菜单进入；人机以中等难度、玩家先手开局，进入后仍可调整难度/先手。
 - “残局挑战”平铺展示 11 个关卡，每张卡的进入按钮以成语命名，并显示白先/黑先与限手数；对局页“返回”回到关卡列表。
-- “棋谱复盘”打开本地棋谱窗口，可逐步前进/后退、自动播放；联机大厅另有“最近对局”复盘入口。
+- “棋谱复盘”打开本地棋谱复盘页，可逐步前进/后退、自动播放；联机大厅另有“最近对局”复盘入口。
 - 对局页提供“返回主菜单”；有棋局时需要确认放弃，菜单页禁用 Ctrl+Z/Ctrl+N 快捷键。
 
 ### 本地模式
@@ -80,7 +82,7 @@
 - 背景音乐、落子音效和按钮点击音效使用 `gomoku/client/assets/audio/` 内置的 MP3 素材；
   开局、胜利、失败、平局音效由代码合成（素材缺失时 BGM/落子也会回退到合成音）；
 - 按钮点击音效通过应用级事件过滤器覆盖所有 `QAbstractButton`；
-- 主窗口和联机窗口共用同一个播放器；主菜单右上角、对局设置栏和联机窗口右上角均提供声音按钮：
+- 主窗口和联机页共用同一个播放器；主菜单右上角、对局设置栏和联机页右上角均提供声音按钮：
   一键静音，并可分别调节背景音乐与音效音量；
 - 静音和两条音量通过 `QSettings` 持久化；开启静音时 BGM 以 0 音量继续循环，
   取消静音后从当前位置恢复。
@@ -101,7 +103,7 @@
   终局后“继续排位”会离开房间并重新进入匹配队列。
 - 大厅显示当前段位、积分、最高分、胜负平、前 50 名排行榜；排行榜玩家名旁显示头像，
   点击即可查看资料。对局页显示双方积分，终局显示“积分变化”。
-- 联机入口在主菜单“联机对战”，独立窗口登录和大厅，避免联机状态干扰离线局面。
+- 联机入口在主菜单“联机对战”，在同一窗口内切到登录页与大厅页；联机状态与离线局面互不干扰。
 
 ### 对战表情与评论
 
@@ -146,6 +148,12 @@
 
 ## 项目结构
 
+> **设计原则：全局只保留一个窗口。**
+> 主菜单、残局列表、离线对局、联机登录/大厅/对局、棋谱复盘都是主窗口
+> 页面栈（`QStackedWidget`）里的**页**；终局弹窗与确认框是覆盖在中央
+> 部件之上的**窗口内模态层**。任何时刻进程内都只有一个可见的原生窗口，
+> 任务栏不会出现第二个条目。
+
 ```text
 Gomoku/
 ├── main.py                         # 薄入口：调用 gomoku.client.app.main
@@ -168,6 +176,7 @@ Gomoku/
 │       ├── assets/THIRD_PARTY_NOTICES.md  # 素材与字体授权清单
 │       ├── theme_palette.py        # 古风调色板
 │       ├── ui_theme.py             # 主题字体、水墨背景、印章与宣纸卡片
+│       ├── modal_overlay.py        # 窗口内模态遮罩层（弹窗不再新建窗口）
 │       ├── result_dialog.py        # 胜利/惜败/和棋自绘弹窗
 │       ├── confirm_dialog.py       # 返回主菜单/重新开局等古风确认弹窗
 │       ├── sound_control.py        # 静音开关与音量滑块按钮
@@ -181,7 +190,7 @@ Gomoku/
 │       ├── config.py               # 非敏感环境配置
 │       ├── logging_setup.py        # 滚动日志与未捕获异常记录
 │       ├── main_window.py          # 主菜单、离线/残局 UI、会话切换、棋谱记录
-│       ├── online_window.py        # 登录、大厅、排行榜、最近对局、联机对局 UI
+│       ├── online_panel.py         # 登录、大厅、排行榜、最近对局、联机对局 UI
 │       ├── avatar_widgets.py       # 预置头像绘制、头像按钮
 │       ├── profile_window.py       # 个人信息窗口与头像选择器
 │       ├── friends_window.py       # 好友申请、好友列表与用户搜索
@@ -191,7 +200,7 @@ Gomoku/
 │       ├── puzzle_page.py          # 残局关卡选择页
 │       ├── records.py              # 本地棋谱 JSONL 存储
 │       ├── replay.py               # 棋谱逐帧时间线
-│       ├── replay_window.py        # 只读复盘窗口
+│       ├── replay_panel.py         # 只读复盘面板
 │       ├── history_records.py      # 服务端对局详情 -> GameRecord
 │       ├── transport.py            # 异步传输抽象
 │       ├── net/
@@ -284,7 +293,7 @@ $env:GOMOKU_JWT_SECRET = "replace-with-a-long-random-secret-at-least-32-chars"
 server\.venv\Scripts\python.exe -m uvicorn server.app.main:app --host 127.0.0.1 --port 8000
 ```
 
-- 注册只需用户名和密码，直接在客户端“联机对战”窗口完成，无需任何额外凭据。
+- 注册只需用户名和密码，直接在客户端“联机对战”页完成，无需任何额外凭据。
 - 客户端开发环境默认访问 `http://127.0.0.1:8000` 和 `ws://127.0.0.1:8000/api/v1/ws`。
 - 服务端首次启动会自动在 `server/data/gomoku.db` 建表；Stage 1 旧数据库会自动补上
   `users.rating` 等积分列和 `rating_events` 表，不需要手工迁移。
@@ -430,7 +439,17 @@ UI 测试自动使用 `QT_QPA_PLATFORM=offscreen`，不启动真实网络；真�
 pip install -r requirements-dev.txt
 ```
 
-打包（`Gomoku.spec` 已配置 onefile/windowed，并把整个 `gomoku/client/assets` 加入 `datas`）：
+推荐用仓库自带的打包脚本（等价于下面的 pyinstaller 命令，并额外检查依赖、
+打印产物大小）：
+
+```powershell
+python build.py                # 正常打包（等价 pyinstaller --noconfirm --clean Gomoku.spec）
+python build.py --fast         # 跳过 --clean，复用上次缓存，打包更快
+python build.py --install      # 先安装 requirements-dev.txt 依赖再打包
+python build.py -- --windowed --debug   # -- 之后的参数原样透传给 PyInstaller
+```
+
+手动打包（`Gomoku.spec` 已配置 onefile/windowed，并把整个 `gomoku/client/assets` 加入 `datas`）：
 
 ```powershell
 pyinstaller --noconfirm --clean Gomoku.spec

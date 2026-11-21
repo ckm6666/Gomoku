@@ -23,7 +23,7 @@ QWidget#centralWidget,
 QStackedWidget#mainStack,
 QWidget#menuPage,
 QWidget#gamePage,
-QWidget#onlineCentral,
+QWidget#onlinePanel,
 QWidget#onlineStack,
 QWidget#onlinePage,
 QWidget#onlineScrollBody,
@@ -77,7 +77,7 @@ QLabel#turnPill[result="true"] {
     border-left: 3px solid #E3D1A9;
 }
 
-/* ------------------------------ 联机窗口 ------------------------------ */
+/* ------------------------------ 联机页 ------------------------------ */
 QWidget#onlineCentral {
     background: transparent;
 }
@@ -658,7 +658,8 @@ QPushButton#menuBackButton:disabled {
 }
 
 /* ------------------------------ 终局弹窗 ------------------------------ */
-QDialog#resultDialog {
+/* 弹窗是主窗口内的一层模态遮罩（QWidget），不再是独立 QDialog 窗口。 */
+QWidget#resultDialog {
     background: transparent;
 }
 
@@ -684,7 +685,7 @@ QLabel#resultDetail {
     font-size: 12px;
 }
 
-QDialog#confirmDialog {
+QWidget#confirmDialog {
     background: transparent;
 }
 
@@ -701,6 +702,27 @@ QLabel#confirmTitle {
 }
 
 QLabel#confirmMessage {
+    color: #4C463C;
+    font-size: 13px;
+}
+
+/* 窗口内提示遮罩（取代原生 QMessageBox，保持全局只有一个窗口）。 */
+QWidget#noticeDialog {
+    background: transparent;
+}
+
+QLabel#noticeSeal {
+    background: transparent;
+}
+
+QLabel#noticeTitle {
+    color: #26221C;
+    font-family: "Ma Shan Zheng";
+    font-size: 26px;
+    font-weight: normal;
+}
+
+QLabel#noticeMessage {
     color: #4C463C;
     font-size: 13px;
 }

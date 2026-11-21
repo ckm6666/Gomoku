@@ -1,6 +1,6 @@
 """声音控制按钮：静音开关与背景音乐/音效音量滑块。
 
-主窗口与联机窗口各放一个 SoundButton，它们共享同一个应用级 AudioManager，
+主窗口与联机页各放一个 SoundButton，它们共享同一个应用级 AudioManager，
 并通过 ``state_changed`` 信号保持图标与滑块状态一致。
 """
 

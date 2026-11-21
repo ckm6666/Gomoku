@@ -31,7 +31,6 @@ from PySide6.QtCore import Qt, QTimer  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
-    QDialog,
     QMessageBox,
     QPushButton,
 )
@@ -47,7 +46,8 @@ from gomoku.client.main_window import GameMode, MainWindow  # noqa: E402
 from gomoku.client.records import LocalRecordStore  # noqa: E402
 from gomoku.client.result_dialog import ResultDialog  # noqa: E402
 from gomoku.client.ui_theme import apply_app_theme  # noqa: E402
-from gomoku.shared.rules import Player  # noqa: E402
+from gomoku.shared.record import GameRecord  # noqa: E402
+from gomoku.shared.rules import Move, Player  # noqa: E402
 
 
 def wait_until(
@@ -195,11 +195,14 @@ class UIAndAITests(unittest.TestCase):
         self.app.processEvents()
 
     def _click_modal_button(self, text: str, delay_ms: int = 250) -> dict:
-        """安排 QTimer 点击当前模态框中的指定按钮。"""
+        """安排 QTimer 点击当前模态层中的指定按钮。"""
         seen = {"count": 0, "text": ""}
 
         def click_button() -> None:
-            box = self.app.activeModalWidget()
+            # 弹窗现在是主窗口内的一层模态遮罩，不再是原生模态窗口。
+            box = self.window.active_modal()
+            if box is None:
+                box = self.app.activeModalWidget()
             if isinstance(box, QMessageBox):
                 seen["count"] += 1
                 seen["text"] = box.text()
@@ -208,19 +211,23 @@ class UIAndAITests(unittest.TestCase):
                         button.click()
                         return
                 box.close()
-            elif isinstance(box, QDialog):
+            elif box is not None:
                 seen["count"] += 1
                 message_label = getattr(box, "message_label", None)
-                seen["text"] = (
-                    message_label.text()
-                    if message_label is not None
-                    else box.windowTitle()
-                )
+                title_label = getattr(box, "title_label", None)
+                if message_label is not None:
+                    seen["text"] = message_label.text()
+                elif title_label is not None:
+                    seen["text"] = title_label.text()
+                else:
+                    seen["text"] = box.windowTitle()
                 for button in box.findChildren(QPushButton):
                     if button.text() == text:
                         button.click()
                         return
-                box.reject()
+                reject = getattr(box, "reject", None)
+                if callable(reject):
+                    reject()
 
         QTimer.singleShot(delay_ms, click_button)
         return seen
@@ -233,7 +240,7 @@ class UIAndAITests(unittest.TestCase):
         deadline = time.monotonic() + timeout_ms / 1000.0
 
         def attempt() -> None:
-            box = self.app.activeModalWidget()
+            box = self.window.active_modal()
             if isinstance(box, ResultDialog):
                 state["count"] += 1
                 state["text"] = box.title_label.text()
@@ -320,23 +327,125 @@ class UIAndAITests(unittest.TestCase):
         self.assertEqual(self.window.game.move_count, 1)
         self.assertEqual(self.window.turn_pill.text(), "白棋回合")
 
-    def test_online_button_opens_auth_window(self) -> None:
-        """离线主窗口可打开独立联机窗口，不需要真实服务器。"""
+    def _visible_windows(self) -> list[str]:
+        """当前可见的顶层窗口类型名。"""
+        return [
+            type(widget).__name__
+            for widget in self.app.topLevelWidgets()
+            if widget.isWindow() and widget.isVisible()
+        ]
+
+    def test_only_one_window_is_ever_visible(self) -> None:
+        """全局只保留一个窗口：联机页、复盘页、弹窗都不新增顶层窗口。"""
+        self.assertEqual(self._visible_windows(), ["MainWindow"])
+
+        # 联机页是主窗口页面栈中的一页。
         self.window.online_button.click()
         self.app.processEvents()
-        online = self.window._online_window
+        self.assertEqual(self._visible_windows(), ["MainWindow"])
+
+        # 复盘页同理。
+        self.window._open_replay_page()
+        self.app.processEvents()
+        self.assertEqual(self._visible_windows(), ["MainWindow"])
+        self.window._on_replay_panel_closed()
+        self.app.processEvents()
+
+        # 模态确认框是主窗口内的一层遮罩，同样不产生新窗口。
+        self._click_modal_button("取消")
+        self.window._confirm_discard_game("返回主菜单", "确定要返回吗？")
+        self.app.processEvents()
+        self.assertEqual(self._visible_windows(), ["MainWindow"])
+
+    def test_online_page_returns_to_menu(self) -> None:
+        """联机页的“返回主菜单”切回主菜单，联机状态保持不变。"""
+        self.window.online_button.click()
+        self.app.processEvents()
+        online = self.window._online_panel
         self.assertIsNotNone(online)
         if online is None:
             return
-        self.assertIs(online.stack.currentWidget(), online.auth_page)
-        online.close()
+        online._show_lobby_page("")
         self.app.processEvents()
+
+        online.back_button.click()
+        self.app.processEvents()
+        self.assertIs(self.window.stack.currentWidget(), self.window.menu_page)
+        # 联机面板仍留在页面栈里，登录态不会因为切页丢失。
+        self.assertIsNotNone(self.window._online_panel)
+
+    def test_online_replay_opens_replay_page_and_returns(self) -> None:
+        """联机大厅请求复盘时打开复盘页，关闭后回到来源页面。"""
+        self.window.online_button.click()
+        self.app.processEvents()
+        online = self.window._online_panel
+        self.assertIsNotNone(online)
+        if online is None:
+            return
+
+        online.replay_requested.emit([])
+        self.app.processEvents()
+        self.assertIs(
+            self.window.stack.currentWidget(), self.window._replay_panel
+        )
+
+        self.window._on_replay_panel_closed()
+        self.app.processEvents()
+        self.assertIs(
+            self.window.stack.currentWidget(), self.window._online_panel
+        )
+
+    def test_replay_page_loads_local_records(self) -> None:
+        """复盘页首次打开就要载入本地棋谱，而不是空列表。"""
+        record = GameRecord(
+            record_id="r1",
+            created_at="2026-01-01T00:00:00+00:00",
+            mode="local",
+            moves=(Move(7, 7, Player.BLACK),),
+            winner=None,
+            result_reason="",
+            black_name="黑棋",
+            white_name="白棋",
+        )
+        store = self.window._record_store
+        store.append(record)
+
+        # 走真实入口：点击菜单按钮。QPushButton.clicked 会带一个
+        # checked=False 参数，槽函数必须能正确处理。
+        self.window.replay_button.click()
+        self.app.processEvents()
+        panel = self.window._replay_panel
+        self.assertIsNotNone(panel)
+        if panel is None:
+            return
+        self.assertEqual(panel.records_list.count(), 1)
+        self.assertIn("双人", panel.records_list.item(0).text())
+
+    def test_closing_while_modal_open_does_not_hang(self) -> None:
+        """模态层打开时关闭主窗口必须能退出，不能卡在嵌套事件循环里。"""
+        QTimer.singleShot(200, self.window.close)
+        self.window._confirm_discard_game("返回主菜单", "确定要返回吗？")
+        self.assertIsNone(self.window.active_modal())
+        self.assertFalse(self.window.isVisible())
+
+    def test_online_button_opens_auth_page(self) -> None:
+        """主窗口可切到联机页，不需要真实服务器。"""
+        self.window.online_button.click()
+        self.app.processEvents()
+        online = self.window._online_panel
+        self.assertIsNotNone(online)
+        if online is None:
+            return
+        self.assertIs(
+            self.window.stack.currentWidget(), self.window._online_panel
+        )
+        self.assertIs(online.stack.currentWidget(), online.auth_page)
 
     def test_online_lobby_shows_ranked_controls_and_leaderboard(self) -> None:
         """联机大厅包含排位匹配入口和排行榜表格，可离屏构建。"""
         self.window.online_button.click()
         self.app.processEvents()
-        online = self.window._online_window
+        online = self.window._online_panel
         self.assertIsNotNone(online)
         if online is None:
             return
@@ -403,7 +512,7 @@ class UIAndAITests(unittest.TestCase):
         self.assertEqual(
             online.recent_games_table.item(0, 2).text(), "胜"
         )
-        online.close()
+        online.shutdown()
         self.app.processEvents()
 
     def test_ai_mode_plays_automatically(self) -> None:
@@ -597,7 +706,7 @@ class UIAndAITests(unittest.TestCase):
         self._start_local()
         probes: list[object] = []
         QTimer.singleShot(
-            100, lambda: probes.append(self.app.activeModalWidget())
+            100, lambda: probes.append(self.window.active_modal())
         )
         self.window.menu_back_button.click()
         self.app.processEvents()

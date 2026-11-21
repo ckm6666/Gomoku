@@ -1,8 +1,8 @@
-"""联机对战独立窗口：登录、自建房/好友大厅和在线棋盘。
+"""联机对战面板：登录、自建房大厅和在线棋盘。
 
-离线双人/AI 窗口保持不变；用户通过主窗口“联机对战”按钮打开本窗口。
-登录成功后使用 HTTPS 认证 + WebSocket 自建房/排位；在线落子只由服务器
-权威快照驱动，不在本地抢先更新。
+联机不再是独立窗口，而是主窗口页面栈中的一页：应用全局只保留一个
+原生窗口。登录成功后使用 HTTPS 认证 + WebSocket 自建房/排位；在线落子只由
+服务器权威快照驱动，不在本地抢先更新。
 """
 
 from __future__ import annotations
@@ -14,17 +14,14 @@ from datetime import datetime
 from typing import Mapping, Optional
 
 from PySide6.QtCore import QSettings, QSize, QUrl, Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
-    QMainWindow,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -53,19 +50,11 @@ from gomoku.client.profile_window import AvatarPickerDialog, ProfileWindow
 from gomoku.client.ui_theme import ONLINE_BACKDROP_SPEC, InkBackdrop
 from gomoku.client.board_widget import BoardWidget
 from gomoku.client.config import AppConfig
-from gomoku.client.constants import (
-    WINDOW_DEFAULT_HEIGHT,
-    WINDOW_DEFAULT_WIDTH,
-    WINDOW_MIN_HEIGHT,
-    WINDOW_MIN_WIDTH,
-    WINDOW_SCREEN_MARGIN,
-)
 from gomoku.client.danmaku import DanmakuOverlay
 from gomoku.client.net.game_history_api import GameHistoryHTTPClient
 from gomoku.client.net.http_api import AuthHTTPClient
 from gomoku.client.net.profile_api import ProfileHTTPClient
 from gomoku.client.net.websocket_transport import QtWebSocketTransport
-from gomoku.client.replay_window import ReplayWindow
 from gomoku.client.sessions.online import OnlineGameSession
 from gomoku.client.sound_control import SoundButton
 from gomoku.shared.avatar import normalize_avatar
@@ -204,11 +193,21 @@ class OnlinePlayerCard(QFrame):
             self.update()
 
 
-class OnlineWindow(QMainWindow):
-    """登录、自建房/好友大厅和联机对局窗口。"""
+class OnlinePanel(InkBackdrop):
+    """登录、自建房和联机对局面板。"""
 
-    def __init__(self, config: Optional[AppConfig] = None) -> None:
-        super().__init__()
+    #: 用户请求返回主菜单时发出。
+    back_requested = Signal()
+    #: 请求复盘某局棋谱；参数为棋谱列表。
+    replay_requested = Signal(object)
+
+    def __init__(
+        self,
+        config: Optional[AppConfig] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent, spec=ONLINE_BACKDROP_SPEC)
+        self.setObjectName("onlinePanel")
         self.config = config or AppConfig()
         self._closing = False
         self._logging_out = False
@@ -279,7 +278,6 @@ class OnlineWindow(QMainWindow):
             self._on_history_busy_changed
         )
         self._recent_games_entries: list = []
-        self._replay_window: Optional[ReplayWindow] = None
 
         self._social_client = SocialHTTPClient(
             self._api_base_url or None,
@@ -311,15 +309,12 @@ class OnlineWindow(QMainWindow):
         self._reconnect_timer.setSingleShot(True)
         self._reconnect_timer.timeout.connect(self._attempt_reconnect)
 
-        self.setWindowTitle("五子棋 - 联机对战")
-        self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
         self._build_ui()
-        self._apply_initial_geometry()
         self._show_auth_page()
         self._refresh_auth_availability()
 
     # ------------------------------------------------------------------
-    # 地址与几何
+    # 地址
     # ------------------------------------------------------------------
     def _resolve_urls(self) -> tuple[str, str]:
         """解析 REST/WS 地址；开发环境默认本机 8000 端口。"""
@@ -343,46 +338,36 @@ class OnlineWindow(QMainWindow):
             return api, ws_base
         return api, ws_base + "/api/v1/ws"
 
-    def _apply_initial_geometry(self) -> None:
-        screen = QApplication.primaryScreen()
-        if screen is None:
-            self.resize(WINDOW_DEFAULT_WIDTH, WINDOW_DEFAULT_HEIGHT)
-            return
-        available = screen.availableGeometry()
-        width = min(
-            WINDOW_DEFAULT_WIDTH,
-            max(WINDOW_MIN_WIDTH, available.width() - WINDOW_SCREEN_MARGIN),
-        )
-        height = min(
-            WINDOW_DEFAULT_HEIGHT,
-            max(WINDOW_MIN_HEIGHT, available.height() - WINDOW_SCREEN_MARGIN),
-        )
-        self.resize(width, height)
-        rect = self.frameGeometry()
-        rect.moveCenter(available.center())
-        self.move(rect.topLeft())
-
     # ------------------------------------------------------------------
     # 页面构建
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        central = InkBackdrop(self, spec=ONLINE_BACKDROP_SPEC)
-        central.setObjectName("onlineCentral")
-        root = QVBoxLayout(central)
+        root = QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 16)
         root.setSpacing(12)
 
-        # 声音设置在登录、大厅和对局页都保持可见。
+        # 声音设置与返回入口在登录、大厅和对局页都保持可见。
         utility_row = QHBoxLayout()
         utility_row.setContentsMargins(0, 0, 2, 0)
         utility_row.addStretch(1)
-        self.sound_button = SoundButton(central)
+        self.back_button = QPushButton("返回主菜单", self)
+        self.back_button.setObjectName("menuBackButton")
+        self.back_button.setToolTip("回到主菜单，联机状态保持不变")
+        self.back_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.back_button.setMinimumWidth(104)
+        self.back_button.setMinimumHeight(32)
+        self.back_button.setAutoDefault(False)
+        self.back_button.clicked.connect(self._on_back_clicked)
+        utility_row.addWidget(
+            self.back_button, 0, Qt.AlignmentFlag.AlignVCenter
+        )
+        self.sound_button = SoundButton(self)
         utility_row.addWidget(
             self.sound_button, 0, Qt.AlignmentFlag.AlignVCenter
         )
         root.addLayout(utility_row)
 
-        self.stack = QStackedWidget(central)
+        self.stack = QStackedWidget(self)
         self.stack.setObjectName("onlineStack")
         self.auth_page = self._build_auth_page()
         self.lobby_page = self._build_lobby_page()
@@ -391,7 +376,17 @@ class OnlineWindow(QMainWindow):
         self.stack.addWidget(self.lobby_page)
         self.stack.addWidget(self.game_page)
         root.addWidget(self.stack)
-        self.setCentralWidget(central)
+
+    def _on_back_clicked(self) -> None:
+        """“返回主菜单”按钮：交由主窗口切页。"""
+        self.back_requested.emit()
+
+    def in_room(self) -> bool:
+        """当前是否在房间或匹配队列中。"""
+        session = self._session
+        if session is None:
+            return False
+        return bool(session.room_code) or session.queued
 
     def _make_centered_card_page(self, card: QFrame) -> QWidget:
         page = QWidget(self)
@@ -1819,25 +1814,8 @@ class OnlineWindow(QMainWindow):
         self._open_replay(record)
 
     def _open_replay(self, record: GameRecord) -> None:
-        existing = self._replay_window
-        if existing is not None:
-            try:
-                existing.close()
-            except RuntimeError:
-                pass
-            self._replay_window = None
-
-        window = ReplayWindow([record], self)
-        window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        window.destroyed.connect(self._on_replay_window_destroyed)
-        self._replay_window = window
-        window.show()
-        window.raise_()
-        window.activateWindow()
-
-    def _on_replay_window_destroyed(self, *_args) -> None:
-        if self.sender() is self._replay_window:
-            self._replay_window = None
+        """请求主窗口打开复盘页；复盘面板由主窗口统一管理。"""
+        self.replay_requested.emit([record])
 
     def _on_history_failed(self, message: str) -> None:
         logger.warning("读取最近对局失败：%s", message)
@@ -2841,7 +2819,10 @@ class OnlineWindow(QMainWindow):
     # ------------------------------------------------------------------
     # 关闭
     # ------------------------------------------------------------------
-    def closeEvent(self, event: QCloseEvent) -> None:
+    def shutdown(self) -> None:
+        """停止定时器与网络连接；面板本身由主窗口的页面栈管理。"""
+        if self._closing:
+            return
         self._closing = True
         self._heartbeat_timer.stop()
         self._clock_timer.stop()
@@ -2851,15 +2832,9 @@ class OnlineWindow(QMainWindow):
         self._history_client.abort_all()
         self._social_client.abort_all()
         self._close_social_windows()
-        if self._replay_window is not None:
-            try:
-                self._replay_window.close()
-            except RuntimeError:
-                self._replay_window = None
         self._teardown_ws()
         if hasattr(self, "danmaku_overlay"):
             self.danmaku_overlay.clear()
-        super().closeEvent(event)
 
 
-__all__ = ["OnlineWindow", "OnlinePlayerCard"]
+__all__ = ["OnlinePanel", "OnlinePlayerCard"]

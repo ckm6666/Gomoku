@@ -16,7 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from PySide6.QtWidgets import QApplication, QPushButton  # noqa: E402
 
 from gomoku.client.friends_window import FriendsWindow  # noqa: E402
-from gomoku.client.online_window import OnlineWindow  # noqa: E402
+from gomoku.client.online_panel import OnlinePanel  # noqa: E402
 from gomoku.client.private_chat_window import PrivateChatWindow  # noqa: E402
 from gomoku.client.profile_window import (  # noqa: E402
     AvatarPickerDialog,
@@ -209,9 +209,9 @@ class PrivateChatWindowTests(unittest.TestCase):
         window.close()
 
 
-class OnlineWindowSocialTests(unittest.TestCase):
+class OnlinePanelSocialTests(unittest.TestCase):
     def test_leaderboard_avatar_and_friends_badge(self) -> None:
-        window = OnlineWindow()
+        window = OnlinePanel()
         window._fill_leaderboard(
             [
                 {
