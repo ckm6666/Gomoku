@@ -1,8 +1,7 @@
-"""服务端测试夹具：临时 SQLite、邀请码和 TestClient。"""
+"""服务端测试夹具：临时 SQLite 和 TestClient。"""
 
 from __future__ import annotations
 
-import asyncio
 import sys
 import tempfile
 import unittest
@@ -15,22 +14,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from fastapi.testclient import TestClient
 
-from server.app.auth_service import create_invite
 from server.app.config import Settings
-from server.app.db import create_engine, create_session_factory, create_tables
 from server.app.main import create_app
-
-
-async def seed_invites(settings: Settings, count: int = 4) -> list[str]:
-    engine = create_engine(settings)
-    await create_tables(engine)
-    factory = create_session_factory(engine)
-    codes: list[str] = []
-    async with factory() as session:
-        for _ in range(count):
-            codes.append(await create_invite(session, settings))
-    await engine.dispose()
-    return codes
 
 
 class ServerTestBase(unittest.TestCase):
@@ -47,9 +32,7 @@ class ServerTestBase(unittest.TestCase):
             refresh_token_days=30,
             turn_seconds=30,
             ws_auth_timeout_seconds=2.0,
-            invite_code_length=8,
         )
-        self.invites = asyncio.run(seed_invites(self.settings))
         self.app = create_app(self.settings)
         self._client_cm = TestClient(self.app)
         self.client = self._client_cm.__enter__()
@@ -64,14 +47,12 @@ class ServerTestBase(unittest.TestCase):
         self,
         username: str,
         password: str = "correct horse battery",
-        invite_index: int = 0,
     ):
         return self.client.post(
             "/api/v1/auth/register",
             json={
                 "username": username,
                 "password": password,
-                "invite_code": self.invites[invite_index],
             },
         )
 

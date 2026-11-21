@@ -53,7 +53,6 @@ class Settings:
     ws_auth_timeout_seconds: float = 10.0
     ws_idle_timeout_seconds: float = 75.0
     max_ws_message_chars: int = 8192
-    invite_code_length: int = 8
     room_code_length: int = 8
 
     @property
@@ -121,7 +120,6 @@ class Settings:
             turn_seconds=turn_seconds,
             ws_auth_timeout_seconds=auth_timeout,
             ws_idle_timeout_seconds=idle_timeout,
-            invite_code_length=8,
             room_code_length=8,
         )
 

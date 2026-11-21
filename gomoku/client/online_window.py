@@ -312,7 +312,7 @@ class OnlineWindow(QMainWindow):
         title = QLabel("五子棋 - 联机对战", card)
         title.setObjectName("onlineTitle")
         subtitle = QLabel(
-            "邀请制内测：登录后可参加排位匹配、查看排行榜，也可创建好友房。",
+            "登录后可参加排位匹配、查看排行榜，也可创建好友房。",
             card,
         )
         subtitle.setObjectName("onlineSubtitle")
@@ -331,9 +331,6 @@ class OnlineWindow(QMainWindow):
         self.password_edit.setObjectName("onlineInput")
         self.password_edit.setPlaceholderText("密码（至少 8 位）")
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.invite_edit = QLineEdit(card)
-        self.invite_edit.setObjectName("onlineInput")
-        self.invite_edit.setPlaceholderText("邀请码（首次注册时填写）")
 
         card_layout.addWidget(title)
         card_layout.addWidget(subtitle)
@@ -341,7 +338,6 @@ class OnlineWindow(QMainWindow):
         for label_text, widget in (
             ("用户名", self.username_edit),
             ("密码", self.password_edit),
-            ("邀请码", self.invite_edit),
         ):
             label = QLabel(label_text, card)
             label.setObjectName("formLabel")
@@ -354,7 +350,7 @@ class OnlineWindow(QMainWindow):
         self.login_button = QPushButton("登录", card)
         self.login_button.setObjectName("restartButton")
         self.login_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.register_button = QPushButton("邀请码注册", card)
+        self.register_button = QPushButton("注册", card)
         self.register_button.setObjectName("undoButton")
         self.register_button.setCursor(Qt.CursorShape.PointingHandCursor)
         buttons.addWidget(self.login_button)
@@ -709,7 +705,6 @@ class OnlineWindow(QMainWindow):
         for widget in (
             self.username_edit,
             self.password_edit,
-            self.invite_edit,
             self.login_button,
             self.register_button,
         ):
@@ -950,13 +945,12 @@ class OnlineWindow(QMainWindow):
             return
         username = self.username_edit.text().strip()
         password = self.password_edit.text()
-        invite = self.invite_edit.text().strip()
-        if not username or not password or not invite:
-            self._set_auth_status("注册需要用户名、密码和邀请码", error=True)
+        if not username or not password:
+            self._set_auth_status("注册需要用户名和密码", error=True)
             return
         self._set_auth_status("正在注册…")
         self._set_auth_form_busy(True)
-        if not self._auth_client.register(username, password, invite):
+        if not self._auth_client.register(username, password):
             self._set_auth_status("无法发起注册请求", error=True)
             self._set_auth_form_busy(False)
 
@@ -965,7 +959,6 @@ class OnlineWindow(QMainWindow):
         for widget in (
             self.username_edit,
             self.password_edit,
-            self.invite_edit,
             self.login_button,
             self.register_button,
         ):
@@ -981,7 +974,6 @@ class OnlineWindow(QMainWindow):
         self._auth_session = session
         self._logging_out = False
         self._reconnect_attempts = 0
-        self.invite_edit.clear()
         self.password_edit.clear()
         self._clear_profile_ui()
         self._set_auth_status("登录成功，正在连接游戏服务器…")

@@ -31,8 +31,8 @@ from server.tests.helpers import ServerTestBase
 
 
 class RankedMatchTests(ServerTestBase):
-    def _register_access(self, username: str, invite_index: int) -> str:
-        response = self.register(username, invite_index=invite_index)
+    def _register_access(self, username: str) -> str:
+        response = self.register(username)
         self.assertEqual(response.status_code, 201, response.text)
         return response.json()["access_token"]
 
@@ -51,8 +51,8 @@ class RankedMatchTests(ServerTestBase):
         return {}
 
     def test_match_resign_rating_profile_and_leaderboard(self) -> None:
-        host_token = self._register_access("rank_host", 0)
-        guest_token = self._register_access("rank_guest", 1)
+        host_token = self._register_access("rank_host")
+        guest_token = self._register_access("rank_guest")
 
         with self.client.websocket_connect("/api/v1/ws") as host:
             with self.client.websocket_connect("/api/v1/ws") as guest:
@@ -218,7 +218,7 @@ class RankedMatchTests(ServerTestBase):
                 self.assertEqual(event_count, 2)
 
     def test_cancel_queue_then_create_friend_room(self) -> None:
-        token = self._register_access("queue_canceller", 0)
+        token = self._register_access("queue_canceller")
         with self.client.websocket_connect("/api/v1/ws") as ws:
             self._authenticate(ws, token)
             ws.send_json(make_message(CLIENT_QUICK_MATCH, {}))
@@ -238,8 +238,8 @@ class RankedMatchTests(ServerTestBase):
             self.assertEqual(len(created["payload"]["room_code"]), 8)
 
     def test_friend_room_does_not_change_rating(self) -> None:
-        host_token = self._register_access("casual_host", 0)
-        guest_token = self._register_access("casual_guest", 1)
+        host_token = self._register_access("casual_host")
+        guest_token = self._register_access("casual_guest")
         with self.client.websocket_connect("/api/v1/ws") as host:
             with self.client.websocket_connect("/api/v1/ws") as guest:
                 self._authenticate(host, host_token)
@@ -271,7 +271,7 @@ class RankedMatchTests(ServerTestBase):
         unauth = self.client.get("/api/v1/leaderboard")
         self.assertEqual(unauth.status_code, 401)
 
-        token = self._register_access("leaderboard_user", 0)
+        token = self._register_access("leaderboard_user")
         response = self.client.get(
             "/api/v1/leaderboard", headers=self.auth_headers(token)
         )

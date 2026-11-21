@@ -2,7 +2,7 @@
 
 FastAPI + WebSocket + SQLAlchemy 的联机服务端，提供：
 
-- 邀请制账号注册、登录、refresh token 轮换、登出；
+- 用户名 + 密码账号注册、登录、refresh token 轮换、登出；
 - 公开排位快速匹配队列（按积分接近配对、随机黑白）；
 - 好友房间创建/加入（休闲，不计分）；
 - 服务器权威落子、五连判定、每手倒计时；
@@ -22,11 +22,11 @@ server/
 │   ├── main.py             # FastAPI app factory、REST/WS 路由、生命周期
 │   ├── config.py           # 环境变量配置
 │   ├── db.py               # 异步引擎、建表、加列迁移、启动作废未完成对局
-│   ├── models.py           # users/invite_codes/refresh_sessions/games/moves/rating_events
+│   ├── models.py           # users/refresh_sessions/games/moves/rating_events
 │   ├── ratings.py          # Elo 与段位纯函数
-│   ├── security.py         # Argon2id、JWT、refresh token、邀请码、登录限流
+│   ├── security.py         # Argon2id、JWT、refresh token、登录限流
 │   ├── schemas.py          # 认证/资料/排行榜 DTO
-│   ├── auth_service.py     # 邀请码/令牌生成辅助
+│   ├── auth_service.py     # 令牌生成辅助
 │   ├── api/auth.py         # 注册/登录/刷新/登出/me
 │   ├── api/ranked.py       # /profile/me 与 /leaderboard
 │   └── ws/
@@ -36,7 +36,7 @@ server/
 ├── requirements.txt
 ├── requirements-dev.txt
 ├── requirements-postgres.txt
-└── manage.py               # 生成邀请码、管理员重置密码
+└── manage.py               # 管理员重置密码
 ```
 
 ## 快速启动（Windows，本地测试）
@@ -53,10 +53,6 @@ server\.venv\Scripts\python.exe -m pip install -r server\requirements-dev.txt
 # 固定一个足够长的开发 secret（生产必须换成真正随机秘密）
 $env:GOMOKU_SERVER_ENV = "development"
 $env:GOMOKU_JWT_SECRET = "replace-with-a-long-random-development-secret-32chars+"
-
-# 启动前生成邀请码（每个码注册一个账号；测试排位至少生成两个）
-server\.venv\Scripts\python.exe -m server.manage create-invite --expires-days 30
-server\.venv\Scripts\python.exe -m server.manage create-invite --expires-days 30
 
 # 单进程启动；房间/匹配队列在内存中，第一版不要开多个 worker
 server\.venv\Scripts\python.exe -m uvicorn server.app.main:app --host 127.0.0.1 --port 8000
@@ -81,10 +77,10 @@ server/data/gomoku.db
 
 所以本机测试无需额外配置即可打开客户端“联机对战”。
 
-## 账号与邀请码
+## 账号与注册
 
-- 客户端登录页同时支持“登录”和“邀请码注册”。
-- 注册邀请码只能使用一次，默认有效期 30 天。
+- 客户端登录页同时支持“登录”和“注册”。
+- 注册只需填写用户名和密码，不需要任何额外凭据；用户名唯一，密码使用 Argon2id 哈希存储。
 - 关闭/重启服务后，如果使用随机开发 secret，旧 access/refresh token 会失效；固定 `GOMOKU_JWT_SECRET` 可避免。
 - 目前没有邮箱/短信自助找回；管理员可重置密码并撤销 refresh 会话：
 
@@ -92,6 +88,8 @@ server/data/gomoku.db
 server\.venv\Scripts\python.exe -m server.manage reset-password --username 用户名
 # 不传 --new-password 时会生成随机密码并打印
 ```
+
+本地联机测试时，直接在客户端注册两个账号（用户名 + 密码）即可用于排位对局。
 
 ## 排位积分与匹配
 
@@ -206,7 +204,7 @@ Start-Process C:\Users\a1325\Desktop\Gomoku\dist\Gomoku.exe
 6. 排位已通过“仅匹配计分、好友房不计分、排位不可直接再战”降低刷分面，但仍无法阻止
    排队串通、故意送分和外部 AI 辅助；积分阶段需另行设计反作弊、举报与回放审计。
 7. 若未来在中国大陆公开运营，需单独评估 ICP/公安备案、实名/未成年人保护、隐私与游戏出版等要求；
-   当前定位仅为邀请制内测。
+   当前定位仅为内测。
 
 ## 测试
 
@@ -215,9 +213,9 @@ cd C:\Users\a1325\Desktop\Gomoku
 server\.venv\Scripts\python.exe -m unittest discover -s server/tests -v
 ```
 
-当前 **24 项**测试覆盖：
+当前 **23 项**测试覆盖：
 
-- 邀请码注册、登录、refresh 轮换/重放、登出、认证响应积分字段；
+- 用户名 + 密码注册、登录、refresh 轮换/重放、登出、认证响应积分字段；
 - 双 WebSocket 建房/加入/落子/拒绝/认输/再战、服务器五连判定、断线重连；
 - 快速匹配、取消匹配、排位房、随机黑白、终局 Elo 结算、好友房不计分；
 - 排行榜、个人资料与最近战绩；

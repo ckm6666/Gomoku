@@ -1,4 +1,4 @@
-"""邀请制账号注册、登录、刷新、登出与当前用户接口。"""
+"""账号注册、登录、刷新、登出与当前用户接口。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from server.app.auth_service import (
 )
 from server.app.db import utcnow_naive
 from server.app.dependencies import get_current_user, get_db
-from server.app.models import InviteCode, RefreshSession, User
+from server.app.models import RefreshSession, User
 from server.app.schemas import (
     AuthResponse,
     LoginRequest,
@@ -24,7 +24,6 @@ from server.app.schemas import (
 )
 from server.app.security import (
     hash_password,
-    normalize_invite_code,
     normalize_username,
     sha256_hex,
     verify_password,
@@ -47,9 +46,8 @@ async def register(
     request: Request,
     session: AsyncSession = Depends(get_db),
 ) -> AuthResponse:
-    """邀请码注册；邀请码只能使用一次。"""
+    """账号注册；用户名唯一。"""
     display_name, username_key = normalize_username(payload.username)
-    invite_hash = sha256_hex(normalize_invite_code(payload.invite_code))
     settings = request.app.state.settings
 
     # 哈希计算放线程池，并且放在注册全局锁之外以减少锁持有时间。
@@ -65,22 +63,6 @@ async def register(
                 detail="用户名已被使用",
             )
 
-        invite = await session.scalar(
-            select(InviteCode).where(
-                InviteCode.code_hash == invite_hash,
-                InviteCode.used_by.is_(None),
-            )
-        )
-        now = utcnow_naive()
-        if (
-            invite is None
-            or (invite.expires_at is not None and invite.expires_at <= now)
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="邀请码无效、已使用或已过期",
-            )
-
         user = User(
             username=display_name,
             username_key=username_key,
@@ -89,33 +71,17 @@ async def register(
         session.add(user)
         try:
             await session.flush()
-            claimed = await session.execute(
-                update(InviteCode)
-                .where(
-                    InviteCode.id == invite.id,
-                    InviteCode.used_by.is_(None),
-                )
-                .values(used_by=user.id, used_at=now)
-            )
-            if (claimed.rowcount or 0) != 1:
-                await session.rollback()
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="邀请码已被使用",
-                )
 
             refresh_record, raw_refresh = make_refresh_session(
                 user.id, settings
             )
             session.add(refresh_record)
             await session.commit()
-        except HTTPException:
-            raise
         except IntegrityError as exc:
             await session.rollback()
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="用户名或邀请码已被使用",
+                detail="用户名已被使用",
             ) from exc
 
         await session.refresh(user)

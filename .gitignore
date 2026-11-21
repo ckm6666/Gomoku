@@ -33,8 +33,6 @@ logs/
 .env.*
 jwt_secret.txt
 runtime.json
-formal_invites.json
-invites.txt
 online_test/
 
 # OS / editor
