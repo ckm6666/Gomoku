@@ -1,4 +1,4 @@
-"""邀请制账号与认证 API 测试。"""
+"""账号与认证 API 测试。"""
 
 from __future__ import annotations
 
@@ -28,10 +28,6 @@ class AuthAPITests(ServerTestBase):
         self.assertEqual(me.status_code, 200)
         self.assertEqual(me.json()["username"], "棋手甲")
 
-        # 已使用邀请码不能再次注册
-        reused = self.register("棋手乙", invite_index=0)
-        self.assertEqual(reused.status_code, 400)
-
         login = self.client.post(
             "/api/v1/auth/login",
             json={
@@ -44,7 +40,7 @@ class AuthAPITests(ServerTestBase):
 
     def test_duplicate_username_and_bad_password(self) -> None:
         self.assertEqual(self.register("same_name").status_code, 201)
-        duplicate = self.register("SAME_NAME", invite_index=1)
+        duplicate = self.register("SAME_NAME")
         self.assertEqual(duplicate.status_code, 409)
 
         bad = self.client.post(
@@ -93,24 +89,12 @@ class AuthAPITests(ServerTestBase):
         )
         self.assertEqual(refresh.status_code, 401)
 
-    def test_invalid_invite_code(self) -> None:
-        response = self.client.post(
-            "/api/v1/auth/register",
-            json={
-                "username": "noinvite",
-                "password": "correct horse battery",
-                "invite_code": "BADCODE",
-            },
-        )
-        self.assertEqual(response.status_code, 400)
-
     def test_username_validation(self) -> None:
         response = self.client.post(
             "/api/v1/auth/register",
             json={
                 "username": "bad name!",
                 "password": "correct horse battery",
-                "invite_code": self.invites[0],
             },
         )
         self.assertEqual(response.status_code, 422)

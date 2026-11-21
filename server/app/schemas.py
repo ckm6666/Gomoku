@@ -24,7 +24,6 @@ from server.app.security import validate_password, validate_username
 class RegisterRequest(BaseModel):
     username: Annotated[str, Field(min_length=2, max_length=24)]
     password: Annotated[str, Field(min_length=8, max_length=128)]
-    invite_code: Annotated[str, Field(min_length=4, max_length=64)]
 
     @field_validator("username")
     @classmethod
@@ -39,11 +38,6 @@ class RegisterRequest(BaseModel):
         if not validate_password(value):
             raise ValueError("密码长度必须为 8～128 个字符")
         return value
-
-    @field_validator("invite_code")
-    @classmethod
-    def _invite_valid(cls, value: str) -> str:
-        return value.strip().upper()
 
 
 class LoginRequest(BaseModel):

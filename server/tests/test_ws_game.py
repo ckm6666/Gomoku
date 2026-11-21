@@ -24,8 +24,8 @@ from server.tests.helpers import ServerTestBase
 
 
 class WebSocketGameTests(ServerTestBase):
-    def _register_access(self, username: str, invite_index: int) -> str:
-        response = self.register(username, invite_index=invite_index)
+    def _register_access(self, username: str) -> str:
+        response = self.register(username)
         self.assertEqual(response.status_code, 201, response.text)
         return response.json()["access_token"]
 
@@ -38,8 +38,8 @@ class WebSocketGameTests(ServerTestBase):
         return message
 
     def test_full_friend_game_flow(self) -> None:
-        host_token = self._register_access("host_user", 0)
-        guest_token = self._register_access("guest_user", 1)
+        host_token = self._register_access("host_user")
+        guest_token = self._register_access("guest_user")
 
         with self.client.websocket_connect("/api/v1/ws") as host:
             with self.client.websocket_connect("/api/v1/ws") as guest:
@@ -156,8 +156,8 @@ class WebSocketGameTests(ServerTestBase):
                 self.assertFalse(new_host.is_game_over)
 
     def test_server_authoritative_five_in_a_row(self) -> None:
-        host_token = self._register_access("win_host", 0)
-        guest_token = self._register_access("win_guest", 1)
+        host_token = self._register_access("win_host")
+        guest_token = self._register_access("win_guest")
         with self.client.websocket_connect("/api/v1/ws") as host:
             with self.client.websocket_connect("/api/v1/ws") as guest:
                 self._authenticate(host, host_token)
@@ -201,8 +201,8 @@ class WebSocketGameTests(ServerTestBase):
                 )
 
     def test_reconnect_restores_state(self) -> None:
-        host_token = self._register_access("reconnect_host", 0)
-        guest_token = self._register_access("reconnect_guest", 1)
+        host_token = self._register_access("reconnect_host")
+        guest_token = self._register_access("reconnect_guest")
 
         with self.client.websocket_connect("/api/v1/ws") as host:
             self._authenticate(host, host_token)

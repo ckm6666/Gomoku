@@ -4,14 +4,14 @@
 
 - 本地双人对战；
 - 三档自研 AI 人机对战；
-- 邀请制账号 + 公开排位快速匹配 + 好友房联机（FastAPI + WebSocket + SQLite/PostgreSQL 兼容）；
+- 账号系统 + 公开排位快速匹配 + 好友房联机（FastAPI + WebSocket + SQLite/PostgreSQL 兼容）；
 - Elo 积分、青铜～王者段位、排行榜、个人战绩与最近排位记录；
 - 可打包为单个 `Gomoku.exe`。
 
 当前版本：**1.5.1**（古风视觉主题：水墨山水 / 宣纸 / 定制终局与确认弹窗）。
 
 > 联机功能需要同时运行本项目的服务端；离线双人/AI 模式不需要服务器。
-> 当前仍是邀请制内测定位，未开放自助注册。
+> 当前仍是内测定位，注册需要用户名与密码。
 
 ## 界面预览
 
@@ -70,7 +70,7 @@
 
 ### 账号与联机
 
-- 邀请码注册、登录、refresh token 轮换、登出；Argon2id 密码哈希。
+- 用户名 + 密码注册、登录、refresh token 轮换、登出；Argon2id 密码哈希。
 - **公开排位快速匹配**：按当前积分选择最接近的对手，双方随机黑白；服务器权威落子、
   胜负和积分。
 - **好友房**：8 位房间码创建/加入，休闲对局，不计分。
@@ -151,13 +151,13 @@ Gomoku/
 ├── server/                         # 独立 FastAPI 服务端
 │   ├── app/
 │   │   ├── ratings.py              # Elo 与段位纯函数
-│   │   ├── models.py               # 账号/邀请码/令牌/对局/落子/积分事件
+│   │   ├── models.py               # 账号/令牌/对局/落子/积分事件
 │   │   ├── api/auth.py             # 注册/登录/刷新/登出/me
 │   │   ├── api/ranked.py           # 个人排位资料与排行榜
 │   │   └── ws/rooms.py             # 好友房、匹配队列、排位结算、时钟、重连
 │   ├── tests/                      # REST + 双 WebSocket + Elo 测试
 │   ├── requirements*.txt
-│   ├── manage.py                   # 邀请码/管理员重置密码
+│   ├── manage.py                   # 管理员重置密码
 │   └── README.md                   # 服务端安装、部署、PostgreSQL、TLS 说明
 ├── tests/                          # 客户端 90 项自动化测试
 ├── requirements.txt                # 客户端运行依赖
@@ -212,16 +212,14 @@ py -3 -m venv .venv
 cd C:\Users\a1325\Desktop\Gomoku
 $env:GOMOKU_SERVER_ENV = "development"
 $env:GOMOKU_JWT_SECRET = "replace-with-a-long-random-secret-at-least-32-chars"
-server\.venv\Scripts\python.exe -m server.manage create-invite --expires-days 30
 server\.venv\Scripts\python.exe -m uvicorn server.app.main:app --host 127.0.0.1 --port 8000
 ```
 
-- `create-invite` 输出的 8 位码就是客户端“邀请码注册”时使用的邀请码；每码只能注册一个账号。
-  要模拟两名玩家排位，需要生成两个邀请码。
+- 注册只需用户名和密码，直接在客户端“联机对战”窗口完成，无需任何额外凭据。
 - 客户端开发环境默认访问 `http://127.0.0.1:8000` 和 `ws://127.0.0.1:8000/api/v1/ws`。
 - 服务端首次启动会自动在 `server/data/gomoku.db` 建表；Stage 1 旧数据库会自动补上
   `users.rating` 等积分列和 `rating_events` 表，不需要手工迁移。
-- 启动本机服务后，打开客户端 → 主菜单“联机对战” → 用邀请码注册/登录 → 大厅直接
+- 启动本机服务后，打开客户端 → 主菜单“联机对战” → 用用户名 + 密码注册/登录 → 大厅直接
   “开始排位匹配”，或创建好友房分享房间码。
 - 默认开发环境没有外部数据库；生产 PostgreSQL、TLS、部署与安全说明见
   [`server/README.md`](server/README.md)。
@@ -335,7 +333,7 @@ server\.venv\Scripts\python.exe -m unittest discover -s server/tests -v
 客户端当前 **90 项**测试覆盖规则、AI、配置/协议、本地/AI/在线会话、排位快照/匹配队列、
 程序化音频/MP3 解码/缓存/设置持久化、按钮点击滤波器、主菜单导航/返回确认、古风主题资源/
 绘制、终局与确认弹窗、双人模式设置栏和离屏 UI/QThread。
-服务端当前 **24 项**测试覆盖邀请注册/登录/refresh 重放/登出、双 WebSocket 建房/加入/落子/拒绝/认输/再战、
+服务端当前 **23 项**测试覆盖注册/登录/refresh 重放/登出、双 WebSocket 建房/加入/落子/拒绝/认输/再战、
 五连终局和断线重连、快速匹配/取消、排位 Elo 结算、好友房不计分、排行榜/资料接口和积分纯函数。
 另已做本机真实 Uvicorn + 两个 WebSocket 客户端完整排位对局验证（1200→1220/1180，排行榜与最近战绩同步）。
 
@@ -405,7 +403,7 @@ Authorization 头或 token。当前客户端 token 只保存在内存，关闭�
 
 - 联机采用服务器权威落子、每手 DB 写穿、房间异步锁、唯一步序/客户端 move_id 幂等、
   服务器时钟和终局一次性 Elo 结算；客户端不能提交胜负或积分。
-- 账号使用邀请码注册、Argon2id 密码哈希、短时 JWT access + 服务端哈希存储且轮换的
+- 账号使用用户名 + 密码注册、Argon2id 密码哈希、短时 JWT access + 服务端哈希存储且轮换的
   refresh token、登录失败限流。
 - 只有公开匹配计分，好友房和再战不计分，排位房不能用房间码加入、排位终局不能直接再战，
   但这些措施不能完全杜绝排队串通、故意送分或外部 AI 辅助；当前不作为严格竞技排位运营。

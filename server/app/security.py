@@ -1,4 +1,4 @@
-"""密码、令牌、邀请码与登录限流。"""
+"""密码、令牌与登录限流。"""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from gomoku.shared.errors import ProtocolError
 from server.app.config import Settings
 
 _PASSWORD_HASHER = PasswordHasher()
-_INVITE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
 def normalize_username(raw: str) -> tuple[str, str]:
@@ -58,14 +57,6 @@ async def verify_password(password: str, password_hash: str) -> bool:
 
 def sha256_hex(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def generate_invite_code(length: int = 8) -> str:
-    return "".join(secrets.choice(_INVITE_ALPHABET) for _ in range(length))
-
-
-def normalize_invite_code(raw: str) -> str:
-    return raw.strip().upper()
 
 
 def generate_refresh_token() -> tuple[str, str]:
@@ -184,8 +175,6 @@ __all__ = [
     "hash_password",
     "verify_password",
     "sha256_hex",
-    "generate_invite_code",
-    "normalize_invite_code",
     "generate_refresh_token",
     "create_access_token",
     "decode_access_token",

@@ -60,14 +60,13 @@ class AuthHTTPClient(QObject):
             {"username": username, "password": password},
         )
 
-    def register(self, username: str, password: str, invite_code: str) -> bool:
+    def register(self, username: str, password: str) -> bool:
         return self._start(
             "register",
             "register",
             {
                 "username": username,
                 "password": password,
-                "invite_code": invite_code,
             },
         )
 

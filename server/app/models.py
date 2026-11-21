@@ -1,4 +1,4 @@
-"""数据库模型：账号、邀请码、刷新会话、对局与落子。"""
+"""数据库模型：账号、刷新会话、对局与落子。"""
 
 from __future__ import annotations
 
@@ -65,25 +65,6 @@ class User(Base):
     draws: Mapped[int] = mapped_column(
         Integer, default=0, server_default=text("0"), nullable=False
     )
-
-
-class InviteCode(Base):
-    __tablename__ = "invite_codes"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    code_hash: Mapped[str] = mapped_column(
-        String(64), unique=True, index=True, nullable=False
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=utcnow_naive, nullable=False
-    )
-    expires_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True
-    )
-    used_by: Mapped[Optional[str]] = mapped_column(
-        String(36), ForeignKey("users.id"), nullable=True
-    )
-    used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
 class RefreshSession(Base):
@@ -210,7 +191,6 @@ class RatingEvent(Base):
 
 __all__ = [
     "User",
-    "InviteCode",
     "RefreshSession",
     "Game",
     "Move",
