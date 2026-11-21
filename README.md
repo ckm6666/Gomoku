@@ -421,7 +421,17 @@ UI 测试自动使用 `QT_QPA_PLATFORM=offscreen`，不启动真实网络；真�
 pip install -r requirements-dev.txt
 ```
 
-打包（`Gomoku.spec` 已配置 onefile/windowed，并把整个 `gomoku/client/assets` 加入 `datas`）：
+推荐用仓库自带的打包脚本（等价于下面的 pyinstaller 命令，并额外检查依赖、
+打印产物大小）：
+
+```powershell
+python build.py                # 正常打包（等价 pyinstaller --noconfirm --clean Gomoku.spec）
+python build.py --fast         # 跳过 --clean，复用上次缓存，打包更快
+python build.py --install      # 先安装 requirements-dev.txt 依赖再打包
+python build.py -- --windowed --debug   # -- 之后的参数原样透传给 PyInstaller
+```
+
+手动打包（`Gomoku.spec` 已配置 onefile/windowed，并把整个 `gomoku/client/assets` 加入 `datas`）：
 
 ```powershell
 pyinstaller --noconfirm --clean Gomoku.spec
