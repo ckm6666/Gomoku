@@ -12,17 +12,20 @@ from typing import Any, Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 
+from gomoku.shared.avatar import normalize_avatar
 from gomoku.shared.errors import ProtocolError
 from gomoku.shared.protocol import (
     CLIENT_AUTH,
     CLIENT_CANCEL_MATCH,
     CLIENT_CHAT,
     CLIENT_CREATE_ROOM,
+    CLIENT_INVITE_TO_ROOM,
     CLIENT_JOIN_ROOM,
     CLIENT_MOVE_INTENT,
     CLIENT_PING,
     CLIENT_QUICK_MATCH,
     CLIENT_REMATCH,
+    CLIENT_RESPOND_ROOM_INVITE,
     CLIENT_RESIGN,
     CLIENT_LEAVE_ROOM,
     SERVER_AUTHENTICATED,
@@ -142,12 +145,15 @@ async def game_websocket(websocket: WebSocket) -> None:
         user_id = user.id
         username = user.username
         rating = user.rating
+        avatar = normalize_avatar(user.avatar, user.id)
 
     conn = ClientConnection(
         connection_id=uuid.uuid4().hex,
         user_id=user_id,
         username=username,
         websocket=websocket,
+        avatar=avatar,
+        rating=rating,
     )
     await conn.send(
         make_message(
@@ -156,6 +162,7 @@ async def game_websocket(websocket: WebSocket) -> None:
                 "user": {
                     "id": user_id,
                     "username": username,
+                    "avatar": avatar,
                     "rating": rating,
                     "rank_name": rank_for_rating(rating).name,
                 }
@@ -268,6 +275,39 @@ async def game_websocket(websocket: WebSocket) -> None:
                         # 网关只负责挡下非字符串的畸形负载。
                         await room_manager.send_chat(
                             conn, kind, content, request_id
+                        )
+                elif message_type == CLIENT_INVITE_TO_ROOM:
+                    invitee_id = payload.get("user_id")
+                    if not isinstance(invitee_id, str) or not invitee_id:
+                        await conn.send(
+                            make_message(
+                                SERVER_ERROR,
+                                {"reason": "邀请对象非法"},
+                                request_id=request_id,
+                            )
+                        )
+                    else:
+                        await room_manager.invite_to_room(
+                            conn, invitee_id, request_id
+                        )
+                elif message_type == CLIENT_RESPOND_ROOM_INVITE:
+                    invite_id = payload.get("invite_id")
+                    accept = payload.get("accept")
+                    if (
+                        not isinstance(invite_id, str)
+                        or not invite_id
+                        or not isinstance(accept, bool)
+                    ):
+                        await conn.send(
+                            make_message(
+                                SERVER_ERROR,
+                                {"reason": "邀请响应格式非法"},
+                                request_id=request_id,
+                            )
+                        )
+                    else:
+                        await room_manager.respond_room_invite(
+                            conn, invite_id, accept, request_id
                         )
                 elif message_type == CLIENT_AUTH:
                     await conn.send(

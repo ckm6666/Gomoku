@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
+from gomoku.shared.avatar import normalize_avatar
 from gomoku.shared.errors import ProtocolError
 from gomoku.shared.rules import BOARD_SIZE, Cell, Move, Player
 
@@ -33,6 +34,8 @@ CLIENT_QUICK_MATCH = "quick_match"
 CLIENT_CANCEL_MATCH = "cancel_match"
 CLIENT_PING = "ping"
 CLIENT_CHAT = "chat"
+CLIENT_INVITE_TO_ROOM = "invite_to_room"
+CLIENT_RESPOND_ROOM_INVITE = "respond_room_invite"
 
 # 服务端 → 客户端
 SERVER_AUTHENTICATED = "authenticated"
@@ -47,6 +50,10 @@ SERVER_MATCH_FOUND = "match_found"
 SERVER_PONG = "pong"
 SERVER_ERROR = "server_error"
 SERVER_CHAT = "chat_message"
+SERVER_ROOM_INVITATION = "room_invitation"
+SERVER_ROOM_INVITE_RESULT = "room_invite_result"
+SERVER_FRIEND_EVENT = "friend_event"
+SERVER_DIRECT_MESSAGE = "direct_message"
 
 _ALLOWED_MESSAGE_TYPES = {
     CLIENT_AUTH,
@@ -60,6 +67,8 @@ _ALLOWED_MESSAGE_TYPES = {
     CLIENT_CANCEL_MATCH,
     CLIENT_PING,
     CLIENT_CHAT,
+    CLIENT_INVITE_TO_ROOM,
+    CLIENT_RESPOND_ROOM_INVITE,
     SERVER_AUTHENTICATED,
     SERVER_ROOM_CREATED,
     SERVER_GAME_STATE,
@@ -72,6 +81,10 @@ _ALLOWED_MESSAGE_TYPES = {
     SERVER_PONG,
     SERVER_ERROR,
     SERVER_CHAT,
+    SERVER_ROOM_INVITATION,
+    SERVER_ROOM_INVITE_RESULT,
+    SERVER_FRIEND_EVENT,
+    SERVER_DIRECT_MESSAGE,
 }
 
 # 服务端 → 客户端的消息类型集合。
@@ -93,6 +106,10 @@ SERVER_MESSAGE_TYPES = frozenset(
         SERVER_PONG,
         SERVER_ERROR,
         SERVER_CHAT,
+        SERVER_ROOM_INVITATION,
+        SERVER_ROOM_INVITE_RESULT,
+        SERVER_FRIEND_EVENT,
+        SERVER_DIRECT_MESSAGE,
     }
 )
 
@@ -119,6 +136,10 @@ class GameSnapshot:
     room_code: str = ""
     black_name: str = ""
     white_name: str = ""
+    black_user_id: str = ""
+    white_user_id: str = ""
+    black_avatar: str = ""
+    white_avatar: str = ""
     turn_deadline_ms: int | None = None
     server_now_ms: int | None = None
     move_timeout_seconds: int | None = None
@@ -254,6 +275,23 @@ def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
     if not isinstance(room_code, str) or not isinstance(black_name, str) or not isinstance(white_name, str):
         raise ProtocolError("room_code/black_name/white_name 必须是字符串")
 
+    black_user_id = payload.get("black_user_id", "")
+    white_user_id = payload.get("white_user_id", "")
+    black_avatar = payload.get("black_avatar", "")
+    white_avatar = payload.get("white_avatar", "")
+    if not all(
+        isinstance(value, str)
+        for value in (
+            black_user_id,
+            white_user_id,
+            black_avatar,
+            white_avatar,
+        )
+    ):
+        raise ProtocolError("用户 id/头像字段必须是字符串")
+    black_avatar = normalize_avatar(black_avatar, black_user_id)
+    white_avatar = normalize_avatar(white_avatar, white_user_id)
+
     def optional_int(field: str) -> int | None:
         value = payload.get(field)
         if value is None:
@@ -299,6 +337,10 @@ def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
         room_code=room_code,
         black_name=black_name,
         white_name=white_name,
+        black_user_id=black_user_id,
+        white_user_id=white_user_id,
+        black_avatar=black_avatar,
+        white_avatar=white_avatar,
         turn_deadline_ms=optional_int("turn_deadline_ms"),
         server_now_ms=optional_int("server_now_ms"),
         move_timeout_seconds=optional_int("move_timeout_seconds"),
@@ -386,6 +428,8 @@ __all__ = [
     "CLIENT_CANCEL_MATCH",
     "CLIENT_PING",
     "CLIENT_CHAT",
+    "CLIENT_INVITE_TO_ROOM",
+    "CLIENT_RESPOND_ROOM_INVITE",
     "SERVER_AUTHENTICATED",
     "SERVER_ROOM_CREATED",
     "SERVER_GAME_STATE",
@@ -398,6 +442,10 @@ __all__ = [
     "SERVER_PONG",
     "SERVER_ERROR",
     "SERVER_CHAT",
+    "SERVER_ROOM_INVITATION",
+    "SERVER_ROOM_INVITE_RESULT",
+    "SERVER_FRIEND_EVENT",
+    "SERVER_DIRECT_MESSAGE",
     "SERVER_MESSAGE_TYPES",
     "GameSnapshot",
     "parse_game_state",

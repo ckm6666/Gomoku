@@ -1,18 +1,20 @@
-# Gomoku Online Server（好友房 + 排位匹配版）
+# Gomoku Online Server（自建房 + 排位匹配版）
 
 FastAPI + WebSocket + SQLAlchemy 的联机服务端，提供：
 
 - 用户名 + 密码账号注册、登录、refresh token 轮换、登出；
 - 公开排位快速匹配队列（按积分接近配对、随机黑白）；
-- 好友房间创建/加入（休闲，不计分）；
+- 预置头像、公开资料与用户搜索；
+- 好友申请/同意/删除、好友在线状态推送与好友私聊（消息持久化、离线补收）；
+- 自建房邀请：房主创建房间后直接邀请在线好友，对方接受即开局，无需房间码；
 - 服务器权威落子、五连判定、每手倒计时；
 - 断线保留房间与重连恢复（每手 30 秒默认）；
-- 认输、好友房双方确认再战、离开房间；
+- 认输、自建房双方确认再战、离开房间；
 - Elo 积分、段位、排行榜、个人资料与最近排位战绩；
 - 最近对局列表与单局完整棋谱（仅对局参与者可读）；
 - SQLite 开发默认 / PostgreSQL 生产 URL 兼容。
 
-当前版本对应客户端 **1.7.0**。已提供参与者棋谱读取；尚未实现赛季、Glicko-2、
+当前版本对应客户端 **1.8.0**。已提供参与者棋谱读取；尚未实现赛季、Glicko-2、
 邮箱验证、第三方登录、举报/处罚或 Redis 多实例路由。
 
 ## 目录
@@ -23,17 +25,20 @@ server/
 │   ├── main.py             # FastAPI app factory、REST/WS 路由、生命周期
 │   ├── config.py           # 环境变量配置
 │   ├── db.py               # 异步引擎、建表、加列迁移、启动作废未完成对局
-│   ├── models.py           # users/refresh_sessions/games/moves/rating_events
+│   ├── models.py           # users/friendships/direct_messages/games/moves/rating_events
 │   ├── ratings.py          # Elo 与段位纯函数
-│   ├── security.py         # Argon2id、JWT、refresh token、登录限流
-│   ├── schemas.py          # 认证/资料/排行榜 DTO
+│   ├── security.py         # Argon2id、JWT、refresh token
+│   ├── schemas.py          # 认证/资料/排行榜/好友/私聊 DTO
 │   ├── auth_service.py     # 令牌生成辅助
 │   ├── api/auth.py         # 注册/登录/刷新/登出/me
 │   ├── api/ranked.py       # /profile/me 与 /leaderboard
+│   ├── api/users.py        # /users/{id}、/users/search、头像更新
+│   ├── api/friends.py      # 好友申请/列表/同意/拒绝/删除
+│   ├── api/messages.py     # 好友私聊历史与发送
 │   ├── api/games.py        # /games/recent 与 /games/{id}
 │   └── ws/
 │       ├── endpoint.py     # WebSocket 首帧认证与命令分发
-│       └── rooms.py        # 好友房、匹配队列、排位结算、时钟、重连、再战
+│       └── rooms.py        # 自建房邀请、匹配队列、排位结算、时钟、重连、再战
 ├── tests/                  # REST + 双 WebSocket + Elo 测试
 ├── requirements.txt
 ├── requirements-dev.txt
@@ -91,14 +96,15 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 # 不传 --new-password 时会生成随机密码并打印
 ```
 
-本地联机测试时，直接在客户端注册两个账号（用户名 + 密码）即可用于排位对局。
+本地联机测试时，直接在客户端注册两个账号（用户名 + 密码）即可用于排位对局；
+好友功能可在好友窗口按用户名搜索并互相添加。
 
 ## 排位积分与匹配
 
 - 客户端大厅发送 `quick_match` 加入内存队列；队列中已有对手时，服务器选择与入队者
   积分最接近的玩家，随机分配黑白并立即开局。
-- 排位房在数据库中标记 `games.rated=true`，房间码不展示、不能用 `join_room` 加入，
-  避免好友定向刷分；排位终局不支持 `rematch`，客户端需重新匹配。
+- 排位房在数据库中标记 `games.rated=true`，只能通过匹配创建，不能通过好友邀请加入，
+  避免定向刷分；排位终局不支持 `rematch`，客户端需重新匹配。
 - 每手默认 30 秒；认输/超时/五连/平局都由服务器裁决。
 - 终局由服务器执行一次 Elo 结算：
   - 起始 1200 分，最低 100；
@@ -118,7 +124,7 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 | 大师 | 1650～1799 |
 | 王者 | ≥ 1800 |
 
-- 好友房 `rated=false`，无论胜负都不改积分。
+- 自建房 `rated=false`，无论胜负都不改积分。
 - 服务启动时会把上次残留的 waiting/playing 对局标记为 `abandoned`，不结算积分。
 
 ### 排位相关接口
@@ -127,25 +133,41 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 | --- | --- |
 | `GET /api/v1/leaderboard?limit=50&offset=0` | 登录后读取排行榜；只包含完成过排位赛的账号，积分降序、场次次序、用户名兜底 |
 | `GET /api/v1/profile/me` | 当前账号积分资料 + 最近 10 场排位记录 |
-| `GET /api/v1/games/recent?limit=20&offset=0` | 当前账号参与过的已结束对局（排位 + 好友房），按结束时间倒序 |
+| `GET /api/v1/games/recent?limit=20&offset=0` | 当前账号参与过的已结束对局（排位 + 自建房），按结束时间倒序 |
 | `GET /api/v1/games/{game_id}` | 单局完整棋谱与落子序列；仅对局参与者可读，非参与者返回 404 |
-| `GET /api/v1/auth/me` | 当前账号资料（含 rating/peak/rank_name/win_rate 等计算字段） |
+| `GET /api/v1/auth/me` | 当前账号资料（含 avatar/rating/peak/rank_name/win_rate 等计算字段） |
+| `GET /api/v1/users/{user_id}` | 公开资料、在线状态与好友关系状态 |
+| `GET /api/v1/users/search?q=` | 按用户名搜索活跃账号（最多 20 条） |
+| `PATCH /api/v1/users/me/avatar` | 更新预置头像 |
+| `GET /api/v1/friends` | 好友列表、收到的申请、发出的申请与未读数 |
+| `POST /api/v1/friends/requests` | 发送好友申请（`{"user_id": ...}`） |
+| `POST /api/v1/friends/requests/{id}/accept` | 同意好友申请 |
+| `POST /api/v1/friends/requests/{id}/decline` | 拒绝好友申请 |
+| `DELETE /api/v1/friends/{user_id}` | 删除好友 |
+| `GET /api/v1/messages/{user_id}?limit=50` | 与好友的最近私聊；只把本次返回的消息标记已读 |
+| `POST /api/v1/messages/{user_id}` | 发送私聊（`{"content": ...}`），在线时实时推送 |
 | `WS quick_match` | 加入排位匹配队列 |
 | `WS cancel_match` | 离开排位队列 |
 | `WS queue_status` | 服务端返回 queued/idle、队列人数、当前积分/段位 |
 | `WS match_found` | 匹配成功，返回 game_id、执子颜色、对手昵称和双方赛前积分 |
-| `WS game_state` | 权威快照新增 `rated`、`your_rating_before/after`、`opponent_rating_before/after`、`rating_delta` |
+| `WS game_state` | 权威快照新增 `rated`、`your_rating_before/after`、`opponent_rating_before/after`、`rating_delta`、双方 user_id 与头像 |
+| `WS invite_to_room` | 房主邀请在线好友加入自建房 |
+| `WS respond_room_invite` | 被邀请者接受/拒绝邀请 |
+| `WS room_invitation` | 服务端推送给被邀请者的对局邀请 |
+| `WS room_invite_result` | 邀请发送/接受/拒绝/取消结果 |
+| `WS friend_event` | 好友申请、同意、删除与在线状态推送 |
+| `WS direct_message` | 收到好友私聊时实时推送 |
 
 ## 联机规则与协议
 
-- 创建好友房者执黑先手，加入者执白。
+- 创建自建房者执黑先手，被邀请并接受的玩家执白。
 - 每手默认 30 秒，服务器倒计时；超时由服务器判负。
 - 客户端只发送落子意图；服务器校验座位/回合/坐标/时钟后，先把落子和局面写入数据库，再广播权威快照。
 - 断线不立即结束服务端房间：服务器保留房间与时钟，客户端可在回合时间内重连；重连后服务器下发完整快照。
 - 进行中的对局不支持单方面悔棋；支持认输。
-- 好友房双方都申请再战后，服务器创建新对局（不计分）并交换黑白；排位房拒绝再战。
+- 自建房双方都申请再战后，服务器创建新对局（不计分）并交换黑白；排位房拒绝再战。
 - 服务重启时未终局对局统一标记为 `abandoned`，客户端回到大厅；不伪装成崩溃恢复。
-- 好友房码为 8 位随机字符；排位房不能通过房间码加入。
+- 自建房使用过期时间 60 秒的定向邀请；邀请要求双方为好友且被邀请者在线。内部仍保留随机房间码用于数据库记录，但客户端不再展示或要求输入。
 - 匹配队列在断线时移除该玩家；重连并重新入队即可。
 
 ## 数据库兼容与迁移
@@ -205,7 +227,7 @@ Start-Process C:\Users\a1325\Desktop\Gomoku\dist\Gomoku.exe
 3. 固定随机 `GOMOKU_JWT_SECRET`，限制配置文件权限，不把 secret 写入客户端或仓库。
 4. 配置每日 PostgreSQL 备份、健康检查和日志收集；设置防火墙，仅开放必要端口。
 5. 客户端 token 目前只存内存，应用重启需要重新登录；后续可用 Windows DPAPI 安全保存 refresh token。
-6. 排位已通过“仅匹配计分、好友房不计分、排位不可直接再战”降低刷分面，但仍无法阻止
+6. 排位已通过“仅匹配计分、自建房不计分、排位不可直接再战”降低刷分面，但仍无法阻止
    排队串通、故意送分和外部 AI 辅助；积分阶段需另行设计反作弊、举报与回放审计。
 7. 若未来在中国大陆公开运营，需单独评估 ICP/公安备案、实名/未成年人保护、隐私与游戏出版等要求；
    当前定位仅为内测。
@@ -217,13 +239,15 @@ cd C:\Users\a1325\Desktop\Gomoku
 server\.venv\Scripts\python.exe -m unittest discover -s server/tests -v
 ```
 
-当前 **37 项**测试覆盖：
+当前 **47 项**测试覆盖：
 
 - 用户名 + 密码注册、登录、refresh 轮换/重放、登出、认证响应积分字段；
-- 双 WebSocket 建房/加入/落子/拒绝/认输/再战、服务器五连判定、断线重连；
-- 快速匹配、取消匹配、排位房、随机黑白、终局 Elo 结算、好友房不计分；
+- 双 WebSocket 建房/邀请/加入/落子/拒绝/认输/再战、服务器五连判定、断线重连；
+- 快速匹配、取消匹配、排位房、随机黑白、终局 Elo 结算、自建房不计分；
 - 排行榜、个人资料与最近战绩；
 - 最近对局/单局棋谱的参与者权限、分页、认输终局；
+- 头像更新与用户搜索、好友申请/同意/删除、在线状态推送、私聊历史与实时推送；
+- 自建房邀请接受/拒绝、非好友/离线好友拒绝，以及快照中的双方 user_id/头像；
 - Elo 期望分/K 值/段位边界/最低分保护。
 
 另做过本机真实 Uvicorn + 两个 WebSocket 客户端完整排位对局验证：两名 1200 分玩家

@@ -2,9 +2,50 @@
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 
+from server.app.security import LoginBackoff
 from server.tests.helpers import ServerTestBase
+
+
+class LoginBackoffTests(unittest.TestCase):
+    """登录退避的单元测试（不经过 HTTP，也不真的等待）。"""
+
+    def test_delay_grows_then_caps(self) -> None:
+        backoff = LoginBackoff(
+            base_delay_seconds=0.5, max_delay_seconds=3.0
+        )
+
+        async def _run() -> list[float]:
+            delays = []
+            for _ in range(5):
+                delays.append(await backoff.delay_for("k"))
+                await backoff.record_failure("k")
+            return delays
+
+        delays = asyncio.run(_run())
+        # 第一次不等待；之后 0.5 → 1 → 2 → 3（封顶）。
+        self.assertEqual(delays, [0.0, 0.5, 1.0, 2.0, 3.0])
+
+    def test_success_clears_the_counter(self) -> None:
+        backoff = LoginBackoff(base_delay_seconds=0.5)
+
+        async def _run() -> float:
+            await backoff.record_failure("k")
+            await backoff.clear("k")
+            return await backoff.delay_for("k")
+
+        self.assertEqual(asyncio.run(_run()), 0.0)
+
+    def test_keys_are_independent(self) -> None:
+        backoff = LoginBackoff(base_delay_seconds=0.5)
+
+        async def _run() -> float:
+            await backoff.record_failure("a")
+            return await backoff.delay_for("b")
+
+        self.assertEqual(asyncio.run(_run()), 0.0)
 
 
 class AuthAPITests(ServerTestBase):
@@ -48,6 +89,28 @@ class AuthAPITests(ServerTestBase):
             json={"username": "same_name", "password": "wrong-password"},
         )
         self.assertEqual(bad.status_code, 401)
+
+    def test_repeated_bad_passwords_do_not_lock_out(self) -> None:
+        """多次输错密码只返回 401，不再因次数过多拒绝登录。"""
+        self.assertEqual(self.register("patient_user").status_code, 201)
+        for _ in range(8):
+            bad = self.client.post(
+                "/api/v1/auth/login",
+                json={
+                    "username": "patient_user",
+                    "password": "wrong-password",
+                },
+            )
+            self.assertEqual(bad.status_code, 401, bad.text)
+
+        good = self.client.post(
+            "/api/v1/auth/login",
+            json={
+                "username": "patient_user",
+                "password": "correct horse battery",
+            },
+        )
+        self.assertEqual(good.status_code, 200, good.text)
 
     def test_refresh_rotation_and_reuse_detection(self) -> None:
         data = self.register("refresh_user").json()

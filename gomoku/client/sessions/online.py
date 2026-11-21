@@ -33,16 +33,20 @@ from gomoku.shared.protocol import (
     CLIENT_CANCEL_MATCH,
     CLIENT_CHAT,
     CLIENT_CREATE_ROOM,
+    CLIENT_INVITE_TO_ROOM,
     CLIENT_JOIN_ROOM,
     CLIENT_LEAVE_ROOM,
     CLIENT_MOVE_INTENT,
     CLIENT_PING,
     CLIENT_QUICK_MATCH,
     CLIENT_REMATCH,
+    CLIENT_RESPOND_ROOM_INVITE,
     CLIENT_RESIGN,
     SERVER_AUTHENTICATED,
     SERVER_CHAT,
+    SERVER_DIRECT_MESSAGE,
     SERVER_ERROR,
+    SERVER_FRIEND_EVENT,
     SERVER_GAME_STATE,
     SERVER_MATCH_FOUND,
     SERVER_MOVE_REJECTED,
@@ -53,6 +57,8 @@ from gomoku.shared.protocol import (
     SERVER_REMATCH_STATUS,
     SERVER_ROOM_CLOSED,
     SERVER_ROOM_CREATED,
+    SERVER_ROOM_INVITATION,
+    SERVER_ROOM_INVITE_RESULT,
     GameSnapshot,
     make_message,
     make_move_intent,
@@ -60,6 +66,11 @@ from gomoku.shared.protocol import (
     parse_message,
 )
 from gomoku.shared.rules import BOARD_SIZE, Cell, Player
+from gomoku.shared.social import (
+    SocialError,
+    parse_direct_message,
+    parse_friend_event,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +120,10 @@ class OnlineGameSession(GameSession):
     matched = Signal(str, str)  # game_id, opponent_name
     chat_received = Signal(object)  # ChatMessage
     chat_failed = Signal(str)  # 发言被拒/发送失败的中文提示
+    room_invited = Signal(object)  # 收到自建房邀请 payload
+    room_invite_result = Signal(object)  # 邀请发送/接受/拒绝结果
+    friend_event = Signal(object)  # FriendEvent
+    direct_message = Signal(object)  # DirectMessage
 
     def __init__(
         self,
@@ -176,6 +191,11 @@ class OnlineGameSession(GameSession):
     @property
     def waiting_for_opponent(self) -> bool:
         return self._waiting
+
+    @property
+    def in_room(self) -> bool:
+        """是否已在等待房间或进行中的对局里。"""
+        return self._waiting or self._active
 
     @property
     def snapshot(self) -> Optional[GameSnapshot]:
@@ -335,6 +355,30 @@ class OnlineGameSession(GameSession):
             return False
         return self._send(
             make_message(CLIENT_JOIN_ROOM, {"room_code": code})
+        )
+
+    def invite_to_room(self, user_id: str) -> bool:
+        """邀请一位在线好友加入自己的等待房间。"""
+        if not self._authenticated or self._closed or not user_id:
+            return False
+        return self._send(
+            make_message(
+                CLIENT_INVITE_TO_ROOM,
+                {"user_id": user_id},
+                request_id=uuid.uuid4().hex,
+            )
+        )
+
+    def respond_room_invite(self, invite_id: str, accept: bool) -> bool:
+        """接受/拒绝收到的自建房邀请。"""
+        if not self._authenticated or self._closed or not invite_id:
+            return False
+        return self._send(
+            make_message(
+                CLIENT_RESPOND_ROOM_INVITE,
+                {"invite_id": invite_id, "accept": bool(accept)},
+                request_id=uuid.uuid4().hex,
+            )
         )
 
     def quick_match(self) -> bool:
@@ -568,6 +612,14 @@ class OnlineGameSession(GameSession):
             return
         elif message_type == SERVER_CHAT:
             self._handle_chat(message)
+        elif message_type == SERVER_ROOM_INVITATION:
+            self._handle_room_invitation(message)
+        elif message_type == SERVER_ROOM_INVITE_RESULT:
+            self._handle_room_invite_result(message)
+        elif message_type == SERVER_FRIEND_EVENT:
+            self._handle_friend_event(message)
+        elif message_type == SERVER_DIRECT_MESSAGE:
+            self._handle_direct_message(message)
         else:
             logger.warning("忽略未知服务器消息：%s", message_type)
 
@@ -587,7 +639,16 @@ class OnlineGameSession(GameSession):
         self._user_id = user_id
         self._username = username
         self._reset_room_state()
-        self.authenticated.emit({"id": user_id, "username": username})
+        rating = user.get("rating")
+        self.authenticated.emit(
+            {
+                "id": user_id,
+                "username": username,
+                "avatar": user.get("avatar", ""),
+                "rating": rating if isinstance(rating, int) else None,
+                "rank_name": user.get("rank_name", ""),
+            }
+        )
         self.state_changed.emit()
 
     def _handle_room_created(self, message: Mapping[str, Any]) -> None:
@@ -825,6 +886,38 @@ class OnlineGameSession(GameSession):
             logger.warning("丢弃非法聊天消息：%s", exc)
             return
         self.chat_received.emit(chat)
+
+    def _handle_room_invitation(self, message: Mapping[str, Any]) -> None:
+        payload = message.get("payload", {})
+        if not isinstance(payload, Mapping):
+            return
+        invite_id = payload.get("invite_id")
+        inviter = payload.get("inviter")
+        if not isinstance(invite_id, str) or not isinstance(inviter, Mapping):
+            logger.warning("丢弃非法自建房邀请")
+            return
+        self.room_invited.emit(dict(payload))
+
+    def _handle_room_invite_result(self, message: Mapping[str, Any]) -> None:
+        payload = message.get("payload", {})
+        if isinstance(payload, Mapping):
+            self.room_invite_result.emit(dict(payload))
+
+    def _handle_friend_event(self, message: Mapping[str, Any]) -> None:
+        try:
+            event = parse_friend_event(message.get("payload", {}))
+        except SocialError as exc:
+            logger.warning("丢弃非法好友事件：%s", exc)
+            return
+        self.friend_event.emit(event)
+
+    def _handle_direct_message(self, message: Mapping[str, Any]) -> None:
+        try:
+            direct = parse_direct_message(message.get("payload", {}))
+        except SocialError as exc:
+            logger.warning("丢弃非法私聊消息：%s", exc)
+            return
+        self.direct_message.emit(direct)
 
     def _on_transport_disconnected(self, reason: str) -> None:
         if self._closed:

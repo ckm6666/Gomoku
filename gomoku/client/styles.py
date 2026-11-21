@@ -1068,4 +1068,290 @@ QMenu#chatMenu::item {
 QMenu#chatMenu::item:selected {
     background-color: #F1E4CC;
 }
+
+/* 个人信息 / 好友 / 头像选择：窗口内浮层，不是原生对话框 */
+QWidget#paperPanel {
+    background: transparent;
+}
+
+QLabel#socialPageTitle {
+    font-family: "Ma Shan Zheng";
+    font-size: 27px;
+    color: #26221C;
+    letter-spacing: 1px;
+}
+
+QLabel#socialSubtitle {
+    font-size: 12px;
+    color: #756C5E;
+}
+
+QLabel#socialSectionTitle {
+    font-family: "Ma Shan Zheng";
+    font-size: 18px;
+    color: #26221C;
+    letter-spacing: 1px;
+}
+
+QLabel#socialSectionCount {
+    font-size: 11px;
+    color: #A89C8B;
+    padding-left: 4px;
+}
+
+QLabel#socialStatus {
+    font-size: 11px;
+    color: #756C5E;
+    padding-left: 2px;
+}
+
+QLabel#friendsEmpty {
+    color: #A89C8B;
+    font-size: 12px;
+    letter-spacing: 1px;
+    padding: 10px 4px;
+}
+
+QLabel#friendsSectionMarker {
+    color: #B8934E;
+    font-size: 11px;
+}
+
+QLabel#friendsSectionMarker[accent="true"] {
+    color: #9E3B2E;
+}
+
+QFrame#friendsSection {
+    background-color: rgba(251, 247, 238, 0.58);
+    border: 1px solid #DCCDB4;
+    border-radius: 10px;
+}
+
+QFrame#friendsSection[accent="true"] {
+    background-color: rgba(158, 59, 46, 0.045);
+    border: 1px solid #C08A7F;
+}
+
+QLabel#profileName {
+    font-family: "Ma Shan Zheng";
+    font-size: 30px;
+    color: #26221C;
+    letter-spacing: 1px;
+}
+
+QLabel#profileOnline {
+    font-size: 12px;
+    color: #8A7F70;
+}
+
+QLabel#profileOnline[online="true"] {
+    color: #4F7A5A;
+}
+
+QLabel#profileTagline {
+    font-size: 11px;
+    color: #A89C8B;
+    letter-spacing: 1px;
+}
+
+QLabel#profileRankBadge {
+    background-color: rgba(184, 147, 78, 0.14);
+    border: 1px solid #B8934E;
+    border-radius: 14px;
+    color: #7E2C22;
+    font-family: "Ma Shan Zheng";
+    font-size: 17px;
+    padding: 2px 12px;
+}
+
+QFrame#profileStatTile {
+    background-color: rgba(251, 247, 238, 0.72);
+    border: 1px solid #DCCDB4;
+    border-radius: 9px;
+    min-height: 58px;
+}
+
+QLabel#profileStatName {
+    color: #756C5E;
+    font-size: 11px;
+    letter-spacing: 1px;
+}
+
+QLabel#profileStatValue {
+    font-family: "Ma Shan Zheng";
+    color: #26221C;
+    font-size: 20px;
+}
+
+QFrame#friendRow {
+    background-color: rgba(255, 252, 244, 0.78);
+    border: 1px solid #E3D7C4;
+    border-radius: 8px;
+}
+
+QFrame#friendRow[online="true"] {
+    border-left: 3px solid #5D8A66;
+}
+
+QFrame#friendRow[online="false"] {
+    border-left: 3px solid #C9B99F;
+}
+
+QLabel#friendName {
+    color: #26221C;
+    font-size: 14px;
+    font-weight: bold;
+}
+
+QLabel#friendPresence {
+    color: #A89C8B;
+    font-size: 11px;
+}
+
+QLabel#friendPresence[online="true"] {
+    color: #4F7A5A;
+}
+
+QLabel#friendUnread {
+    background-color: #9E3B2E;
+    color: #FBF7EE;
+    border-radius: 8px;
+    font-size: 10px;
+    font-weight: bold;
+    padding: 1px 7px;
+}
+
+QPushButton#socialPrimaryButton {
+    background-color: #9E3B2E;
+    color: #FBF7EE;
+    border: 1px solid #7E2C22;
+    border-radius: 8px;
+    padding: 7px 16px;
+    min-height: 20px;
+    font-size: 13px;
+}
+
+QPushButton#socialPrimaryButton:hover {
+    background-color: #B85546;
+}
+
+QPushButton#socialPrimaryButton:pressed {
+    background-color: #7E2C22;
+}
+
+QPushButton#socialPrimaryButton:disabled {
+    background-color: #D8CEC0;
+    border-color: #C9B99F;
+    color: #A89C8B;
+}
+
+QPushButton#socialSecondaryButton {
+    background-color: rgba(251, 247, 238, 0.92);
+    color: #4C463C;
+    border: 1px solid #C9B99F;
+    border-radius: 8px;
+    padding: 7px 16px;
+    min-height: 20px;
+    font-size: 13px;
+}
+
+QPushButton#socialSecondaryButton:hover {
+    background-color: #F5EFE3;
+    border-color: #B8934E;
+}
+
+QPushButton#socialSecondaryButton:pressed {
+    background-color: #E9DFCE;
+}
+
+QPushButton#socialSecondaryButton:disabled {
+    background-color: #EEE8DF;
+    border-color: #D8CEC0;
+    color: #B3A898;
+}
+
+QPushButton#socialCompactButton {
+    background-color: transparent;
+    color: #756C5E;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 5px 9px;
+    font-size: 12px;
+}
+
+QPushButton#socialCompactButton:hover {
+    background-color: #F1E4CC;
+    color: #4C463C;
+}
+
+QPushButton#socialCompactButton:pressed {
+    background-color: #E9DFCE;
+}
+
+QLineEdit#socialSearchInput {
+    background-color: #FBF7EE;
+    border: 1px solid #C9B99F;
+    border-radius: 15px;
+    padding: 6px 14px;
+    min-height: 22px;
+    color: #26221C;
+    selection-background-color: #B8934E;
+}
+
+QLineEdit#socialSearchInput:focus {
+    border-color: #B8934E;
+}
+
+QPushButton#avatarChoice {
+    background-color: transparent;
+    border: 2px solid transparent;
+    border-radius: 34px;
+    padding: 2px;
+}
+
+QPushButton#avatarChoice:hover {
+    background-color: rgba(184, 147, 78, 0.10);
+    border-color: #B8934E;
+}
+
+QPushButton#avatarChoice[current="true"] {
+    background-color: rgba(158, 59, 46, 0.08);
+    border-color: #9E3B2E;
+}
+
+QLabel#avatarPickerHint {
+    color: #756C5E;
+    font-size: 12px;
+}
+
+QScrollArea#socialScroll,
+QWidget#socialScrollBody {
+    background: transparent;
+    border: none;
+}
+
+QScrollArea#socialScroll > QWidget > QWidget {
+    background: transparent;
+}
+
+QTextBrowser#chatMessages {
+    background-color: #FBF6EA;
+    border: 1px solid #D9CBB3;
+    border-radius: 8px;
+    padding: 8px;
+    color: #2B2118;
+}
+
+QLineEdit#chatMessageInput {
+    background-color: #FBF6EA;
+    border: 1px solid #C9B99F;
+    border-radius: 6px;
+    padding: 6px 10px;
+    min-height: 24px;
+    color: #2B2118;
+}
+
+QLineEdit#chatMessageInput:focus {
+    border-color: #B8934E;
+}
 """
