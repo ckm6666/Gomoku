@@ -1,14 +1,16 @@
-"""古风终局弹窗：胜利 / 惜败 / 和棋。"""
+"""古风终局弹窗：胜利 / 惜败 / 和棋。
+
+弹窗不再创建独立窗口，而是作为主窗口内的一层模态遮罩（见
+:mod:`gomoku.client.modal_overlay`），因此应用全局始终只有一个窗口。
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal, Optional
 
-from PySide6.QtCore import QRectF, QSize, Qt
-from PySide6.QtGui import QPainter, QPixmap
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -16,6 +18,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gomoku.client.modal_overlay import (
+    RESULT_ACCEPTED,
+    ModalOverlay,
+)
 from gomoku.client.ui_theme import (
     make_ink_divider,
     make_seal_pixmap,
@@ -23,6 +29,10 @@ from gomoku.client.ui_theme import (
 )
 
 ResultKind = Literal["win", "lose", "draw"]
+
+#: 终局卡片尺寸（逻辑像素）；与旧独立对话框的观感保持一致。
+CARD_WIDTH: int = 480
+CARD_HEIGHT: int = 400
 
 
 @dataclass(frozen=True)
@@ -38,7 +48,7 @@ class ResultPresentation:
     secondary_text: str = "查看棋盘"
 
 
-class ResultDialog(QDialog):
+class ResultDialog(ModalOverlay):
     """模态终局弹窗；接受表示再来一局，拒绝表示查看棋盘。"""
 
     def __init__(
@@ -46,29 +56,24 @@ class ResultDialog(QDialog):
         presentation: ResultPresentation,
         parent: Optional[QWidget] = None,
     ) -> None:
-        super().__init__(parent)
+        super().__init__(parent, object_name="resultDialog")
         self._presentation = presentation
-        self._background: Optional[QPixmap] = None
-        self._background_key: Optional[tuple[int, int, float, str]] = None
 
-        self.setObjectName("resultDialog")
-        self.setWindowTitle("对局结果")
-        self.setModal(True)
-        self.setWindowFlag(
-            Qt.WindowType.WindowContextHelpButtonHint, False
+        card = self.card
+        card.setObjectName("resultCard")
+        card.setFixedSize(CARD_WIDTH, CARD_HEIGHT)
+        card.set_renderer(
+            lambda size, dpr: render_result_backdrop(
+                size, dpr, presentation.kind
+            )
         )
-        self.resize(520, 430)
-        self.setMinimumSize(460, 380)
-        self.setSizeGripEnabled(False)
-        self.setAutoFillBackground(False)
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(46, 28, 46, 26)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(40, 26, 40, 24)
         layout.setSpacing(6)
 
-        dpr = self.devicePixelRatioF()
-        self.seal_label = QLabel(self)
+        dpr = card.devicePixelRatioF()
+        self.seal_label = QLabel(card)
         self.seal_label.setObjectName("resultSeal")
         self.seal_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.seal_label.setPixmap(
@@ -77,21 +82,21 @@ class ResultDialog(QDialog):
             )
         )
 
-        self.title_label = QLabel(presentation.title, self)
+        self.title_label = QLabel(presentation.title, card)
         self.title_label.setObjectName("resultTitle")
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.subtitle_label = QLabel(presentation.subtitle, self)
+        self.subtitle_label = QLabel(presentation.subtitle, card)
         self.subtitle_label.setObjectName("resultSubtitle")
         self.subtitle_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.subtitle_label.setWordWrap(True)
 
-        self.divider_label = QLabel(self)
+        self.divider_label = QLabel(card)
         self.divider_label.setObjectName("resultDivider")
         self.divider_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.divider_label.setPixmap(make_ink_divider(190, 16, dpr=dpr))
 
-        self.detail_label = QLabel(presentation.detail, self)
+        self.detail_label = QLabel(presentation.detail, card)
         self.detail_label.setObjectName("resultDetail")
         self.detail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.detail_label.setWordWrap(True)
@@ -106,18 +111,14 @@ class ResultDialog(QDialog):
         buttons = QHBoxLayout()
         buttons.setSpacing(14)
         buttons.addStretch(1)
-        self.restart_button = QPushButton(
-            presentation.primary_text, self
-        )
+        self.restart_button = QPushButton(presentation.primary_text, card)
         self.restart_button.setObjectName("resultPrimaryButton")
         self.restart_button.setDefault(True)
         self.restart_button.setAutoDefault(True)
         self.restart_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.restart_button.setMinimumWidth(112)
         self.restart_button.setMinimumHeight(38)
-        self.view_button = QPushButton(
-            presentation.secondary_text, self
-        )
+        self.view_button = QPushButton(presentation.secondary_text, card)
         self.view_button.setObjectName("resultSecondaryButton")
         self.view_button.setAutoDefault(False)
         self.view_button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -130,6 +131,7 @@ class ResultDialog(QDialog):
 
         self.restart_button.clicked.connect(self.accept)
         self.view_button.clicked.connect(self.reject)
+        self.set_default_action(self.accept)
         self.restart_button.setFocus()
 
     # ------------------------------------------------------------------
@@ -138,36 +140,13 @@ class ResultDialog(QDialog):
     @property
     def restart_requested(self) -> bool:
         """用户是否选择再来一局。"""
-        return self.result() == int(QDialog.DialogCode.Accepted)
-
-    # ------------------------------------------------------------------
-    # 绘制
-    # ------------------------------------------------------------------
-    def paintEvent(self, event) -> None:  # noqa: N802 - Qt 接口
-        del event
-        width = self.width()
-        height = self.height()
-        if width <= 0 or height <= 0:
-            return
-        dpr = max(1.0, self.devicePixelRatioF())
-        key = (
-            width,
-            height,
-            round(dpr, 3),
-            self._presentation.kind,
-        )
-        if self._background is None or self._background_key != key:
-            self._background = render_result_backdrop(
-                QSize(width, height), dpr, self._presentation.kind
-            )
-            self._background_key = key
-        painter = QPainter(self)
-        painter.drawPixmap(
-            QRectF(0, 0, width, height),
-            self._background,
-            QRectF(self._background.rect()),
-        )
-        painter.end()
+        return self.result() == RESULT_ACCEPTED
 
 
-__all__ = ["ResultDialog", "ResultPresentation", "ResultKind"]
+__all__ = [
+    "CARD_HEIGHT",
+    "CARD_WIDTH",
+    "ResultDialog",
+    "ResultKind",
+    "ResultPresentation",
+]

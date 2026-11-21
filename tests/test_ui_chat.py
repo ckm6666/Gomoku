@@ -24,6 +24,8 @@ from PySide6.QtWidgets import (  # noqa: E402
     QLineEdit,
     QPushButton,
     QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
 
 from gomoku.client.chat_widgets import (  # noqa: E402
@@ -424,14 +426,14 @@ class ChatMenuThemeTests(unittest.TestCase):
         self.assertEqual(button.menu().objectName(), "chatMenu")
 
 
-class OnlineWindowChatTests(unittest.TestCase):
-    """联机窗口里的聊天区域行为。"""
+class OnlinePanelChatTests(unittest.TestCase):
+    """联机页里的聊天区域行为。"""
 
     def setUp(self) -> None:
-        from gomoku.client.online_window import OnlineWindow
+        from gomoku.client.online_panel import OnlinePanel
 
-        self.window = OnlineWindow()
-        self.addCleanup(self.window.close)
+        self.window = OnlinePanel()
+        self.addCleanup(self.window.shutdown)
 
     def test_chat_log_is_cleared_when_a_new_room_is_created(self) -> None:
         """新房间 = 新对话，旧房间的记录不能留下来。"""
@@ -468,8 +470,8 @@ class ChatLogToggleTests(unittest.TestCase):
 
         from PySide6.QtCore import QSettings
 
-        from gomoku.client.online_window import (
-            OnlineWindow,
+        from gomoku.client.online_panel import (
+            OnlinePanel,
             SETTINGS_CHAT_LOG_VISIBLE,
         )
 
@@ -484,9 +486,14 @@ class ChatLogToggleTests(unittest.TestCase):
         )
         self.addCleanup(shutil.rmtree, self._settings_dir, True)
 
-        self.window = OnlineWindow()
-        self.addCleanup(self.window.close)
-        self.window.show()
+        # 联机页现在是主窗口页面栈中的一页，本身不是窗口。
+        # 测试里用一个宿主窗口把它承载起来，可见性断言才有意义。
+        self.host = QWidget()
+        self.window = OnlinePanel(parent=self.host)
+        self.host.setLayout(QVBoxLayout(self.host))
+        self.host.layout().addWidget(self.window)
+        self.addCleanup(self.window.shutdown)
+        self.host.show()
         QT_APP.processEvents()
         self.window.stack.setCurrentWidget(self.window.game_page)
         QT_APP.processEvents()
@@ -527,7 +534,7 @@ class ChatLogToggleTests(unittest.TestCase):
         self.assertGreater(collapsed_width, expanded_width)
 
     def test_toggle_choice_is_persisted(self) -> None:
-        from gomoku.client.online_window import SETTINGS_CHAT_LOG_VISIBLE
+        from gomoku.client.online_panel import SETTINGS_CHAT_LOG_VISIBLE
 
         self.window.chat_log_toggle_button.setChecked(True)
         QT_APP.processEvents()

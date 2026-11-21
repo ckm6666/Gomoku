@@ -9,8 +9,11 @@
 * 在需要时暂停会话、显示终局弹窗；
 * 在关闭窗口时等待会话后台任务结束。
 
-联机对战由独立的 OnlineWindow 承载；MainWindow 只负责本地/人机窗口，
+联机对战由同一窗口内的 OnlinePanel 承载；MainWindow 负责本地/人机页面，
 避免网络状态影响已经稳定的离线对局。
+
+设计原则：应用全局只保留一个原生窗口。联机大厅、在线棋盘、棋谱复盘
+都是页面栈中的一页，弹窗则是覆盖在中央部件之上的模态层。
 """
 
 from __future__ import annotations
@@ -39,7 +42,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
-    QMessageBox,
     QPushButton,
     QSizePolicy,
     QStackedWidget,
@@ -62,11 +64,12 @@ from gomoku.client.constants import (
     WINDOW_MIN_WIDTH,
     WINDOW_SCREEN_MARGIN,
 )
-from gomoku.client.online_window import OnlineWindow
+from gomoku.client.modal_overlay import ModalOverlay, NoticeOverlay
+from gomoku.client.online_panel import OnlinePanel
 from gomoku.client.puzzle_bank import load_puzzle_bank
 from gomoku.client.puzzle_page import PuzzlePage
 from gomoku.client.records import LocalRecordStore
-from gomoku.client.replay_window import ReplayWindow
+from gomoku.client.replay_panel import ReplayPanel
 from gomoku.client.result_dialog import ResultDialog, ResultPresentation
 from gomoku.client.sessions import (
     AIGameSession,
@@ -235,7 +238,7 @@ class MainWindow(QMainWindow):
         record_store: Optional[LocalRecordStore] = None,
     ) -> None:
         super().__init__()
-        # 服务器地址等非敏感配置传给独立联机窗口；本地棋盘不联网。
+        # 服务器地址等非敏感配置传给联机页；本地棋盘不联网。
         self.config = config or AppConfig()
 
         # 残局题库/进度与本地棋谱；测试可注入临时目录/固定题库。
@@ -246,7 +249,12 @@ class MainWindow(QMainWindow):
         self._current_puzzle: Optional[Puzzle] = None
         self._puzzle_result: Optional[tuple[bool, str]] = None
         self._recorded_generation = -1
-        self._replay_window: Optional[ReplayWindow] = None
+        # 联机与复盘都是主窗口页面栈中的一页，不再是独立窗口。
+        self._online_panel: Optional[OnlinePanel] = None
+        self._replay_panel: Optional[ReplayPanel] = None
+        self._replay_return_page: Optional[QWidget] = None
+        # 当前正在显示的窗口内模态层（终局弹窗/确认框），供测试定位。
+        self._active_modal: Optional[ModalOverlay] = None
 
         # 对局配置：默认保持本地双人，切到人机模式后默认中等难度。
         self._game_mode = GameMode.LOCAL
@@ -263,8 +271,6 @@ class MainWindow(QMainWindow):
 
         # 每次会话替换/撤销递增，用于丢弃过期终局弹窗定时器。
         self._game_generation = 0
-        # 联机窗口独立运行，离线/人机会话不受其网络状态影响。
-        self._online_window = None
 
         # 启动页是主菜单；仍先创建一个占位会话，确保 BoardWidget 和
         # 状态同步有可读视图。用户首次选择模式时会替换为全新会话。
@@ -572,7 +578,7 @@ class MainWindow(QMainWindow):
             "联机对战",
             "menuPrimaryButton",
             "登录后参加排位匹配或好友房",
-            self._open_online_window,
+            self._open_online_page,
         )
         self.local_button = self._make_menu_button(
             "双人对战",
@@ -596,7 +602,7 @@ class MainWindow(QMainWindow):
             "棋谱复盘",
             "menuButton",
             "查看并逐步回放最近的本地棋谱",
-            self._open_replay_window,
+            lambda _checked=False: self._open_replay_page(),
         )
         self.exit_button = self._make_menu_button(
             "退出游戏",
@@ -1009,42 +1015,57 @@ class MainWindow(QMainWindow):
         self._set_game_shortcuts_enabled(False)
         self.puzzle_page.back_button.setFocus()
 
-    def _open_replay_window(self) -> None:
-        """打开本地棋谱复盘窗口。"""
+    def _open_replay_page(
+        self,
+        records: Optional[Sequence[GameRecord]] = None,
+        *,
+        return_to: Optional[QWidget] = None,
+    ) -> None:
+        """打开棋谱复盘页；复盘是页面而不是独立窗口。
+
+        ``records`` 为空时从本地棋谱库读取。注意这个槽也可能被
+        ``QPushButton.clicked`` 直接触发——那时传进来的是
+        ``checked=False``，必须当成“没有指定棋谱”处理。
+        """
         if (
             self._closing
             or self._modal_dialog_open
             or self._result_dialog_open
         ):
             return
-        try:
-            records = self._record_store.list_recent(50)
-        except Exception:
-            logger.exception("读取本地棋谱失败")
-            records = ()
 
-        existing = self._replay_window
-        if existing is not None:
+        if not isinstance(records, (list, tuple)):
+            records = None
+        if records is None:
             try:
-                existing.close()
-            except RuntimeError:
-                pass
-            self._replay_window = None
+                records = self._record_store.list_recent(50)
+            except Exception:
+                logger.exception("读取本地棋谱失败")
+                records = ()
 
-        window = ReplayWindow(records, self)
-        window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        window.destroyed.connect(self._on_replay_window_destroyed)
-        self._replay_window = window
-        window.show()
-        window.raise_()
-        window.activateWindow()
+        panel = self._replay_panel
+        if panel is None:
+            panel = ReplayPanel(records, parent=self.stack)
+            panel.closed.connect(self._on_replay_panel_closed)
+            self._replay_panel = panel
+            self.stack.addWidget(panel)
+        else:
+            panel.set_records(records)
 
-    def _on_replay_window_destroyed(self, *_args) -> None:
-        if self.sender() is self._replay_window:
-            self._replay_window = None
+        self._replay_return_page = return_to or self.stack.currentWidget()
+        self.stack.setCurrentWidget(panel)
+        self._set_game_shortcuts_enabled(False)
+
+    def _on_replay_panel_closed(self) -> None:
+        """复盘页关闭：回到来源页面。"""
+        target = self._replay_return_page or self.menu_page
+        self._replay_return_page = None
+        self.stack.setCurrentWidget(target)
+        if target is self.menu_page:
+            self.online_button.setFocus()
 
     def _exit_game(self) -> None:
-        """退出应用；closeEvent 负责关闭联机窗口与后台线程。"""
+        """退出应用；closeEvent 负责停止联机页与后台线程。"""
         if not self._closing:
             self.close()
 
@@ -1059,29 +1080,43 @@ class MainWindow(QMainWindow):
         )
         self._restart_shortcut.setEnabled(enabled)
 
-    def _open_online_window(self) -> None:
-        """打开独立联机窗口；离线棋盘和 AI 状态不受影响。"""
+    def _open_online_page(self) -> None:
+        """打开联机页；离线棋盘和 AI 状态不受影响。"""
         try:
-            if self._online_window is None:
-                window = OnlineWindow(self.config)
-                window.setAttribute(
-                    Qt.WidgetAttribute.WA_DeleteOnClose, True
+            panel = self._online_panel
+            if panel is None:
+                panel = OnlinePanel(self.config, self.stack)
+                panel.back_requested.connect(
+                    self._return_to_menu_from_online
                 )
-                window.destroyed.connect(self._on_online_window_destroyed)
-                self._online_window = window
-            self._online_window.show()
-            self._online_window.raise_()
-            self._online_window.activateWindow()
-        except Exception as exc:  # 依赖/窗口初始化失败时不要让离线应用崩溃
-            logger.exception("打开联机窗口失败")
-            QMessageBox.warning(
-                self,
+                panel.replay_requested.connect(self._open_replay_page)
+                self._online_panel = panel
+                self.stack.addWidget(panel)
+            self.stack.setCurrentWidget(panel)
+            self._set_game_shortcuts_enabled(False)
+        except Exception as exc:  # 依赖/页面初始化失败时不要让离线应用崩溃
+            logger.exception("打开联机页失败")
+            self._show_notice(
                 "无法打开联机对战",
-                f"联机窗口初始化失败：{type(exc).__name__}",
+                f"联机页面初始化失败：{type(exc).__name__}",
             )
 
-    def _on_online_window_destroyed(self, *_args) -> None:
-        self._online_window = None
+    def _return_to_menu_from_online(self) -> None:
+        """从联机页返回主菜单；联机会话状态保持不变。"""
+        if self._closing or self._modal_dialog_open:
+            return
+        panel = self._online_panel
+        if panel is not None and panel.in_room():
+            confirmed = self._confirm_discard_game(
+                "返回主菜单",
+                "对局仍在继续，返回主菜单只是切走界面，确定要返回吗？",
+                confirm_text="返回主菜单",
+            )
+            if not confirmed:
+                return
+        self.stack.setCurrentWidget(self.menu_page)
+        self._set_game_shortcuts_enabled(False)
+        self.online_button.setFocus()
 
     def _apply_initial_geometry(self) -> None:
         """根据主屏可用区域设置初始大小并居中，兼容小屏幕和高 DPI。"""
@@ -1402,9 +1437,12 @@ class MainWindow(QMainWindow):
             presentation = self._build_result_presentation(
                 view.winner, view.move_count
             )
-            result_dialog = ResultDialog(presentation, self)
+            result_dialog = ResultDialog(presentation, self._overlay_host())
+            self._active_modal = result_dialog
             result_dialog.exec()
             restart = result_dialog.restart_requested
+            result_dialog.deleteLater()
+            self._active_modal = None
         finally:
             self._result_dialog_open = False
             self._modal_dialog_open = False
@@ -1490,12 +1528,35 @@ class MainWindow(QMainWindow):
                 title,
                 message,
                 confirm_text=confirm_text,
-                parent=self,
+                parent=self._overlay_host(),
             )
+            self._active_modal = dialog
             dialog.exec()
-            return dialog.confirm_requested
+            confirmed = dialog.confirm_requested
+            dialog.deleteLater()
+            self._active_modal = None
+            return confirmed
         finally:
             self._modal_dialog_open = False
+
+    def _overlay_host(self) -> QWidget:
+        """模态层的宿主：主窗口中央部件。"""
+        host = self.centralWidget()
+        return host if host is not None else self
+
+    def _show_notice(self, title: str, message: str) -> None:
+        """在窗口内显示一条提示（不创建原生消息框窗口）。"""
+        notice = NoticeOverlay(title, message, parent=self._overlay_host())
+        self._active_modal = notice
+        try:
+            notice.exec()
+        finally:
+            notice.deleteLater()
+            self._active_modal = None
+
+    def active_modal(self) -> Optional[ModalOverlay]:
+        """当前正在显示的窗口内模态层（测试用）。"""
+        return self._active_modal
 
     # ------------------------------------------------------------------
     # 状态同步
@@ -1663,17 +1724,22 @@ class MainWindow(QMainWindow):
     # 关闭保护
     # ------------------------------------------------------------------
     def closeEvent(self, event: QCloseEvent) -> None:
-        """关闭窗口前停止 AI 会话与联机窗口。"""
+        """关闭窗口前停止 AI 会话与联机/复盘面板。"""
         self._closing = True
-        if self._online_window is not None:
+        # 模态层用嵌套事件循环阻塞主流程；退出前必须先结束它，
+        # 否则关闭动作会卡在循环里，进程无法退出。
+        modal = self._active_modal
+        if modal is not None:
+            modal.reject()
+        if self._online_panel is not None:
             try:
-                self._online_window.close()
+                self._online_panel.shutdown()
             except RuntimeError:
-                self._online_window = None
-        if self._replay_window is not None:
+                self._online_panel = None
+        if self._replay_panel is not None:
             try:
-                self._replay_window.close()
+                self._replay_panel.shutdown()
             except RuntimeError:
-                self._replay_window = None
+                self._replay_panel = None
         self._session.shutdown()
         super().closeEvent(event)
