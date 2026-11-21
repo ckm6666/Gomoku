@@ -139,6 +139,16 @@ class BoardWidget(QWidget):
             self._set_hover_cell(None)
         self.update()
 
+    def board_rect(self) -> QRectF:
+        """返回棋盘绘制区域（居中的正方形画框）在控件坐标中的矩形。
+
+        棋盘控件可能是非正方形的，棋面永远画在居中的正方形里。覆盖层
+        （弹幕/表情）需要用同一套坐标，动画才会贴着棋盘走，而不是落在
+        控件四周的留白上。
+        """
+        self._calculate_geometry()
+        return QRectF(self._panel_rect)
+
     # ------------------------------------------------------------------
     # QWidget 事件
     # ------------------------------------------------------------------

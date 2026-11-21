@@ -32,6 +32,7 @@ CLIENT_REMATCH = "rematch"
 CLIENT_QUICK_MATCH = "quick_match"
 CLIENT_CANCEL_MATCH = "cancel_match"
 CLIENT_PING = "ping"
+CLIENT_CHAT = "chat"
 
 # 服务端 → 客户端
 SERVER_AUTHENTICATED = "authenticated"
@@ -45,6 +46,7 @@ SERVER_QUEUE_STATUS = "queue_status"
 SERVER_MATCH_FOUND = "match_found"
 SERVER_PONG = "pong"
 SERVER_ERROR = "server_error"
+SERVER_CHAT = "chat_message"
 
 _ALLOWED_MESSAGE_TYPES = {
     CLIENT_AUTH,
@@ -57,6 +59,7 @@ _ALLOWED_MESSAGE_TYPES = {
     CLIENT_QUICK_MATCH,
     CLIENT_CANCEL_MATCH,
     CLIENT_PING,
+    CLIENT_CHAT,
     SERVER_AUTHENTICATED,
     SERVER_ROOM_CREATED,
     SERVER_GAME_STATE,
@@ -68,7 +71,30 @@ _ALLOWED_MESSAGE_TYPES = {
     SERVER_MATCH_FOUND,
     SERVER_PONG,
     SERVER_ERROR,
+    SERVER_CHAT,
 }
+
+# 服务端 → 客户端的消息类型集合。
+#
+# 客户端只认得自己这一版支持的服务端消息；遇到不认识的服务端类型时
+# 应当安静忽略，而不是当成协议错误弹给玩家。这样服务端以后新增消息
+# 类型（哪怕协议版本不变）也不会让旧客户端满屏报错。
+SERVER_MESSAGE_TYPES = frozenset(
+    {
+        SERVER_AUTHENTICATED,
+        SERVER_ROOM_CREATED,
+        SERVER_GAME_STATE,
+        SERVER_MOVE_REJECTED,
+        SERVER_OPPONENT_STATUS,
+        SERVER_ROOM_CLOSED,
+        SERVER_REMATCH_STATUS,
+        SERVER_QUEUE_STATUS,
+        SERVER_MATCH_FOUND,
+        SERVER_PONG,
+        SERVER_ERROR,
+        SERVER_CHAT,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -359,6 +385,7 @@ __all__ = [
     "CLIENT_QUICK_MATCH",
     "CLIENT_CANCEL_MATCH",
     "CLIENT_PING",
+    "CLIENT_CHAT",
     "SERVER_AUTHENTICATED",
     "SERVER_ROOM_CREATED",
     "SERVER_GAME_STATE",
@@ -370,6 +397,8 @@ __all__ = [
     "SERVER_MATCH_FOUND",
     "SERVER_PONG",
     "SERVER_ERROR",
+    "SERVER_CHAT",
+    "SERVER_MESSAGE_TYPES",
     "GameSnapshot",
     "parse_game_state",
     "make_move_intent",

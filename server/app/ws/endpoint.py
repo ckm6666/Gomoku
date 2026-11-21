@@ -7,7 +7,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
@@ -16,6 +16,7 @@ from gomoku.shared.errors import ProtocolError
 from gomoku.shared.protocol import (
     CLIENT_AUTH,
     CLIENT_CANCEL_MATCH,
+    CLIENT_CHAT,
     CLIENT_CREATE_ROOM,
     CLIENT_JOIN_ROOM,
     CLIENT_MOVE_INTENT,
@@ -40,6 +41,18 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["game-websocket"])
 
 
+class _EnvelopeError(ProtocolError):
+    """协议错误，附带原始帧的 request_id（若能取到）。
+
+    网关解析失败时也回 request_id，客户端才能把这条错误归到对应的
+    请求上（例如"发言被拒"），而不是笼统地弹进红色错误条。
+    """
+
+    def __init__(self, message: str, request_id: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.request_id = request_id
+
+
 async def _receive_envelope(
     websocket: WebSocket,
     timeout: float,
@@ -54,7 +67,16 @@ async def _receive_envelope(
         raw = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ProtocolError("消息不是合法 JSON") from exc
-    return parse_message(raw)
+    try:
+        return parse_message(raw)
+    except ProtocolError as exc:
+        # 尽量带上原始 request_id，客户端才能精确定位是哪条请求被拒。
+        request_id: Optional[str] = None
+        if isinstance(raw, dict):
+            candidate = raw.get("request_id")
+            if isinstance(candidate, str) and candidate:
+                request_id = candidate
+        raise _EnvelopeError(str(exc), request_id) from exc
 
 
 async def _safe_close(websocket: WebSocket, code: int, reason: str) -> None:
@@ -165,7 +187,11 @@ async def game_websocket(websocket: WebSocket) -> None:
                 break
             except ProtocolError as exc:
                 await conn.send(
-                    make_message(SERVER_ERROR, {"reason": str(exc)})
+                    make_message(
+                        SERVER_ERROR,
+                        {"reason": str(exc)},
+                        request_id=getattr(exc, "request_id", None),
+                    )
                 )
                 continue
 
@@ -223,6 +249,26 @@ async def game_websocket(websocket: WebSocket) -> None:
                     await room_manager.quick_match(conn, request_id)
                 elif message_type == CLIENT_CANCEL_MATCH:
                     await room_manager.cancel_match(conn, request_id)
+                elif message_type == CLIENT_CHAT:
+                    kind = payload.get("kind")
+                    content = payload.get("content")
+                    if (
+                        not isinstance(kind, str)
+                        or not isinstance(content, str)
+                    ):
+                        await conn.send(
+                            make_message(
+                                SERVER_ERROR,
+                                {"reason": "聊天消息格式非法"},
+                                request_id=request_id,
+                            )
+                        )
+                    else:
+                        # 白名单、长度、限流与规范化都在 RoomManager 内完成，
+                        # 网关只负责挡下非字符串的畸形负载。
+                        await room_manager.send_chat(
+                            conn, kind, content, request_id
+                        )
                 elif message_type == CLIENT_AUTH:
                     await conn.send(
                         make_message(
