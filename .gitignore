@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+server/.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build / packaging
+build/
+dist/
+*.exe
+*.dll
+
+# Runtime data, databases, logs
+server/data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+logs/
+
+# Local secrets / deployment runtime
+.env
+.env.*
+jwt_secret.txt
+runtime.json
+formal_invites.json
+invites.txt
+online_test/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+.claude/
+
+# Archives / temp files
+*.tmp
+*.bak
+*.tar.gz
+*.zip
+
+# Keep only the README screenshots (old development screenshots are local)
+_*.png
+!_theme_*.png

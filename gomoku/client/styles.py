@@ -1,0 +1,760 @@
+"""应用级 QSS 样式（古风水墨 + 宣纸）。
+
+界面整体采用淡墨山水、宣纸、朱砂与金的配色；图片背景、纸纹、印章和棋盘画框
+由 :mod:`gomoku.client.ui_theme` 与 :mod:`gomoku.client.board_widget` 自绘，
+本文件只负责颜色、字体、边距和控件状态。颜色值与 ``theme_palette`` 对应。
+
+注意：不在这里指定全局 font-family，应用入口通过 QFont.setFamilies 设置
+“站酷小薇体 → 微软雅黑 UI → Segoe UI”的字体回退链；标题控件单独使用
+“Ma Shan Zheng”书法字体。
+"""
+
+from __future__ import annotations
+
+from typing import Final
+
+APP_STYLE: Final[str] = """
+/* ------------------------------ 基础外观 ------------------------------ */
+QMainWindow {
+    background-color: #F5EFE3;
+}
+
+QWidget#centralWidget,
+QStackedWidget#mainStack,
+QWidget#menuPage,
+QWidget#gamePage,
+QWidget#onlineCentral,
+QWidget#onlineStack,
+QWidget#onlinePage,
+QWidget#onlineScrollBody,
+QScrollArea#onlineScroll,
+QScrollArea#onlineScroll > QWidget#qt_scrollarea_viewport {
+    background: transparent;
+}
+
+QLabel {
+    color: #26221C;
+    background-color: transparent;
+}
+
+QToolTip {
+    color: #FFF9EF;
+    background-color: #3C3127;
+    border: 1px solid #B8934E;
+    border-radius: 4px;
+    padding: 6px 9px;
+}
+
+/* ------------------------------ 顶部标题 ------------------------------ */
+QLabel#brandTitle {
+    color: #26221C;
+    font-family: "Ma Shan Zheng";
+    font-size: 31px;
+    font-weight: normal;
+}
+
+QLabel#brandSubtitle {
+    color: #756C5E;
+    font-size: 12px;
+    padding-top: 1px;
+}
+
+QLabel#turnPill {
+    color: #4C463C;
+    background-color: rgba(251, 247, 238, 228);
+    border: 1px solid #C9B99F;
+    border-left: 3px solid #B8934E;
+    border-radius: 4px;
+    padding: 7px 14px;
+    font-size: 13px;
+    font-weight: bold;
+}
+
+QLabel#turnPill[result="true"] {
+    color: #FFF9EF;
+    background-color: #9E3B2E;
+    border: 1px solid #7E2C22;
+    border-left: 3px solid #E3D1A9;
+}
+
+/* ------------------------------ 联机窗口 ------------------------------ */
+QWidget#onlineCentral {
+    background: transparent;
+}
+
+QFrame#onlineCard {
+    background-color: rgba(252, 248, 239, 232);
+    border: 1px solid #D3C4AD;
+    border-top: 3px solid #B8934E;
+    border-radius: 8px;
+}
+
+QLabel#onlineTitle {
+    color: #26221C;
+    font-family: "Ma Shan Zheng";
+    font-size: 27px;
+    font-weight: normal;
+}
+
+QLabel#onlineSubtitle {
+    color: #756C5E;
+    font-size: 12px;
+}
+
+QLabel#onlineRoomTitle {
+    color: #26221C;
+    font-size: 18px;
+    font-weight: bold;
+}
+
+QLabel#onlineClock {
+    color: #5A4A38;
+    background-color: #F3EADA;
+    border: 1px solid #C9B99F;
+    border-radius: 4px;
+    padding: 4px 9px;
+    font-size: 12px;
+}
+
+QLabel#rankBadge {
+    color: #6B4725;
+    background-color: #F1E4CC;
+    border: 1px solid #B8934E;
+    border-radius: 8px;
+    padding: 4px 14px;
+    font-size: 13px;
+    font-weight: bold;
+}
+
+QLabel#rankSummary {
+    color: #756C5E;
+    font-size: 12px;
+}
+
+QLabel#sectionTitle {
+    color: #4C463C;
+    font-size: 13px;
+    font-weight: bold;
+    padding-top: 3px;
+}
+
+QLabel#onlineRatingResult {
+    color: #7A4A24;
+    background-color: #F3E6D2;
+    border: 1px solid #C9B99F;
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-size: 13px;
+    font-weight: bold;
+}
+
+QLabel#onlineStatus {
+    color: #756C5E;
+    font-size: 12px;
+}
+
+QLabel#onlineStatus[error="true"] {
+    color: #9E3B2E;
+}
+
+QLabel#onlineError {
+    color: #9E3B2E;
+    font-size: 12px;
+}
+
+QLabel#formLabel {
+    color: #756C5E;
+    font-size: 12px;
+}
+
+QPushButton#smallButton {
+    background-color: #F3EADA;
+    border: 1px solid #C9B99F;
+    color: #5A4A38;
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 11px;
+}
+
+QPushButton#smallButton:hover {
+    background-color: #EADCC8;
+    border-color: #B8934E;
+}
+
+QTableWidget#leaderboardTable {
+    color: #3A3128;
+    background-color: rgba(251, 247, 238, 238);
+    alternate-background-color: #F7F1E5;
+    border: 1px solid #D8C9B2;
+    border-radius: 5px;
+    gridline-color: transparent;
+    font-size: 12px;
+    selection-background-color: #F1E4CC;
+    selection-color: #26221C;
+}
+
+QTableWidget#leaderboardTable::item {
+    padding: 3px 6px;
+}
+
+QHeaderView::section {
+    color: #756C5E;
+    background-color: #E9DFCE;
+    border: none;
+    border-bottom: 1px solid #C9B99F;
+    padding: 5px 6px;
+    font-size: 11px;
+    font-weight: bold;
+}
+
+QLineEdit#onlineInput {
+    color: #332C24;
+    background-color: #FBF7EE;
+    border: 1px solid #C9B99F;
+    border-radius: 4px;
+    padding: 8px 10px;
+    min-height: 20px;
+    font-size: 13px;
+}
+
+QLineEdit#onlineInput:hover {
+    border-color: #B8934E;
+}
+
+QLineEdit#onlineInput:focus {
+    border: 1px solid #8E6C32;
+}
+
+QLineEdit#onlineInput:disabled {
+    color: #B3A898;
+    background-color: #EEE8DF;
+    border-color: #DCD0BC;
+}
+
+QScrollArea#onlineScroll {
+    border: none;
+}
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 2px;
+}
+
+QScrollBar::handle:vertical {
+    background-color: #C9B99F;
+    border-radius: 4px;
+    min-height: 28px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background-color: #B8934E;
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical,
+QScrollBar::add-page:vertical,
+QScrollBar::sub-page:vertical {
+    background: transparent;
+    height: 0px;
+}
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 2px;
+}
+
+QScrollBar::handle:horizontal {
+    background-color: #C9B99F;
+    border-radius: 4px;
+    min-width: 28px;
+}
+
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal,
+QScrollBar::add-page:horizontal,
+QScrollBar::sub-page:horizontal {
+    background: transparent;
+    width: 0px;
+}
+
+/* ------------------------------ 主菜单 ------------------------------ */
+QFrame#menuCard {
+    background: transparent;
+    border: none;
+}
+
+QLabel#menuTitle {
+    color: #26221C;
+    font-family: "Ma Shan Zheng";
+    font-size: 40px;
+    font-weight: normal;
+    padding-top: 2px;
+}
+
+QLabel#menuSubtitle {
+    color: #756C5E;
+    font-size: 13px;
+    padding-top: 2px;
+}
+
+QLabel#menuFootnote {
+    color: #A89C8B;
+    font-size: 11px;
+}
+
+QLabel#menuVersion {
+    color: #756C5E;
+    font-size: 12px;
+}
+
+QPushButton#menuButton {
+    color: #332C24;
+    background-color: #F7EFE2;
+    border: 1px solid #CDBFA9;
+    border-left: 3px solid #B8934E;
+    border-radius: 6px;
+    padding: 10px 16px;
+    font-size: 15px;
+    font-weight: bold;
+}
+
+QPushButton#menuButton:hover {
+    background-color: #F0E2CC;
+    border-color: #B8934E;
+    border-left: 3px solid #9E3B2E;
+}
+
+QPushButton#menuButton:pressed {
+    background-color: #E6D3B7;
+}
+
+QPushButton#menuPrimaryButton {
+    color: #FFF9EF;
+    background-color: #9E3B2E;
+    border: 1px solid #7E2C22;
+    border-left: 3px solid #E3D1A9;
+    border-radius: 6px;
+    padding: 10px 16px;
+    font-size: 15px;
+    font-weight: bold;
+}
+
+QPushButton#menuPrimaryButton:hover {
+    background-color: #8A3127;
+    border-color: #6B241B;
+    border-left: 3px solid #E3D1A9;
+}
+
+QPushButton#menuPrimaryButton:pressed {
+    background-color: #6B241B;
+}
+
+QPushButton#menuQuietButton {
+    color: #756C5E;
+    background-color: transparent;
+    border: 1px solid #D3C4AD;
+    border-radius: 6px;
+    padding: 9px 16px;
+    font-size: 14px;
+    font-weight: normal;
+}
+
+QPushButton#menuQuietButton:hover {
+    background-color: #F6EFE4;
+    border-color: #B8934E;
+    color: #4C463C;
+}
+
+QPushButton#menuQuietButton:pressed {
+    background-color: #EDE2D1;
+}
+
+QPushButton#menuButton:focus,
+QPushButton#menuPrimaryButton:focus,
+QPushButton#menuQuietButton:focus {
+    border: 1px solid #B8934E;
+    border-left: 3px solid #9E3B2E;
+}
+
+/* ------------------------------ 对局设置栏 ------------------------------ */
+QFrame#settingsBar {
+    background-color: rgba(251, 247, 238, 214);
+    border: 1px solid #D8C9B2;
+    border-radius: 6px;
+}
+
+QLabel#settingsLabel {
+    color: #756C5E;
+    font-size: 12px;
+    background-color: transparent;
+}
+
+QComboBox {
+    color: #3F382F;
+    background-color: #FBF7EE;
+    border: 1px solid #C9B99F;
+    border-radius: 4px;
+    padding: 4px 25px 4px 9px;
+    min-height: 20px;
+    font-size: 12px;
+}
+
+QComboBox:hover {
+    border-color: #B8934E;
+}
+
+QComboBox:focus {
+    border: 1px solid #8E6C32;
+}
+
+QComboBox:disabled {
+    color: #B3A898;
+    background-color: #EEE8DF;
+    border-color: #DCD0BC;
+}
+
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 21px;
+    border-left: 1px solid #D8C9B2;
+}
+
+QComboBox QAbstractItemView {
+    color: #3A3128;
+    background-color: #FBF7EE;
+    border: 1px solid #C9B99F;
+    border-radius: 4px;
+    selection-background-color: #F1E4CC;
+    selection-color: #26221C;
+    outline: 0;
+    padding: 3px;
+}
+
+QComboBox QAbstractItemView::item {
+    min-height: 24px;
+    padding: 2px 8px;
+}
+
+/* ------------------------------ 声音设置 ------------------------------ */
+QToolButton#soundButton {
+    background-color: #F3EADA;
+    border: 1px solid #C9B99F;
+    border-radius: 6px;
+}
+
+QToolButton#soundButton:hover {
+    background-color: #EADCC8;
+    border-color: #B8934E;
+}
+
+QToolButton#soundButton:pressed {
+    background-color: #E2D3BC;
+}
+
+QToolButton#soundButton:disabled {
+    background-color: #EEE8DF;
+    border-color: #DCD0BC;
+}
+
+QToolButton#soundButton::menu-indicator {
+    image: none;
+    width: 0px;
+}
+
+QMenu#soundMenu {
+    background-color: #FBF7EE;
+    border: 1px solid #C9B99F;
+    border-radius: 6px;
+    padding: 4px;
+}
+
+QMenu#soundMenu::item {
+    color: #3F382F;
+    padding: 6px 14px;
+    border-radius: 3px;
+}
+
+QMenu#soundMenu::item:selected {
+    background-color: #F1E4CC;
+}
+
+QMenu#soundMenu::separator {
+    height: 1px;
+    background-color: #D8C9B2;
+    margin: 4px 8px;
+}
+
+QWidget#volumeRow {
+    background-color: transparent;
+}
+
+QLabel#volumeLabel {
+    color: #5A4A38;
+    font-size: 12px;
+    background-color: transparent;
+}
+
+QLabel#volumeValue {
+    color: #A89C8B;
+    font-size: 11px;
+    background-color: transparent;
+}
+
+QSlider#volumeSlider {
+    min-height: 18px;
+    background-color: transparent;
+}
+
+QSlider#volumeSlider::groove:horizontal {
+    height: 4px;
+    border-radius: 2px;
+    background-color: #DCD0BC;
+}
+
+QSlider#volumeSlider::sub-page:horizontal {
+    height: 4px;
+    border-radius: 2px;
+    background-color: #B8934E;
+}
+
+QSlider#volumeSlider::handle:horizontal {
+    width: 14px;
+    height: 14px;
+    margin: -6px 0px;
+    border-radius: 7px;
+    background-color: #9E3B2E;
+    border: 1px solid #7E2C22;
+}
+
+/* ------------------------------ 棋手状态卡片 ------------------------------ */
+QFrame#playerCard {
+    background-color: rgba(252, 248, 239, 214);
+    border: 1px solid #D3C4AD;
+    border-radius: 8px;
+}
+
+QFrame#playerCard[active="true"] {
+    background-color: #F3E6D2;
+    border: 1px solid #9E3B2E;
+}
+
+QLabel#playerName {
+    color: #332C24;
+    font-size: 15px;
+    font-weight: bold;
+}
+
+QLabel#playerCaption {
+    color: #756C5E;
+    font-size: 12px;
+    padding-top: 2px;
+}
+
+QFrame#playerCard[active="true"] QLabel#playerName,
+QFrame#playerCard[active="true"] QLabel#playerCaption {
+    color: #7E2C22;
+}
+
+QLabel#stoneBadgeBlack {
+    background-color: #171717;
+    border: 1px solid #B8934E;
+    border-radius: 13px;
+}
+
+QLabel#stoneBadgeWhite {
+    background-color: #FBF7EE;
+    border: 1px solid #A89C8B;
+    border-radius: 13px;
+}
+
+/* ------------------------------ 底部操作区 ------------------------------ */
+QLabel#moveInfo {
+    color: #4C463C;
+    font-size: 13px;
+    font-weight: bold;
+}
+
+QLabel#hintLabel {
+    color: #756C5E;
+    font-size: 11px;
+}
+
+QPushButton {
+    color: #3D3125;
+    background-color: #F2E9DA;
+    border: 1px solid #D9C9B3;
+    border-radius: 5px;
+    padding: 9px 17px;
+    font-size: 13px;
+    font-weight: bold;
+}
+
+QPushButton:hover {
+    background-color: #EADCC8;
+    border-color: #B8934E;
+}
+
+QPushButton:pressed {
+    background-color: #E2D3BC;
+}
+
+QPushButton:focus {
+    border: 1px solid #B8934E;
+}
+
+QPushButton#undoButton {
+    background-color: #F3EADA;
+    border: 1px solid #D9C9B3;
+    color: #554534;
+}
+
+QPushButton#undoButton:hover {
+    background-color: #EADCC8;
+    border-color: #B8934E;
+}
+
+QPushButton#menuBackButton {
+    background-color: #F3EADA;
+    border: 1px solid #D9C9B3;
+    color: #554534;
+}
+
+QPushButton#menuBackButton:hover {
+    background-color: #EADCC8;
+    border-color: #B8934E;
+}
+
+QPushButton#restartButton {
+    background-color: #9E3B2E;
+    border: 1px solid #7E2C22;
+    color: #FFF9EF;
+}
+
+QPushButton#restartButton:hover {
+    background-color: #8A3127;
+    border-color: #6B241B;
+}
+
+QPushButton#restartButton:pressed {
+    background-color: #6B241B;
+}
+
+QPushButton#undoButton:focus,
+QPushButton#restartButton:focus,
+QPushButton#menuBackButton:focus {
+    border: 1px solid #B8934E;
+}
+
+QPushButton:disabled,
+QPushButton#undoButton:disabled,
+QPushButton#restartButton:disabled,
+QPushButton#menuBackButton:disabled {
+    background-color: #EEE8DF;
+    border-color: #DCD0BC;
+    color: #B3A898;
+}
+
+/* ------------------------------ 终局弹窗 ------------------------------ */
+QDialog#resultDialog {
+    background: transparent;
+}
+
+QLabel#resultSeal,
+QLabel#resultDivider {
+    background: transparent;
+}
+
+QLabel#resultTitle {
+    color: #26221C;
+    font-family: "Ma Shan Zheng";
+    font-size: 38px;
+    font-weight: normal;
+}
+
+QLabel#resultSubtitle {
+    color: #4C463C;
+    font-size: 14px;
+}
+
+QLabel#resultDetail {
+    color: #756C5E;
+    font-size: 12px;
+}
+
+QDialog#confirmDialog {
+    background: transparent;
+}
+
+QLabel#confirmSeal,
+QLabel#confirmDivider {
+    background: transparent;
+}
+
+QLabel#confirmTitle {
+    color: #26221C;
+    font-family: "Ma Shan Zheng";
+    font-size: 30px;
+    font-weight: normal;
+}
+
+QLabel#confirmMessage {
+    color: #4C463C;
+    font-size: 13px;
+}
+
+QPushButton#resultPrimaryButton {
+    color: #FFF9EF;
+    background-color: #9E3B2E;
+    border: 1px solid #7E2C22;
+    border-radius: 5px;
+    padding: 10px 30px;
+    min-width: 96px;
+    font-size: 14px;
+    font-weight: bold;
+}
+
+QPushButton#resultPrimaryButton:hover {
+    background-color: #8A3127;
+}
+
+QPushButton#resultPrimaryButton:pressed {
+    background-color: #6B241B;
+}
+
+QPushButton#resultSecondaryButton {
+    color: #4C463C;
+    background-color: #F7EFE2;
+    border: 1px solid #C9B99F;
+    border-radius: 5px;
+    padding: 10px 26px;
+    min-width: 96px;
+    font-size: 14px;
+}
+
+QPushButton#resultSecondaryButton:hover {
+    background-color: #EDE1CE;
+    border-color: #B8934E;
+}
+
+QPushButton#resultPrimaryButton:focus,
+QPushButton#resultSecondaryButton:focus {
+    border: 1px solid #E3D1A9;
+}
+
+/* ------------------------------ 弹窗 ------------------------------ */
+QMessageBox {
+    background-color: #FBF7EE;
+}
+
+QMessageBox QLabel {
+    color: #332C24;
+    font-size: 14px;
+}
+
+QMessageBox QPushButton {
+    min-width: 84px;
+}
+"""

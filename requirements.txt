@@ -1,0 +1,5 @@
+# 运行期依赖：PySide6 官方核心包 + Addons（QtWebSockets 联机传输）。
+# 不安装完整 PySide6 元包中的 WebEngine/PDF 等大型模块。
+PySide6-Essentials>=6.6,<7.0
+PySide6-Addons>=6.6,<7.0
+
