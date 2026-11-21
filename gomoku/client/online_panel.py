@@ -42,11 +42,11 @@ from gomoku.client.chat_widgets import (
     PresetCommentButton,
 )
 from gomoku.client.confirm_dialog import ConfirmDialog
-from gomoku.client.friends_window import FriendsWindow
+from gomoku.client.friends_panel import FriendsPanel
 from gomoku.client.history_records import record_from_game_detail
 from gomoku.client.net.social_api import SocialHTTPClient
-from gomoku.client.private_chat_window import PrivateChatWindow
-from gomoku.client.profile_window import AvatarPickerDialog, ProfileWindow
+from gomoku.client.private_chat_panel import PrivateChatPanel
+from gomoku.client.profile_panel import AvatarPickerPanel, ProfilePanel
 from gomoku.client.ui_theme import ONLINE_BACKDROP_SPEC, InkBackdrop
 from gomoku.client.board_widget import BoardWidget
 from gomoku.client.config import AppConfig
@@ -290,9 +290,9 @@ class OnlinePanel(InkBackdrop):
             self._on_social_unauthorized
         )
         self._friends_data: dict = {}
-        self._friends_window: Optional[FriendsWindow] = None
-        self._profile_window: Optional[ProfileWindow] = None
-        self._chat_windows: dict[str, PrivateChatWindow] = {}
+        self._friends_panel: Optional[FriendsPanel] = None
+        self._profile_panel: Optional[ProfilePanel] = None
+        self._chat_panels: dict[str, PrivateChatPanel] = {}
         self._pending_profile_user_id = ""
         self._pending_chat_user: Optional[dict] = None
 
@@ -739,7 +739,7 @@ class OnlinePanel(InkBackdrop):
 
         self.quick_match_button.clicked.connect(self._on_quick_match)
         self.create_room_button.clicked.connect(self._on_create_room)
-        self.friends_button.clicked.connect(self._open_friends_window)
+        self.friends_button.clicked.connect(self._open_friends_panel)
         self.leaderboard_table.cellClicked.connect(
             self._on_leaderboard_cell_clicked
         )
@@ -1114,7 +1114,6 @@ class OnlinePanel(InkBackdrop):
             return
         raw_entries = data.get("entries")
         entries = raw_entries if isinstance(raw_entries, list) else []
-        self._leaderboard_entries = entries
         total = data.get("total", len(entries))
         if not isinstance(total, int) or isinstance(total, bool):
             total = len(entries)
@@ -1123,6 +1122,9 @@ class OnlinePanel(InkBackdrop):
     def _fill_leaderboard(self, entries: list, total: int) -> None:
         table = self.leaderboard_table
         valid = [entry for entry in entries if isinstance(entry, Mapping)]
+        # 行号必须和 _leaderboard_entries 一一对应，否则点击第 i 行打开的
+        # 是另一个人。
+        self._leaderboard_entries = valid
         table.setRowCount(len(valid))
         own_id = (
             self._auth_session.user.id if self._auth_session else ""
@@ -1241,18 +1243,18 @@ class OnlinePanel(InkBackdrop):
             return
         self._pending_profile_user_id = user_id
         if self._auth_session.user.id == user_id:
-            self._show_profile_window(self._self_profile())
+            self._show_profile_panel(self._self_profile())
             return
         self._social_client.fetch_user(
             self._auth_session.access_token, user_id
         )
 
-    def _show_profile_window(self, profile: object) -> None:
+    def _show_profile_panel(self, profile: object) -> None:
         if not isinstance(profile, Mapping):
             return
         self._current_profile = dict(profile)
-        if self._profile_window is None:
-            window = ProfileWindow(self)
+        if self._profile_panel is None:
+            window = ProfilePanel(self)
             window.add_friend_requested.connect(
                 self._send_friend_request
             )
@@ -1262,21 +1264,19 @@ class OnlinePanel(InkBackdrop):
             window.remove_friend_requested.connect(self._remove_friend)
             window.avatar_requested.connect(self._open_avatar_picker)
             window.open_friends_requested.connect(
-                self._open_friends_window
+                self._open_friends_panel
             )
             window.destroyed.connect(
-                lambda *_: setattr(self, "_profile_window", None)
+                lambda *_: setattr(self, "_profile_panel", None)
             )
-            self._profile_window = window
-        self._profile_window.set_profile(profile)
-        self._profile_window.show()
-        self._profile_window.raise_()
-        self._profile_window.activateWindow()
+            self._profile_panel = window
+        self._profile_panel.set_profile(profile)
+        self._profile_panel.show()
 
     def _open_avatar_picker(self) -> None:
         if self._auth_session is None:
             return
-        picker = AvatarPickerDialog(
+        picker = AvatarPickerPanel(
             self._auth_session.user.avatar, self
         )
         picker.avatar_selected.connect(self._on_avatar_selected)
@@ -1305,8 +1305,12 @@ class OnlinePanel(InkBackdrop):
         if self._profile_user is not None:
             self._profile_user["avatar"] = user.avatar
         self._update_self_avatar()
-        if self._profile_window is not None:
-            self._profile_window.set_avatar(user.avatar)
+        if (
+            self._profile_panel is not None
+            and self._profile_panel.user_id == user.id
+        ):
+            # 资料浮层此刻显示的不是自己时，不能把本人的头像盖上去。
+            self._profile_panel.set_avatar(user.avatar)
         self._show_status("头像已更新")
 
     # ------------------------------------------------------------------
@@ -1326,15 +1330,14 @@ class OnlinePanel(InkBackdrop):
             f"好友 ({count})" if count else "好友"
         )
 
-    def _open_friends_window(self, invite_mode: bool = False) -> None:
+    def _open_friends_panel(self, invite_mode: bool = False) -> None:
         if self._auth_session is None:
             return
-        if self._friends_window is not None:
-            self._friends_window.show()
-            self._friends_window.raise_()
-            self._friends_window.activateWindow()
+        if self._friends_panel is not None:
+            self._friends_panel.set_invite_mode(invite_mode)
+            self._friends_panel.show()
             return
-        window = FriendsWindow(self, invite_mode=invite_mode)
+        window = FriendsPanel(self, invite_mode=invite_mode)
         window.profile_requested.connect(self._open_user_profile)
         window.chat_requested.connect(self._open_private_chat)
         window.invite_requested.connect(self._invite_friend)
@@ -1345,14 +1348,12 @@ class OnlinePanel(InkBackdrop):
         window.search_requested.connect(self._search_users)
         window.refresh_requested.connect(self._refresh_friends)
         window.destroyed.connect(
-            lambda *_: setattr(self, "_friends_window", None)
+            lambda *_: setattr(self, "_friends_panel", None)
         )
-        self._friends_window = window
+        self._friends_panel = window
         if self._friends_data:
             window.set_data(self._friends_data)
         window.show()
-        window.raise_()
-        window.activateWindow()
         self._refresh_friends()
 
     def _send_friend_request(self, user_id: str) -> None:
@@ -1399,15 +1400,15 @@ class OnlinePanel(InkBackdrop):
     def _search_users(self, query: str) -> None:
         if self._auth_session is None:
             return
-        if self._friends_window is not None:
-            self._friends_window.set_status("正在搜索…")
+        if self._friends_panel is not None:
+            self._friends_panel.set_status("正在搜索…")
         self._social_client.search_users(
             self._auth_session.access_token, query
         )
 
     def _refresh_open_profile(self) -> None:
         if (
-            self._profile_window is not None
+            self._profile_panel is not None
             and self._pending_profile_user_id
             and self._auth_session is not None
         ):
@@ -1450,14 +1451,12 @@ class OnlinePanel(InkBackdrop):
     ) -> None:
         if not user_id:
             return
-        existing = self._chat_windows.get(user_id)
+        existing = self._chat_panels.get(user_id)
         if existing is not None:
             existing.show()
-            existing.raise_()
-            existing.activateWindow()
             return
         resolved_name, avatar = self._username_avatar(user_id, username)
-        window = PrivateChatWindow(
+        window = PrivateChatPanel(
             user_id, resolved_name, avatar, self
         )
         window.send_requested.connect(
@@ -1466,22 +1465,20 @@ class OnlinePanel(InkBackdrop):
             )
         )
         window.destroyed.connect(
-            lambda *_: self._chat_windows.pop(user_id, None)
+            lambda *_: self._chat_panels.pop(user_id, None)
         )
-        self._chat_windows[user_id] = window
+        self._chat_panels[user_id] = window
         window.set_send_enabled(True)
         window.show()
-        window.raise_()
-        window.activateWindow()
         if self._auth_session is not None:
             self._social_client.fetch_messages(
-                self._auth_session.access_token, user_id
+                self._auth_session.access_token, user_id, limit=200
             )
 
     def _send_private_message(self, user_id: str, text: str) -> None:
         if self._auth_session is None or not text.strip():
             return
-        window = self._chat_windows.get(user_id)
+        window = self._chat_panels.get(user_id)
         if window is not None:
             window.set_status("发送中…")
         self._social_client.send_message(
@@ -1492,6 +1489,7 @@ class OnlinePanel(InkBackdrop):
         if not isinstance(message, DirectMessage):
             return
         payload = {
+            "id": message.id,
             "sender_id": message.sender_id,
             "sender_name": message.sender_name,
             "content": message.content,
@@ -1500,7 +1498,7 @@ class OnlinePanel(InkBackdrop):
         self_id = (
             self._auth_session.user.id if self._auth_session else ""
         )
-        window = self._chat_windows.get(message.sender_id)
+        window = self._chat_panels.get(message.sender_id)
         if window is not None:
             window.append_message(payload, self_id)
             window.set_status("")
@@ -1599,7 +1597,7 @@ class OnlinePanel(InkBackdrop):
             )
 
     def _on_invite_friend_clicked(self) -> None:
-        self._open_friends_window(invite_mode=True)
+        self._open_friends_panel(invite_mode=True)
 
     def _invite_friend(self, user_id: str, username: str) -> None:
         if self._session is None or not user_id:
@@ -1617,7 +1615,17 @@ class OnlinePanel(InkBackdrop):
         if not isinstance(kind, str):
             return
         if kind.startswith("user:"):
-            self._show_profile_window(data)
+            requested_id = kind.split(":", 1)[1]
+            if requested_id != self._pending_profile_user_id:
+                # 已经切到别的用户了，过期响应直接丢掉。
+                return
+            if isinstance(data, Mapping):
+                user = data.get("user")
+                if isinstance(user, Mapping):
+                    returned_id = str(user.get("id", ""))
+                    if returned_id and returned_id != requested_id:
+                        return
+            self._show_profile_panel(data)
             return
         if kind == "avatar":
             self._apply_avatar_update(data)
@@ -1628,9 +1636,9 @@ class OnlinePanel(InkBackdrop):
                 if isinstance(data, Mapping)
                 else []
             )
-            if self._friends_window is not None:
-                self._friends_window.set_search_results(entries)
-                self._friends_window.set_status(
+            if self._friends_panel is not None:
+                self._friends_panel.set_search_results(entries)
+                self._friends_panel.set_status(
                     f"找到 {len(entries)} 位玩家"
                 )
             return
@@ -1638,8 +1646,8 @@ class OnlinePanel(InkBackdrop):
             if isinstance(data, Mapping):
                 self._friends_data = dict(data)
             self._update_friends_badge()
-            if self._friends_window is not None:
-                self._friends_window.set_data(self._friends_data)
+            if self._friends_panel is not None:
+                self._friends_panel.set_data(self._friends_data)
             return
         if kind == "friend_request":
             self._show_status("好友申请已发送")
@@ -1657,7 +1665,7 @@ class OnlinePanel(InkBackdrop):
             return
         if kind.startswith("messages:"):
             user_id = kind.split(":", 1)[1]
-            window = self._chat_windows.get(user_id)
+            window = self._chat_panels.get(user_id)
             if window is None:
                 return
             messages = (
@@ -1676,7 +1684,7 @@ class OnlinePanel(InkBackdrop):
             return
         if kind.startswith("message_send:"):
             user_id = kind.split(":", 1)[1]
-            window = self._chat_windows.get(user_id)
+            window = self._chat_panels.get(user_id)
             if window is not None and isinstance(data, Mapping):
                 self_id = (
                     self._auth_session.user.id
@@ -1684,6 +1692,7 @@ class OnlinePanel(InkBackdrop):
                     else ""
                 )
                 window.append_message(data, self_id)
+                window.clear_draft()
                 window.set_status("")
 
     def _on_social_failed(self, kind: str, message: str) -> None:
@@ -1692,11 +1701,14 @@ class OnlinePanel(InkBackdrop):
             "message_send:"
         ):
             user_id = kind.split(":", 1)[1]
-            window = self._chat_windows.get(user_id)
+            window = self._chat_panels.get(user_id)
             if window is not None:
                 window.set_status(message or "发送失败")
+                if kind.startswith("message_send:"):
+                    # 发送失败：把文本放回输入框，别让用户白打一遍。
+                    window.restore_draft()
                 return
-        if self._friends_window is not None and kind in (
+        if self._friends_panel is not None and kind in (
             "friends",
             "friend_request",
             "friend_accept",
@@ -1704,7 +1716,7 @@ class OnlinePanel(InkBackdrop):
             "friend_remove",
             "search",
         ):
-            self._friends_window.set_status(message)
+            self._friends_panel.set_status(message)
         self._show_status(message or "操作失败", error=True)
 
     def _on_social_unauthorized(self, _kind: str) -> None:
@@ -1717,25 +1729,32 @@ class OnlinePanel(InkBackdrop):
 
     def _show_status(self, text: str, error: bool = False) -> None:
         if self.stack.currentWidget() is self.game_page:
-            self.game_error_label.setText(text)
+            if error:
+                self.game_error_label.setText(text)
+            else:
+                # 普通提示别塞进红色的错误标签里。
+                self.game_error_label.setText("")
+                self._set_lobby_status(text)
         else:
             self._set_lobby_status(text, error=error)
 
     def _close_social_windows(self) -> None:
-        for window in (self._friends_window, self._profile_window):
-            if window is not None:
+        for panel in (self._friends_panel, self._profile_panel):
+            if panel is not None:
                 try:
-                    window.close()
+                    panel.close()
+                    panel.deleteLater()
                 except RuntimeError:
                     pass
-        for window in list(self._chat_windows.values()):
+        for panel in list(self._chat_panels.values()):
             try:
-                window.close()
+                panel.close()
+                panel.deleteLater()
             except RuntimeError:
                 pass
-        self._friends_window = None
-        self._profile_window = None
-        self._chat_windows.clear()
+        self._friends_panel = None
+        self._profile_panel = None
+        self._chat_panels.clear()
         self._friends_data = {}
         self._pending_profile_user_id = ""
 
@@ -2716,6 +2735,8 @@ class OnlinePanel(InkBackdrop):
                 if session.busy and current is your_color
                 else ("落子中" if current is your_color else "等待"),
                 your_rating,
+                you_avatar,
+                you_id,
             )
             self.opponent_card.set_content(
                 opponent_name,
@@ -2725,6 +2746,8 @@ class OnlinePanel(InkBackdrop):
                 if not session.opponent_online
                 else ("落子中" if current is opponent_color else "等待"),
                 opponent_rating,
+                opponent_avatar,
+                opponent_id,
             )
             if not self._ws_connected:
                 self._set_game_pill("连接中断", result=False)

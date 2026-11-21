@@ -52,6 +52,24 @@ async def _check_send_rate(user_id: str) -> None:
             )
         recent.append(now)
         _send_times[user_id] = recent
+        _prune_send_times(now)
+
+
+#: 限流表里保留的用户数上限；超过后清理掉早已过期的键，避免字典无限增长。
+_SEND_TRACKER_MAX_KEYS = 4096
+
+
+def _prune_send_times(now: float) -> None:
+    """丢弃长时间没有发送记录的用户键。"""
+    if len(_send_times) <= _SEND_TRACKER_MAX_KEYS:
+        return
+    stale = [
+        key
+        for key, stamps in _send_times.items()
+        if not stamps or now - stamps[-1] >= _DM_WINDOW_SECONDS
+    ]
+    for key in stale:
+        _send_times.pop(key, None)
 
 
 async def _require_friend(
@@ -130,16 +148,25 @@ async def message_history(
         )
     ).all()
 
-    await session.execute(
-        update(DirectMessage)
-        .where(
-            DirectMessage.sender_id == other.id,
-            DirectMessage.recipient_id == current_user.id,
-            DirectMessage.read_at.is_(None),
+    # 只把“这次真正返回给客户端”的消息标记为已读。否则对方发来 500 条
+    # 未读、本次只取回 50 条时，剩下的 450 条会被悄悄标成已读——未读数
+    # 归零，用户再也看不到它们。
+    returned_ids = [
+        message.id
+        for message in rows
+        if message.sender_id == other.id
+        and message.recipient_id == current_user.id
+    ]
+    if returned_ids:
+        await session.execute(
+            update(DirectMessage)
+            .where(
+                DirectMessage.id.in_(returned_ids),
+                DirectMessage.read_at.is_(None),
+            )
+            .values(read_at=utcnow_naive())
         )
-        .values(read_at=utcnow_naive())
-    )
-    await session.commit()
+        await session.commit()
 
     users = await _load_users(
         session, {message.sender_id for message in rows}

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -23,6 +25,7 @@ from server.app.schemas import (
     UserResponse,
 )
 from server.app.security import (
+    LoginBackoff,
     hash_password,
     normalize_username,
     sha256_hex,
@@ -30,6 +33,10 @@ from server.app.security import (
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
 
 
 @router.post(
@@ -98,11 +105,19 @@ async def login(
 ) -> AuthResponse:
     """账号密码登录；失败响应保持泛化，避免枚举账号。
 
-    登录失败只返回通用的 401，不按失败次数锁定账号或 IP，避免正常用户
-    因为多次输错密码而被拒绝登录。
+    登录失败只返回通用的 401，**不按失败次数锁定账号或 IP**，避免正常
+    用户因为多次输错密码而被拒绝登录。取而代之的是渐进退避：连续失败
+    的请求会慢一点再返回（封顶 3 秒），把在线暴力猜测的速率压到不可行，
+    同时不会把任何人挡在门外。
     """
     settings = request.app.state.settings
     _, username_key = normalize_username(payload.username)
+
+    backoff: LoginBackoff = request.app.state.login_backoff
+    backoff_key = f"{username_key}|{_client_ip(request)}"
+    delay = await backoff.delay_for(backoff_key)
+    if delay > 0:
+        await asyncio.sleep(delay)
 
     user = await session.scalar(
         select(User).where(User.username_key == username_key)
@@ -112,12 +127,14 @@ async def login(
         and await verify_password(payload.password, user.password_hash)
     )
     if not password_ok or user is None or not user.is_active:
+        await backoff.record_failure(backoff_key)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="用户名或密码不正确",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    await backoff.clear(backoff_key)
     refresh_record, raw_refresh = make_refresh_session(user.id, settings)
     session.add(refresh_record)
     await session.commit()

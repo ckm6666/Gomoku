@@ -187,6 +187,101 @@ class SocialAPITests(ServerTestBase):
                 [],
             )
 
+    def test_accept_then_decline_keeps_the_friendship(self) -> None:
+        """接受之后再拒绝，不能把已经建立的好友关系悄悄删掉。"""
+        alice_token, alice = self._register_user("race_alice")
+        bob_token, bob = self._register_user("race_bob")
+
+        response = self.client.post(
+            "/api/v1/friends/requests",
+            json={"user_id": bob["id"]},
+            headers=self.auth_headers(alice_token),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        request_id = response.json()["request_id"]
+
+        accepted = self.client.post(
+            f"/api/v1/friends/requests/{request_id}/accept",
+            headers=self.auth_headers(bob_token),
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+
+        # 申请已经处理完，再次拒绝必须干净地失败，而不是删掉好友关系。
+        declined = self.client.post(
+            f"/api/v1/friends/requests/{request_id}/decline",
+            headers=self.auth_headers(bob_token),
+        )
+        self.assertEqual(declined.status_code, 404, declined.text)
+
+        friends = self.client.get(
+            "/api/v1/friends", headers=self.auth_headers(bob_token)
+        )
+        self.assertEqual(friends.status_code, 200, friends.text)
+        friend_ids = {f["user_id"] for f in friends.json()["friends"]}
+        self.assertIn(alice["id"], friend_ids)
+
+    def test_duplicate_friend_request_returns_conflict(self) -> None:
+        """重复的“加好友”必须是 4xx，不能变成 500。"""
+        alice_token, alice = self._register_user("dup_alice")
+        bob_token, bob = self._register_user("dup_bob")
+
+        first = self.client.post(
+            "/api/v1/friends/requests",
+            json={"user_id": bob["id"]},
+            headers=self.auth_headers(alice_token),
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+
+        # 同一方向再发一次：提示已发送。
+        again = self.client.post(
+            "/api/v1/friends/requests",
+            json={"user_id": bob["id"]},
+            headers=self.auth_headers(alice_token),
+        )
+        self.assertIn(again.status_code, (400, 409), again.text)
+
+        # 对方也发一次：冲突，而不是服务器错误。
+        reverse = self.client.post(
+            "/api/v1/friends/requests",
+            json={"user_id": alice["id"]},
+            headers=self.auth_headers(bob_token),
+        )
+        self.assertIn(reverse.status_code, (400, 409), reverse.text)
+
+    def test_history_only_marks_returned_messages_read(self) -> None:
+        """只取回 limit 条时，没取回的消息不能被标成已读。"""
+        alice_token, alice = self._register_user("dm_alice")
+        bob_token, bob = self._register_user("dm_bob")
+        self._make_friends(
+            alice_token, alice["id"], bob_token, bob["id"]
+        )
+
+        for index in range(5):
+            sent = self.client.post(
+                f"/api/v1/messages/{bob['id']}",
+                json={"content": f"第 {index} 条"},
+                headers=self.auth_headers(alice_token),
+            )
+            self.assertEqual(sent.status_code, 200, sent.text)
+
+        history = self.client.get(
+            f"/api/v1/messages/{alice['id']}",
+            params={"limit": 2},
+            headers=self.auth_headers(bob_token),
+        )
+        self.assertEqual(history.status_code, 200, history.text)
+        self.assertEqual(len(history.json()["messages"]), 2)
+
+        # 5 条只取回 2 条：未读数必须是 3，而不是被清零。
+        friends = self.client.get(
+            "/api/v1/friends", headers=self.auth_headers(bob_token)
+        ).json()
+        entries = [
+            f for f in friends["friends"] if f["user_id"] == alice["id"]
+        ]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["unread"], 3)
+
     def test_friend_request_rejects_self_and_missing(self) -> None:
         token, user = self._register_user("friend_solo")
         headers = self.auth_headers(token)

@@ -26,6 +26,7 @@ from server.app.db import (
     create_tables,
     mark_unfinished_games_abandoned,
 )
+from server.app.security import LoginBackoff
 from server.app.ws.endpoint import router as ws_router
 from server.app.ws.rooms import RoomManager
 
@@ -47,6 +48,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         app.state.engine = engine
         app.state.session_factory = session_factory
         app.state.registration_lock = asyncio.Lock()
+        app.state.login_backoff = LoginBackoff()
         app.state.room_manager = RoomManager(
             service_settings, session_factory
         )

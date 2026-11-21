@@ -945,11 +945,13 @@ class RicePaperCard(QFrame):
         seal_text: Optional[str] = "弈",
         shadow: bool = True,
         corner_motifs: bool = True,
+        opaque: bool = False,
     ) -> None:
         super().__init__(parent)
         self._seal_text = seal_text
         self._shadow = shadow
         self._corner_motifs = corner_motifs
+        self._opaque = opaque
         self._seal_cache: Optional[QPixmap] = None
         self._seal_key: Optional[tuple[int, float]] = None
         self.setFrameShape(QFrame.Shape.NoFrame)
@@ -983,7 +985,12 @@ class RicePaperCard(QFrame):
         path.addRoundedRect(card, radius, radius)
         painter.setClipPath(path)
 
-        painter.fillRect(card, QColor(255, 252, 244, 230))
+        # 半透明时让背景（主菜单的水墨底）透出来；浮层面板悬在任意内容
+        # 之上，必须完全不透明，否则底下的文字会透上来。
+        painter.fillRect(
+            card,
+            QColor(255, 252, 244, 255 if self._opaque else 230),
+        )
         _paint_texture(painter, width, height, dpr)
 
         painter.setClipping(False)

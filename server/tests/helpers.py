@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from server.app.config import Settings
 from server.app.main import create_app
+from server.app.security import LoginBackoff
 
 
 class ServerTestBase(unittest.TestCase):
@@ -42,6 +43,11 @@ class ServerTestBase(unittest.TestCase):
         self.app = create_app(self.settings)
         self._client_cm = TestClient(self.app)
         self.client = self._client_cm.__enter__()
+        # 测试里把登录退避的等待时间清零：退避的逻辑由单独的单元测试
+        # 覆盖，接口测试不应该真的睡上好几秒。
+        self.app.state.login_backoff = LoginBackoff(
+            base_delay_seconds=0.0, max_delay_seconds=0.0
+        )
 
     def tearDown(self) -> None:
         try:

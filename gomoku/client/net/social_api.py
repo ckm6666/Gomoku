@@ -36,7 +36,12 @@ class SocialHTTPClient(QObject):
         self._api_base_url = (api_base_url or "").rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._manager = QNetworkAccessManager(self)
-        self._replies: dict[str, QNetworkReply] = {}
+        # 每个在途请求都有自己的令牌：同一 kind 的多个写请求（例如连续
+        # 发两条私聊）可以同时在飞，不会互相顶掉。
+        self._replies: dict[int, tuple[str, QNetworkReply]] = {}
+        # GET 走“后发先到为准”：同一 kind 的新请求会作废上一个。
+        self._latest_get: dict[str, int] = {}
+        self._next_token = 0
 
     @property
     def busy(self) -> bool:
@@ -135,11 +140,11 @@ class SocialHTTPClient(QObject):
         )
 
     def abort_all(self) -> None:
-        for kind in list(self._replies):
-            reply = self._replies.pop(kind, None)
-            if reply is not None:
-                reply.abort()
-                reply.deleteLater()
+        for token in list(self._replies):
+            _kind, reply = self._replies.pop(token)
+            reply.abort()
+            reply.deleteLater()
+        self._latest_get.clear()
         self.busy_changed.emit(False)
 
     # ------------------------------------------------------------------
@@ -165,10 +170,13 @@ class SocialHTTPClient(QObject):
             self.failed.emit(kind, "联机服务器地址无效")
             return False
 
-        old_reply = self._replies.pop(kind, None)
-        if old_reply is not None:
-            old_reply.abort()
-            old_reply.deleteLater()
+        old_token = self._latest_get.get(kind) if method == "GET" else None
+        if old_token is not None:
+            # 同一个 GET 的上一次请求作废：后发为准，不让过期响应覆盖新状态。
+            stale = self._replies.pop(old_token, None)
+            if stale is not None:
+                stale[1].abort()
+                stale[1].deleteLater()
 
         request = QNetworkRequest(url)
         request.setRawHeader(
@@ -200,19 +208,26 @@ class SocialHTTPClient(QObject):
             self.failed.emit(kind, "不支持的请求方法")
             return False
 
-        self._replies[kind] = reply
+        self._next_token += 1
+        token = self._next_token
+        self._replies[token] = (kind, reply)
+        if method == "GET":
+            self._latest_get[kind] = token
         reply.finished.connect(
-            lambda reply=reply, kind=kind: self._on_finished(reply, kind)
+            lambda reply=reply, token=token: self._on_finished(reply, token)
         )
         self.busy_changed.emit(True)
         return True
 
-    def _on_finished(self, reply: QNetworkReply, kind: str) -> None:
-        if reply is not self._replies.get(kind):
+    def _on_finished(self, reply: QNetworkReply, token: int) -> None:
+        entry = self._replies.pop(token, None)
+        if entry is None:
+            # 已经被作废（例如同 kind 的新 GET 顶掉了它）：直接丢弃。
             reply.deleteLater()
             return
-
-        self._replies.pop(kind, None)
+        kind, _reply = entry
+        if self._latest_get.get(kind) == token:
+            self._latest_get.pop(kind, None)
         self.busy_changed.emit(bool(self._replies))
 
         try:
@@ -238,7 +253,10 @@ class SocialHTTPClient(QObject):
 
             message = self._extract_error(data) or "请求失败"
             if status == 401:
+                # 401 交给令牌刷新处理：刷新成功后请求会被重放，这里再报
+                # 一遍错只会把“未提供认证凭据”推成红色错误提示。
                 self.unauthorized.emit(kind)
+                return
             self.failed.emit(kind, message)
         finally:
             reply.deleteLater()

@@ -15,6 +15,7 @@ from server.app.api.social_helpers import (
 from server.app.dependencies import get_current_user, get_db
 from server.app.models import User
 from server.app.ratings import rank_for_rating
+from server.app.security import normalize_username
 from server.app.schemas import (
     AvatarUpdateRequest,
     PublicProfileResponse,
@@ -45,7 +46,9 @@ async def search_users(
     session: AsyncSession = Depends(get_db),
 ) -> UserSearchResponse:
     """按用户名模糊搜索活跃账号（用于添加好友）。"""
-    key = q.strip().casefold()
+    # 与注册时同一套规范化（NFKC + casefold），否则全角等宽字符注册出来的
+    # 用户用同样的字符搜不到——屏幕上显示的名字和数据库里的 key 对不上。
+    _, key = normalize_username(q)
     if not key:
         return UserSearchResponse(entries=[], total=0)
     rows = (

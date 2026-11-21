@@ -1,4 +1,4 @@
-"""好友私聊窗口：历史消息与实时收发。"""
+"""好友私聊面板：历史消息与实时收发。"""
 
 from __future__ import annotations
 
@@ -18,11 +18,11 @@ from PySide6.QtWidgets import (
 )
 
 from gomoku.client.avatar_widgets import AvatarView
-from gomoku.client.paper_dialog import InkDivider, PaperDialog
+from gomoku.client.paper_panel import InkDivider, PaperPanel
 from gomoku.shared.social import MAX_DIRECT_MESSAGE_LENGTH
 
 
-class PrivateChatWindow(PaperDialog):
+class PrivateChatPanel(PaperPanel):
     """与一位好友的私聊窗口。"""
 
     send_requested = Signal(str)
@@ -42,7 +42,8 @@ class PrivateChatWindow(PaperDialog):
             min_height=520,
         )
         self.friend_id = friend_id
-        self.setModal(False)
+        self._seen_ids: set[str] = set()
+        self._last_sent = ""
 
         header = QHBoxLayout()
         header.setSpacing(12)
@@ -119,20 +120,44 @@ class PrivateChatWindow(PaperDialog):
         messages: Sequence[Mapping],
         self_id: str,
     ) -> None:
-        self.messages_view.clear()
-        if not messages:
+        """把服务端历史并进当前记录。
+
+        不能直接清空重画：历史请求和实时推送是两条独立的链路，谁先到
+        说不准。清空会把刚收到的实时消息抹掉，不去重又会把同一条消息
+        显示两遍。这里按消息 id 合并，只补上还没出现过的。
+        """
+        if not self._seen_ids and not self.messages_view.toPlainText():
             self.messages_view.setHtml(
                 '<div style="color:#7A6A55;text-align:center;'
                 'padding:20px;">还没有聊天记录，打个招呼吧</div>'
             )
-            return
+        added = False
         for message in messages:
-            if isinstance(message, Mapping):
-                self._append(message, self_id, scroll=False)
-        self._scroll_to_bottom()
+            if not isinstance(message, Mapping):
+                continue
+            if self._append(message, self_id, scroll=False):
+                added = True
+        if added:
+            self._scroll_to_bottom()
 
     def append_message(self, message: Mapping, self_id: str) -> None:
-        self._append(message, self_id, scroll=True)
+        if self._append(message, self_id, scroll=True):
+            self._scroll_to_bottom()
+
+    @property
+    def last_draft(self) -> str:
+        """最近一次发送出去、但还没确认的文本。"""
+        return self._last_sent
+
+    def restore_draft(self) -> None:
+        """发送失败时把文本放回输入框，别让用户白打一遍。"""
+        if self._last_sent:
+            self.input.setText(self._last_sent)
+            self._last_sent = ""
+
+    def clear_draft(self) -> None:
+        """发送成功：忘掉待确认的草稿。"""
+        self._last_sent = ""
 
     def _append(
         self,
@@ -140,7 +165,16 @@ class PrivateChatWindow(PaperDialog):
         self_id: str,
         *,
         scroll: bool,
-    ) -> None:
+    ) -> bool:
+        """把一条消息画进记录里；已经显示过就跳过。
+
+        返回 True 表示这次确实新增了一条。
+        """
+        message_id = str(message.get("id", ""))
+        if message_id:
+            if message_id in self._seen_ids:
+                return False
+            self._seen_ids.add(message_id)
         sender_id = str(message.get("sender_id", ""))
         is_self = sender_id == self_id
         sender_name = (
@@ -163,6 +197,7 @@ class PrivateChatWindow(PaperDialog):
         self.messages_view.append(block)
         if scroll:
             self._scroll_to_bottom()
+        return True
 
     @staticmethod
     def _format_time(message: Mapping) -> str:
@@ -191,10 +226,13 @@ class PrivateChatWindow(PaperDialog):
         if not text:
             return
         self.input.clear()
+        # 记住这次发送的内容：万一服务端拒绝（限流、对方已不是好友），
+        # 还能把文本放回输入框。
+        self._last_sent = text
         self.send_requested.emit(text)
 
     def mark_read(self) -> None:
         """占位：历史加载时服务端已标记已读。"""
 
 
-__all__ = ["PrivateChatWindow"]
+__all__ = ["PrivateChatPanel"]

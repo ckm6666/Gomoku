@@ -487,7 +487,9 @@ class RoomManager:
                 ).all()
         except Exception:
             logger.exception("查询好友列表失败 user=%s", user_id)
-            return []
+            # 数据库抖动时退回缓存快照，不要把好友列表清空——否则这一轮
+            # 上下线推送会被静默丢掉，好友的在线状态就此对不上。
+            return list(self._friend_cache.get(user_id, frozenset()))
         ids = [
             row.user_b if row.user_a == user_id else row.user_a
             for row in rows
@@ -948,6 +950,13 @@ class RoomManager:
         if time.monotonic() - invite.created_at > _INVITE_TTL_SECONDS:
             self._invites.pop(invite.invite_id, None)
             await self._send_error(conn, "邀请已过期", request_id)
+            return
+        # 邀请发出后、对方回应前，好友关系可能已经被解除（删好友）。这里
+        # 重新校验一次，否则“不是好友也能被拉进自建房”，绕过了发邀请时
+        # 的好友限制。
+        if not await self._are_friends(invite.inviter_id, conn.user_id):
+            self._invites.pop(invite.invite_id, None)
+            await self._send_error(conn, "你们已不是好友，无法接受邀请", request_id)
             return
 
         self._invites.pop(invite.invite_id, None)

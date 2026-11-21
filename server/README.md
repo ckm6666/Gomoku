@@ -144,7 +144,7 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 | `POST /api/v1/friends/requests/{id}/accept` | 同意好友申请 |
 | `POST /api/v1/friends/requests/{id}/decline` | 拒绝好友申请 |
 | `DELETE /api/v1/friends/{user_id}` | 删除好友 |
-| `GET /api/v1/messages/{user_id}?limit=50` | 与好友的最近私聊；读取时标记已读 |
+| `GET /api/v1/messages/{user_id}?limit=50` | 与好友的最近私聊；只把本次返回的消息标记已读 |
 | `POST /api/v1/messages/{user_id}` | 发送私聊（`{"content": ...}`），在线时实时推送 |
 | `WS quick_match` | 加入排位匹配队列 |
 | `WS cancel_match` | 离开排位队列 |

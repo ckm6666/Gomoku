@@ -1,4 +1,4 @@
-"""个人信息窗口与头像选择器（宣纸金线风格）。"""
+"""个人信息面板与头像选择器（宣纸金线风格）。"""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from gomoku.client.avatar_widgets import AvatarView, avatar_pixmap
-from gomoku.client.paper_dialog import InkDivider, PaperDialog
+from gomoku.client.paper_panel import InkDivider, PaperPanel
 from gomoku.shared.avatar import (
     AVATAR_BY_KEY,
     AVATARS,
@@ -25,7 +25,7 @@ from gomoku.shared.avatar import (
 )
 
 
-class AvatarPickerDialog(PaperDialog):
+class AvatarPickerPanel(PaperPanel):
     """预置头像选择器。"""
 
     avatar_selected = Signal(str)
@@ -40,8 +40,8 @@ class AvatarPickerDialog(PaperDialog):
             seal_text="容",
             window_title="选择头像",
             min_width=380,
+            modal=True,
         )
-        self.setModal(True)
         current_key = normalize_avatar(current)
 
         title = QLabel("选择你的头像", self.card)
@@ -105,7 +105,7 @@ class AvatarPickerDialog(PaperDialog):
         self.accept()
 
 
-class ProfileWindow(PaperDialog):
+class ProfilePanel(PaperPanel):
     """展示用户资料；按钮只发信号，网络请求由联机窗口处理。"""
 
     add_friend_requested = Signal(str)
@@ -213,6 +213,12 @@ class ProfileWindow(PaperDialog):
         self.actions = QHBoxLayout()
         self.actions.setSpacing(8)
         self.content.addLayout(self.actions)
+
+    # ------------------------------------------------------------------
+    @property
+    def user_id(self) -> str:
+        """当前展示的用户 id；没有资料时为空串。"""
+        return str(self._user.get("id", ""))
 
     # ------------------------------------------------------------------
     def set_profile(
@@ -359,4 +365,4 @@ class ProfileWindow(PaperDialog):
         self.actions.addWidget(close_button)
 
 
-__all__ = ["ProfileWindow", "AvatarPickerDialog"]
+__all__ = ["ProfilePanel", "AvatarPickerPanel"]

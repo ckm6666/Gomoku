@@ -1,4 +1,4 @@
-"""好友列表、好友申请与用户搜索窗口（宣纸金线风格）。"""
+"""好友列表、好友申请与用户搜索面板（宣纸金线风格）。"""
 
 from __future__ import annotations
 
@@ -17,11 +17,11 @@ from PySide6.QtWidgets import (
 )
 
 from gomoku.client.avatar_widgets import AvatarView
-from gomoku.client.paper_dialog import PaperDialog
+from gomoku.client.paper_panel import PaperPanel
 
 
-class FriendsWindow(PaperDialog):
-    """非模态好友窗口；所有网络操作通过信号交给联机窗口。"""
+class FriendsPanel(PaperPanel):
+    """非模态好友面板；所有网络操作通过信号交给联机面板。"""
 
     profile_requested = Signal(str)
     chat_requested = Signal(str, str)
@@ -63,6 +63,8 @@ class FriendsWindow(PaperDialog):
         )
         subtitle.setObjectName("socialSubtitle")
         subtitle.setWordWrap(True)
+        self._title_label = title
+        self._subtitle_label = subtitle
         self.content.addWidget(title)
         self.content.addWidget(subtitle)
 
@@ -146,6 +148,25 @@ class FriendsWindow(PaperDialog):
         self.search_input.returnPressed.connect(self._emit_search)
 
     # ------------------------------------------------------------------
+    def set_invite_mode(self, invite_mode: bool) -> None:
+        """切换“好友列表 / 邀请好友对局”两种标题。
+
+        浮层会被复用：从对局页点“邀请好友”时，已经打开的好友浮层要
+        跟着切换标题，否则用户看到的是“我的好友”。
+        """
+        if invite_mode == self._invite_mode:
+            return
+        self._invite_mode = invite_mode
+        self._title_label.setText(
+            "邀请好友对局" if invite_mode else "我的好友"
+        )
+        self._subtitle_label.setText(
+            "选一位在线好友，邀请进入自建房"
+            if invite_mode
+            else "与好友聊天，或邀请一局自建房对弈"
+        )
+
+    # ------------------------------------------------------------------
     def _add_section(
         self,
         key: str,
@@ -220,6 +241,9 @@ class FriendsWindow(PaperDialog):
             item = layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                # 先脱离父控件再删除：否则在事件循环处理删除之前，旧行
+                # 还会留在原来的位置上，和新行重叠一帧。
+                widget.setParent(None)
                 widget.deleteLater()
 
     def _add_hint(self, layout: QVBoxLayout, text: str) -> None:
@@ -241,7 +265,9 @@ class FriendsWindow(PaperDialog):
         presence: Optional[str] = None,
         online: Optional[bool] = None,
         unread: int = 0,
-        buttons: Sequence[tuple[str, str, Callable[[], None]]] = (),
+        buttons: Sequence[
+            tuple[str, str, Callable[[], None], bool]
+        ] = (),
     ) -> QFrame:
         frame = QFrame(self.card)
         frame.setObjectName("friendRow")
@@ -285,14 +311,35 @@ class FriendsWindow(PaperDialog):
             badge.setObjectName("friendUnread")
             layout.addWidget(badge)
 
-        for text, object_name, callback in buttons:
+        for text, object_name, callback, lock_row in buttons:
             button = QPushButton(text, frame)
             button.setObjectName(object_name)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.setAutoDefault(False)
-            button.clicked.connect(callback)
+            button.clicked.connect(
+                lambda _checked=False, cb=callback, row=frame, lock=lock_row: (
+                    self._run_row_action(row, cb, lock)
+                )
+            )
             layout.addWidget(button)
         return frame
+
+    @staticmethod
+    def _run_row_action(
+        frame: QFrame,
+        callback: Callable[[], None],
+        lock_row: bool,
+    ) -> None:
+        """执行行内操作。
+
+        接受、拒绝、删除这类操作重复提交没有意义：第二次请求会得到
+        “已经处理过”的错误提示，白白在界面上弹一条红字。所以点过之后
+        就把这一行的按钮锁住，等列表刷新后重建。
+        """
+        if lock_row:
+            for button in frame.findChildren(QPushButton):
+                button.setEnabled(False)
+        callback()
 
     # ------------------------------------------------------------------
     def set_data(self, data: Mapping) -> None:
@@ -333,6 +380,7 @@ class FriendsWindow(PaperDialog):
                                 lambda _=False, rid=request_id: (
                                     self.accept_requested.emit(rid)
                                 ),
+                                True,
                             ),
                             (
                                 "拒绝",
@@ -340,6 +388,7 @@ class FriendsWindow(PaperDialog):
                                 lambda _=False, rid=request_id: (
                                     self.decline_requested.emit(rid)
                                 ),
+                                True,
                             ),
                         ),
                     )
@@ -371,7 +420,7 @@ class FriendsWindow(PaperDialog):
                 except (TypeError, ValueError):
                     unread_count = 0
                 buttons: list[
-                    tuple[str, str, Callable[[], None]]
+                    tuple[str, str, Callable[[], None], bool]
                 ] = [
                     (
                         "邀请对局",
@@ -381,6 +430,7 @@ class FriendsWindow(PaperDialog):
                             if is_online
                             else None
                         ),
+                        False,
                     ),
                     (
                         "聊天",
@@ -388,6 +438,7 @@ class FriendsWindow(PaperDialog):
                         lambda _=False, uid=user_id, name=username: (
                             self.chat_requested.emit(uid, name)
                         ),
+                        False,
                     ),
                     (
                         "资料",
@@ -395,6 +446,7 @@ class FriendsWindow(PaperDialog):
                         lambda _=False, uid=user_id: (
                             self.profile_requested.emit(uid)
                         ),
+                        False,
                     ),
                     (
                         "删除",
@@ -402,6 +454,7 @@ class FriendsWindow(PaperDialog):
                         lambda _=False, uid=user_id: (
                             self.remove_requested.emit(uid)
                         ),
+                        True,
                     ),
                 ]
                 row = self._row(
@@ -447,6 +500,7 @@ class FriendsWindow(PaperDialog):
                             lambda _=False, uid=user_id: (
                                 self.add_requested.emit(uid)
                             ),
+                            True,
                         ),
                         (
                             "资料",
@@ -454,6 +508,7 @@ class FriendsWindow(PaperDialog):
                             lambda _=False, uid=user_id: (
                                 self.profile_requested.emit(uid)
                             ),
+                            False,
                         ),
                     ),
                 )
@@ -470,4 +525,4 @@ class FriendsWindow(PaperDialog):
         self._set_section_visible("搜索结果", False)
 
 
-__all__ = ["FriendsWindow"]
+__all__ = ["FriendsPanel"]

@@ -113,6 +113,21 @@ def _apply_additive_schema(connection) -> None:
             )
             logger.info("数据库迁移：users.rating 索引已创建")
 
+    if "direct_messages" in table_names:
+        inspector = inspect(connection)
+        index_names = {
+            index["name"]
+            for index in inspector.get_indexes("direct_messages")
+        }
+        if "ix_direct_messages_unread" not in index_names:
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_direct_messages_unread "
+                    "ON direct_messages (recipient_id, read_at, sender_id)"
+                )
+            )
+            logger.info("数据库迁移：direct_messages 未读计数索引已创建")
+
 
 async def create_tables(engine: AsyncEngine) -> None:
     # 延迟导入，避免 Base 与模型模块的循环导入。

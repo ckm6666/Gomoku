@@ -254,6 +254,14 @@ class DirectMessage(Base):
             "recipient_id",
             "created_at",
         ),
+        # 未读计数按 (recipient_id, read_at) 过滤并按 sender_id 分组；
+        # 没有这条索引时，每次刷新好友列表都要扫全表。
+        Index(
+            "ix_direct_messages_unread",
+            "recipient_id",
+            "read_at",
+            "sender_id",
+        ),
     )
 
 

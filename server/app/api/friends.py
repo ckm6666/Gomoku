@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from sqlalchemy import func, or_, select
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gomoku.shared.social import (
@@ -175,7 +176,14 @@ async def create_friend_request(
         updated_at=utcnow_naive(),
     )
     session.add(friendship)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        # 并发双击“加好友”会撞上 uq_friendships_pair 唯一约束。
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="好友申请已发送"
+        ) from exc
     await session.refresh(friendship)
 
     await push_friend_event(
@@ -222,13 +230,31 @@ async def accept_friend_request(
     friendship = await _load_pending_addressed(
         session, request_id, current_user
     )
-    friendship.status = "accepted"
-    friendship.updated_at = utcnow_naive()
-    await session.commit()
 
+    # 先取申请人再落库：否则“提交后才 404”会让客户端以为失败，好友
+    # 关系却已经生效，双方状态对不上。
     requester = await session.get(User, friendship.requested_by)
     if requester is None:
         raise HTTPException(status_code=404, detail="申请用户不存在")
+
+    # 条件更新：只有仍处于 pending 的那一行会被改写。与“拒绝”并发时，
+    # 两个请求里只有一个能改到这行，另一个拿到干净的 404，而不会把已经
+    # 建立的好友关系悄悄删掉。
+    result = await session.execute(
+        update(Friendship)
+        .where(
+            Friendship.id == request_id,
+            Friendship.status == "pending",
+        )
+        .values(status="accepted", updated_at=utcnow_naive())
+    )
+    if result.rowcount == 0:
+        await session.rollback()
+        raise HTTPException(
+            status_code=404, detail="好友申请不存在或已处理"
+        )
+    await session.commit()
+
     await push_friend_event(
         request, requester.id, FRIEND_EVENT_ACCEPTED, current_user
     )
@@ -256,7 +282,20 @@ async def decline_friend_request(
         session, request_id, current_user
     )
     requester_id = friendship.requested_by
-    await session.delete(friendship)
+
+    # 与“接受”一样用条件删除：只有仍处于 pending 的行才会被删掉。
+    # 并发接受时删不到行，返回 404，而不是把已建立的好友关系抹掉。
+    result = await session.execute(
+        delete(Friendship).where(
+            Friendship.id == request_id,
+            Friendship.status == "pending",
+        )
+    )
+    if result.rowcount == 0:
+        await session.rollback()
+        raise HTTPException(
+            status_code=404, detail="好友申请不存在或已处理"
+        )
     await session.commit()
 
     requester = await session.get(User, requester_id)
@@ -279,7 +318,16 @@ async def remove_friend(
     if friendship is None or friendship.status != "accepted":
         raise HTTPException(status_code=404, detail="好友关系不存在")
 
-    await session.delete(friendship)
+    # 条件删除：并发“接受申请”时删不到行，不会把刚建立的关系抹掉。
+    result = await session.execute(
+        delete(Friendship).where(
+            Friendship.id == friendship.id,
+            Friendship.status == "accepted",
+        )
+    )
+    if result.rowcount == 0:
+        await session.rollback()
+        raise HTTPException(status_code=404, detail="好友关系不存在")
     await session.commit()
 
     other = await session.get(User, user_id)

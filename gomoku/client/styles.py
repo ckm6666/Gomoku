@@ -1069,8 +1069,8 @@ QMenu#chatMenu::item:selected {
     background-color: #F1E4CC;
 }
 
-/* 个人信息 / 好友 / 头像选择 */
-QDialog#paperDialog {
+/* 个人信息 / 好友 / 头像选择：窗口内浮层，不是原生对话框 */
+QWidget#paperPanel {
     background: transparent;
 }
 
