@@ -1433,4 +1433,50 @@ QLineEdit#chatMessageInput {
 QLineEdit#chatMessageInput:focus {
     border-color: #B8934E;
 }
+
+/* ------------------------------ 沙盘推演 ------------------------------ */
+QWidget#sandboxPanel {
+    background-color: #F5EFE3;
+    border: 1px solid #B8934E;
+    border-radius: 8px;
+}
+
+QLabel#sandboxTitle {
+    color: #26221C;
+    font-size: 15px;
+    font-weight: bold;
+}
+
+QLabel#sandboxStatus {
+    color: #756C5E;
+    font-size: 12px;
+}
+
+QPushButton#sandboxSideButton {
+    color: #4C463C;
+    background-color: #F3EADA;
+    border: 1px solid #C9B99F;
+    border-radius: 5px;
+    padding: 6px 12px;
+}
+
+QPushButton#sandboxSideButton:checked {
+    color: #FBF7EE;
+    background-color: #9E3B2E;
+    border-color: #7E2C22;
+}
+
+QPushButton#sandboxControlButton {
+    color: #5A4A38;
+    background-color: #F3EADA;
+    border: 1px solid #C9B99F;
+    border-radius: 5px;
+    padding: 6px 12px;
+}
+
+QPushButton#sandboxControlButton:disabled {
+    color: #B3A898;
+    background-color: #EEE8DF;
+    border-color: #DCD0BC;
+}
 """
