@@ -13,6 +13,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
     QPushButton,
@@ -211,6 +213,39 @@ class PrivateChatPanelTests(unittest.TestCase):
         self.assertEqual(sent, ["晚上来一局？"])
         self.assertEqual(window.input.text(), "")
         window.close()
+
+    def test_close_button_hides_the_chat_window(self) -> None:
+        """私聊浮层没有系统标题栏，必须自己提供关闭入口。"""
+        window = PrivateChatPanel("u2", "好友", "lan")
+        window.show()
+        self.assertTrue(window.isVisible())
+        closed: list[bool] = []
+        window.closed.connect(lambda: closed.append(True))
+        window.close_button.click()
+        self.assertFalse(window.isVisible())
+        self.assertEqual(closed, [True])
+
+    def test_escape_closes_the_chat_window(self) -> None:
+        """焦点在输入框里时，Esc 也要能关掉聊天窗。"""
+        window = PrivateChatPanel("u2", "好友", "lan")
+        window.show()
+        window.input.setFocus()
+        QTest.keyClick(window.input, Qt.Key.Key_Escape)
+        self.assertFalse(window.isVisible())
+
+    def test_closed_chat_window_can_be_reopened(self) -> None:
+        """关掉之后重新点“聊天”，窗口要能再回来。"""
+        panel = OnlinePanel()
+        panel._open_private_chat("u2", "好友")
+        window = panel._chat_panels["u2"]
+        # 宿主联机页没有显示，isVisible() 恒为假，只能看显式隐藏标记。
+        self.assertFalse(window.isHidden())
+        window.close()
+        self.assertTrue(window.isHidden())
+        panel._open_private_chat("u2", "好友")
+        self.assertFalse(window.isHidden())
+        self.assertIs(panel._chat_panels["u2"], window)
+        panel.close()
 
 
 class OnlinePanelSocialTests(unittest.TestCase):

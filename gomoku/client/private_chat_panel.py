@@ -6,7 +6,7 @@ import html
 from datetime import datetime
 from typing import Mapping, Optional, Sequence
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -44,6 +44,9 @@ class PrivateChatPanel(PaperPanel):
         self.friend_id = friend_id
         self._seen_ids: set[str] = set()
         self._last_sent = ""
+        # 私聊浮层不是原生窗口，没有系统标题栏上的关闭按钮；面板自己
+        # 必须能被关闭，因此显式接受键盘焦点，Esc 才有地方可去。
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         header = QHBoxLayout()
         header.setSpacing(12)
@@ -90,10 +93,28 @@ class PrivateChatPanel(PaperPanel):
         )
         self.status_label.setObjectName("socialStatus")
         self.status_label.setWordWrap(True)
-        self.content.addWidget(self.status_label)
+
+        # 关闭按钮：私聊是浮在联机页面上的子控件，没有系统标题栏，
+        # 不给一个明确的关闭入口，用户就只能看着这个窗口干瞪眼。
+        self.close_button = QPushButton("关闭", self.card)
+        self.close_button.setObjectName("socialSecondaryButton")
+        self.close_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.close_button.setAutoDefault(False)
+        self.close_button.setToolTip("关闭聊天窗口（Esc）")
+        self.close_button.clicked.connect(self.close)
+
+        footer = QHBoxLayout()
+        footer.setSpacing(10)
+        footer.addWidget(self.status_label, 1)
+        footer.addWidget(
+            self.close_button, 0, Qt.AlignmentFlag.AlignBottom
+        )
+        self.content.addLayout(footer)
 
         self.send_button.clicked.connect(self._on_send)
         self.input.returnPressed.connect(self._on_send)
+        # 输入框吃掉焦点时 Esc 不会冒泡到面板，这里单独拦一道。
+        self.input.installEventFilter(self)
 
     def set_friend(
         self,
@@ -220,6 +241,28 @@ class PrivateChatPanel(PaperPanel):
     def _scroll_to_bottom(self) -> None:
         bar = self.messages_view.verticalScrollBar()
         bar.setValue(bar.maximum())
+
+    # ------------------------------------------------------------------
+    # 关闭
+    # ------------------------------------------------------------------
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt 接口
+        """输入框里按 Esc 直接关窗。"""
+        if (
+            obj is self.input
+            and event.type() == QEvent.Type.KeyPress
+            and event.key() == Qt.Key.Key_Escape
+        ):
+            self.close()
+            return True
+        return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        """Esc 关闭聊天窗。"""
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _on_send(self) -> None:
         text = self.input.text().strip()

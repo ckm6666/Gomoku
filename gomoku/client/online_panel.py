@@ -1451,11 +1451,18 @@ class OnlinePanel(InkBackdrop):
     ) -> None:
         if not user_id:
             return
+        resolved_name, avatar = self._username_avatar(user_id, username)
         existing = self._chat_panels.get(user_id)
         if existing is not None:
+            # 聊天窗可以被关闭，重新点“聊天”时把旧窗拉回来：刷新一下
+            # 好友资料，再补拉一次历史（关闭期间对方可能发过消息）。
+            existing.set_friend(resolved_name, avatar)
             existing.show()
+            if self._auth_session is not None:
+                self._social_client.fetch_messages(
+                    self._auth_session.access_token, user_id, limit=200
+                )
             return
-        resolved_name, avatar = self._username_avatar(user_id, username)
         window = PrivateChatPanel(
             user_id, resolved_name, avatar, self
         )
