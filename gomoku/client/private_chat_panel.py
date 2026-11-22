@@ -33,6 +33,7 @@ class PrivateChatPanel(PaperPanel):
         username: str,
         avatar: str = "",
         parent: Optional[QWidget] = None,
+        avatar_version: int = 0,
     ) -> None:
         super().__init__(
             parent,
@@ -48,7 +49,11 @@ class PrivateChatPanel(PaperPanel):
         header = QHBoxLayout()
         header.setSpacing(12)
         self.avatar_view = AvatarView(
-            avatar, friend_id, 44, self.card
+            avatar,
+            friend_id,
+            44,
+            self.card,
+            avatar_version=max(0, int(avatar_version)),
         )
         identity = QVBoxLayout()
         identity.setSpacing(1)
@@ -100,9 +105,12 @@ class PrivateChatPanel(PaperPanel):
         username: str,
         avatar: str = "",
         online: Optional[bool] = None,
+        avatar_version: int = 0,
     ) -> None:
         self.name_label.setText(username)
-        self.avatar_view.set_avatar(avatar, self.friend_id)
+        self.avatar_view.set_avatar(
+            avatar, self.friend_id, max(0, int(avatar_version))
+        )
         if online is None:
             self.online_label.setText("")
         else:

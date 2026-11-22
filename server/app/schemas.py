@@ -13,7 +13,14 @@ from pydantic import (
     field_validator,
 )
 
-from gomoku.shared.avatar import DEFAULT_AVATAR
+from gomoku.shared.achievements import (
+    AchievementStats,
+    unlocked_achievement_keys,
+)
+from gomoku.shared.avatar import (
+    AVATAR_IMAGE_MAX_BYTES,
+    DEFAULT_AVATAR,
+)
 from server.app.ratings import (
     START_RATING,
     rank_for_rating,
@@ -60,6 +67,13 @@ class UserResponse(BaseModel):
     id: str
     username: str
     avatar: str = DEFAULT_AVATAR
+    # 对外只暴露“有自定义图片时才有效”的版本号；模型上的
+    # public_avatar_version 属性会把没有图片的情况归一为 0。
+    avatar_version: int = Field(
+        default=0,
+        validation_alias="public_avatar_version",
+        serialization_alias="avatar_version",
+    )
     created_at: datetime
     rating: int = START_RATING
     peak_rating: int = START_RATING
@@ -67,6 +81,8 @@ class UserResponse(BaseModel):
     wins: int = 0
     losses: int = 0
     draws: int = 0
+    current_win_streak: int = 0
+    best_win_streak: int = 0
 
     @computed_field
     @property
@@ -95,6 +111,20 @@ class UserResponse(BaseModel):
             return 0.0
         return round(self.wins * 100.0 / self.rated_games, 1)
 
+    @computed_field
+    @property
+    def achievements(self) -> list[str]:
+        """当前已解锁的成就 key（按成就目录顺序）。"""
+        stats = AchievementStats(
+            wins=self.wins,
+            rated_games=self.rated_games,
+            current_streak=self.current_win_streak,
+            best_streak=self.best_win_streak,
+            rating=self.rating,
+            peak_rating=self.peak_rating,
+        )
+        return list(unlocked_achievement_keys(stats))
+
 
 class AuthResponse(BaseModel):
     access_token: str
@@ -109,6 +139,7 @@ class LeaderboardEntry(BaseModel):
     user_id: str
     username: str
     avatar: str = DEFAULT_AVATAR
+    avatar_version: int = 0
     rating: int
     rank_name: str
     rated_games: int
@@ -166,6 +197,19 @@ class AvatarUpdateRequest(BaseModel):
     avatar: Annotated[str, Field(min_length=1, max_length=16)]
 
 
+class AvatarImageRequest(BaseModel):
+    """上传自定义头像；image 为 ``data:image/jpeg;base64,...``。"""
+
+    image: Annotated[
+        str,
+        Field(
+            min_length=32,
+            # 留出 base64 与 data URL 前缀的余量。
+            max_length=AVATAR_IMAGE_MAX_BYTES * 2,
+        ),
+    ]
+
+
 class PublicProfileResponse(BaseModel):
     user: UserResponse
     online: bool = False
@@ -176,6 +220,7 @@ class UserSearchEntry(BaseModel):
     id: str
     username: str
     avatar: str = DEFAULT_AVATAR
+    avatar_version: int = 0
     rating: int = START_RATING
     rank_name: str
     online: bool = False
@@ -190,6 +235,7 @@ class FriendEntry(BaseModel):
     user_id: str
     username: str
     avatar: str = DEFAULT_AVATAR
+    avatar_version: int = 0
     rating: int = START_RATING
     rank_name: str
     online: bool = False
@@ -201,6 +247,7 @@ class FriendRequestEntry(BaseModel):
     user_id: str
     username: str
     avatar: str = DEFAULT_AVATAR
+    avatar_version: int = 0
     rating: int = START_RATING
     rank_name: str
     created_at: datetime
@@ -221,6 +268,7 @@ class DirectMessageEntry(BaseModel):
     sender_id: str
     sender_name: str
     sender_avatar: str = DEFAULT_AVATAR
+    sender_avatar_version: int = 0
     recipient_id: str
     content: str
     created_at: datetime
@@ -270,6 +318,7 @@ __all__ = [
     "RecentGamesResponse",
     "GameDetailResponse",
     "AvatarUpdateRequest",
+    "AvatarImageRequest",
     "PublicProfileResponse",
     "UserSearchEntry",
     "UserSearchResponse",

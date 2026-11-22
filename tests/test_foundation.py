@@ -195,6 +195,16 @@ class ProtocolTests(unittest.TestCase):
                 "opponent_rating_before": 1230,
                 "opponent_rating_after": 1242,
                 "rating_delta": -12,
+                "black_avatar_version": 3,
+                "white_avatar_version": 2,
+                "black_achievements": [
+                    "rank_gold",
+                    "first_win",
+                    "unknown_key",
+                    "rank_gold",
+                ],
+                "white_achievements": ["streak_3"],
+                "your_new_achievements": ["streak_3", "nope"],
             }
         )
         self.assertTrue(snapshot.rated)
@@ -202,6 +212,15 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(snapshot.your_rating_before, 1190)
         self.assertEqual(snapshot.your_rating_after, 1178)
         self.assertEqual(snapshot.rating_delta, -12)
+        self.assertEqual(snapshot.black_avatar_version, 3)
+        self.assertEqual(snapshot.white_avatar_version, 2)
+        self.assertEqual(
+            snapshot.black_achievements, ("first_win", "rank_gold")
+        )
+        self.assertEqual(snapshot.white_achievements, ("streak_3",))
+        self.assertEqual(
+            snapshot.your_new_achievements, ("streak_3",)
+        )
 
     def test_rated_game_state_rejects_bad_fields(self) -> None:
         payload = {

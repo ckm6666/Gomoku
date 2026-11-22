@@ -7,6 +7,7 @@ from typing import Mapping, Optional
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -16,8 +17,21 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gomoku.client.achievement_widgets import achievement_pixmap
+from gomoku.client.avatar_images import (
+    AvatarImageError,
+    prepare_avatar_image,
+)
 from gomoku.client.avatar_widgets import AvatarView, avatar_pixmap
 from gomoku.client.paper_panel import InkDivider, PaperPanel
+from gomoku.shared.achievements import (
+    ACHIEVEMENT_BY_KEY,
+    ACHIEVEMENT_TOTAL,
+    normalize_achievement_keys,
+    stats_from_mapping,
+    top_achievement_keys,
+    unlocked_achievement_keys,
+)
 from gomoku.shared.avatar import (
     AVATAR_BY_KEY,
     AVATARS,
@@ -29,11 +43,14 @@ class AvatarPickerPanel(PaperPanel):
     """预置头像选择器。"""
 
     avatar_selected = Signal(str)
+    image_selected = Signal(str)
 
     def __init__(
         self,
         current: str = "",
         parent: Optional[QWidget] = None,
+        *,
+        current_version: int = 0,
     ) -> None:
         super().__init__(
             parent,
@@ -47,12 +64,31 @@ class AvatarPickerPanel(PaperPanel):
         title = QLabel("选择你的头像", self.card)
         title.setObjectName("socialPageTitle")
         subtitle = QLabel(
-            "十二枚古典印章，择一枚作为你的标记", self.card
+            "十二枚古典印章，择一枚作为你的标记；"
+            "也可以上传一张本地图片（自动裁成方形）",
+            self.card,
         )
         subtitle.setObjectName("socialSubtitle")
         subtitle.setWordWrap(True)
         self.content.addWidget(title)
         self.content.addWidget(subtitle)
+        self.content.addWidget(InkDivider(self.card))
+
+        self.upload_button = QPushButton("上传本地图片", self.card)
+        self.upload_button.setObjectName("socialPrimaryButton")
+        self.upload_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.upload_button.setAutoDefault(False)
+        self.upload_button.clicked.connect(self._pick_image)
+        self.content.addWidget(self.upload_button)
+
+        self.upload_hint = QLabel(
+            "支持 JPEG/PNG，图片会被裁成 192×192 的圆形头像",
+            self.card,
+        )
+        self.upload_hint.setObjectName("avatarPickerHint")
+        self.upload_hint.setWordWrap(True)
+        self.upload_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.content.addWidget(self.upload_hint)
         self.content.addWidget(InkDivider(self.card))
 
         grid = QGridLayout()
@@ -84,8 +120,16 @@ class AvatarPickerPanel(PaperPanel):
             grid.addWidget(button, index // 4, index % 4)
         self.content.addLayout(grid)
 
+        has_custom_image = (
+            isinstance(current_version, int)
+            and not isinstance(current_version, bool)
+            and current_version > 0
+        )
         current_label = QLabel(
-            f"当前头像：{AVATAR_BY_KEY[current_key].label}", self.card
+            "当前头像：自定义图片（选择印章会移除）"
+            if has_custom_image
+            else f"当前头像：{AVATAR_BY_KEY[current_key].label}",
+            self.card,
         )
         current_label.setObjectName("avatarPickerHint")
         current_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -100,6 +144,23 @@ class AvatarPickerPanel(PaperPanel):
             cancel_button, 0, Qt.AlignmentFlag.AlignRight
         )
 
+    def _pick_image(self) -> None:
+        path, _selected = QFileDialog.getOpenFileName(
+            self,
+            "选择头像图片",
+            "",
+            "图片文件 (*.png *.jpg *.jpeg *.bmp *.webp)",
+        )
+        if not path:
+            return
+        try:
+            data_url = prepare_avatar_image(path)
+        except AvatarImageError as exc:
+            self.upload_hint.setText(str(exc))
+            return
+        self.image_selected.emit(data_url)
+        self.accept()
+
     def _choose(self, key: str) -> None:
         self.avatar_selected.emit(key)
         self.accept()
@@ -113,6 +174,7 @@ class ProfilePanel(PaperPanel):
     remove_friend_requested = Signal(str)
     avatar_requested = Signal()
     open_friends_requested = Signal()
+    achievements_requested = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(
@@ -205,6 +267,42 @@ class ProfilePanel(PaperPanel):
             self._stat_values[key] = value
         self.content.addLayout(stats)
 
+        # 成就勋章：只展示最稀有的几枚，完整成就墙由“全部成就”打开。
+        achievement_row = QHBoxLayout()
+        achievement_title = QLabel("成就勋章", self.card)
+        achievement_title.setObjectName("socialSectionTitle")
+        self.achievement_count_label = QLabel(
+            f"0 / {ACHIEVEMENT_TOTAL}", self.card
+        )
+        self.achievement_count_label.setObjectName(
+            "socialSectionCount"
+        )
+        self.achievements_button = QPushButton("全部成就", self.card)
+        self.achievements_button.setObjectName("socialSecondaryButton")
+        self.achievements_button.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.achievements_button.setAutoDefault(False)
+        self.achievements_button.clicked.connect(
+            self.achievements_requested.emit
+        )
+        achievement_row.addWidget(achievement_title)
+        achievement_row.addWidget(self.achievement_count_label)
+        achievement_row.addStretch(1)
+        achievement_row.addWidget(self.achievements_button)
+        self.content.addLayout(achievement_row)
+
+        self.medal_container = QWidget(self.card)
+        self.medal_layout = QHBoxLayout(self.medal_container)
+        self.medal_layout.setContentsMargins(0, 0, 0, 0)
+        self.medal_layout.setSpacing(7)
+        self.content.addWidget(self.medal_container)
+
+        self.achievement_hint_label = QLabel("", self.card)
+        self.achievement_hint_label.setObjectName("socialSubtitle")
+        self.achievement_hint_label.setWordWrap(True)
+        self.content.addWidget(self.achievement_hint_label)
+
         self.footer_hint = QLabel("", self.card)
         self.footer_hint.setObjectName("socialSubtitle")
         self.footer_hint.setWordWrap(True)
@@ -238,8 +336,15 @@ class ProfilePanel(PaperPanel):
         user_id = str(self._user.get("id", ""))
         username = str(self._user.get("username", "玩家"))
         avatar = self._user.get("avatar", "")
+        avatar_version = self._user.get("avatar_version", 0)
+        if not isinstance(avatar_version, int) or isinstance(
+            avatar_version, bool
+        ):
+            avatar_version = 0
         online = bool(profile.get("online"))
-        self.avatar_view.set_avatar(avatar, user_id)
+        self.avatar_view.set_avatar(
+            avatar, user_id, max(0, avatar_version)
+        )
         self.avatar_view.set_online(online)
         self.name_label.setText(username)
         self.online_label.setText("● 在线" if online else "○ 离线")
@@ -273,12 +378,64 @@ class ProfilePanel(PaperPanel):
         self._stat_values["created"].setText(
             created[:10] if created else "—"
         )
+        self._update_achievements()
         self.footer_hint.setText(self._footer_text())
         self._rebuild_actions()
 
+    def _update_achievements(self) -> None:
+        """刷新勋章行与成就计数。"""
+        stats = stats_from_mapping(self._user)
+        raw_keys = self._user.get("achievements")
+        if isinstance(raw_keys, (list, tuple)):
+            keys = normalize_achievement_keys(raw_keys)
+        else:
+            keys = unlocked_achievement_keys(stats)
+        self.achievement_count_label.setText(
+            f"{len(keys)} / {ACHIEVEMENT_TOTAL}"
+        )
+        self.achievement_hint_label.setText(
+            f"当前连胜 {stats.current_streak} · "
+            f"最高连胜 {stats.best_streak} · "
+            f"排位 {stats.wins} 胜"
+        )
+
+        while self.medal_layout.count():
+            item = self.medal_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+
+        top_keys = top_achievement_keys(keys, 6)
+        for key in top_keys:
+            spec = ACHIEVEMENT_BY_KEY.get(key)
+            if spec is None:
+                continue
+            label = QLabel(self.medal_container)
+            label.setPixmap(
+                achievement_pixmap(
+                    spec, 32, self.devicePixelRatioF()
+                )
+            )
+            label.setFixedSize(32, 32)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setToolTip(f"{spec.name} · {spec.description}")
+            self.medal_layout.addWidget(label)
+        if not top_keys:
+            empty = QLabel(
+                "完成排位对局即可点亮第一枚勋章",
+                self.medal_container,
+            )
+            empty.setObjectName("socialSubtitle")
+            self.medal_layout.addWidget(empty)
+        self.medal_layout.addStretch(1)
+
     def _footer_text(self) -> str:
         if self._is_self:
-            return "点击“更换头像”可挑选新的印章。"
+            return (
+                "点击“更换头像”可挑选印章或上传本地图片；"
+                "排位赛的战绩会点亮成就勋章。"
+            )
         if self._friendship == "friends":
             return "你们已是好友，可以私聊或邀请一局自建房对弈。"
         if self._friendship == "pending_out":
@@ -287,10 +444,14 @@ class ProfilePanel(PaperPanel):
             return "对方已向你发送好友申请，可在好友窗口处理。"
         return "加为好友后即可私聊与邀请对局。"
 
-    def set_avatar(self, avatar: str) -> None:
+    def set_avatar(self, avatar: str, avatar_version: int = 0) -> None:
         self.avatar_view.set_avatar(
-            avatar, str(self._user.get("id", ""))
+            avatar,
+            str(self._user.get("id", "")),
+            max(0, int(avatar_version)),
         )
+        self._user["avatar"] = avatar
+        self._user["avatar_version"] = max(0, int(avatar_version))
 
     # ------------------------------------------------------------------
     def _clear_actions(self) -> None:

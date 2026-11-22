@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
+from gomoku.shared.achievements import normalize_achievement_keys
 from gomoku.shared.avatar import normalize_avatar
 from gomoku.shared.errors import ProtocolError
 from gomoku.shared.rules import BOARD_SIZE, Cell, Move, Player
@@ -140,6 +141,13 @@ class GameSnapshot:
     white_user_id: str = ""
     black_avatar: str = ""
     white_avatar: str = ""
+    black_avatar_version: int = 0
+    white_avatar_version: int = 0
+    # 双方已解锁成就 key；对局卡片只展示其中最稀有的几枚。
+    black_achievements: tuple[str, ...] = ()
+    white_achievements: tuple[str, ...] = ()
+    # 本局结算后当前玩家新解锁的成就（仅终局快照携带）。
+    your_new_achievements: tuple[str, ...] = ()
     turn_deadline_ms: int | None = None
     server_now_ms: int | None = None
     move_timeout_seconds: int | None = None
@@ -323,6 +331,18 @@ def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
     ):
         raise ProtocolError("rating_delta 必须是整数或 null")
 
+    black_avatar_version = optional_int("black_avatar_version") or 0
+    white_avatar_version = optional_int("white_avatar_version") or 0
+    black_achievements = normalize_achievement_keys(
+        payload.get("black_achievements", ())
+    )
+    white_achievements = normalize_achievement_keys(
+        payload.get("white_achievements", ())
+    )
+    your_new_achievements = normalize_achievement_keys(
+        payload.get("your_new_achievements", ())
+    )
+
     return GameSnapshot(
         game_id=game_id,
         board=board,
@@ -341,6 +361,11 @@ def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
         white_user_id=white_user_id,
         black_avatar=black_avatar,
         white_avatar=white_avatar,
+        black_avatar_version=black_avatar_version,
+        white_avatar_version=white_avatar_version,
+        black_achievements=black_achievements,
+        white_achievements=white_achievements,
+        your_new_achievements=your_new_achievements,
         turn_deadline_ms=optional_int("turn_deadline_ms"),
         server_now_ms=optional_int("server_now_ms"),
         move_timeout_seconds=optional_int("move_timeout_seconds"),

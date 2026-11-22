@@ -67,6 +67,25 @@ class SocialHTTPClient(QObject):
             {"avatar": avatar},
         )
 
+    def update_avatar_image(
+        self, access_token: str, image_data_url: str
+    ) -> bool:
+        return self._start(
+            "avatar",
+            "PUT",
+            "/api/v1/users/me/avatar-image",
+            access_token,
+            {"image": image_data_url},
+        )
+
+    def delete_avatar_image(self, access_token: str) -> bool:
+        return self._start(
+            "avatar",
+            "DELETE",
+            "/api/v1/users/me/avatar-image",
+            access_token,
+        )
+
     def search_users(self, access_token: str, query: str) -> bool:
         return self._start(
             "search",
@@ -198,9 +217,9 @@ class SocialHTTPClient(QObject):
             reply = self._manager.get(request)
         elif method == "POST":
             reply = self._manager.post(request, data)
-        elif method == "PATCH":
+        elif method in ("PATCH", "PUT"):
             reply = self._manager.sendCustomRequest(
-                request, b"PATCH", data
+                request, method.encode("ascii"), data
             )
         elif method == "DELETE":
             reply = self._manager.deleteResource(request)

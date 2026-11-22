@@ -4,7 +4,8 @@ FastAPI + WebSocket + SQLAlchemy 的联机服务端，提供：
 
 - 用户名 + 密码账号注册、登录、refresh token 轮换、登出；
 - 公开排位快速匹配队列（按积分接近配对、随机黑白）；
-- 预置头像、公开资料与用户搜索；
+- 预置头像与自定义图片头像（JPEG/PNG 校验、体积/尺寸限制、按版本长缓存）、公开资料与用户搜索；
+- 排位成就：胜场/连胜/段位成就由账号统计推导，排位结算时更新连胜并在终局快照下发新解锁勋章；
 - 好友申请/同意/删除、好友在线状态推送与好友私聊（消息持久化、离线补收）；
 - 自建房邀请：房主创建房间后直接邀请在线好友，对方接受即开局，无需房间码；
 - 服务器权威落子、五连判定、每手倒计时；
@@ -14,7 +15,7 @@ FastAPI + WebSocket + SQLAlchemy 的联机服务端，提供：
 - 最近对局列表与单局完整棋谱（仅对局参与者可读）；
 - SQLite 开发默认 / PostgreSQL 生产 URL 兼容。
 
-当前版本对应客户端 **1.8.0**。已提供参与者棋谱读取；尚未实现赛季、Glicko-2、
+当前版本对应客户端 **1.9.0**。已提供参与者棋谱读取；尚未实现赛季、Glicko-2、
 邮箱验证、第三方登录、举报/处罚或 Redis 多实例路由。
 
 ## 目录
@@ -27,12 +28,14 @@ server/
 │   ├── db.py               # 异步引擎、建表、加列迁移、启动作废未完成对局
 │   ├── models.py           # users/friendships/direct_messages/games/moves/rating_events
 │   ├── ratings.py          # Elo 与段位纯函数
+│   ├── achievement_service.py  # 由账号统计推导成就
+│   ├── avatar_service.py   # 自定义头像 data URL 校验与解码
 │   ├── security.py         # Argon2id、JWT、refresh token
 │   ├── schemas.py          # 认证/资料/排行榜/好友/私聊 DTO
 │   ├── auth_service.py     # 令牌生成辅助
 │   ├── api/auth.py         # 注册/登录/刷新/登出/me
 │   ├── api/ranked.py       # /profile/me 与 /leaderboard
-│   ├── api/users.py        # /users/{id}、/users/search、头像更新
+│   ├── api/users.py        # /users/{id}、/users/search、头像更新/上传/读取
 │   ├── api/friends.py      # 好友申请/列表/同意/拒绝/删除
 │   ├── api/messages.py     # 好友私聊历史与发送
 │   ├── api/games.py        # /games/recent 与 /games/{id}
@@ -138,7 +141,10 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 | `GET /api/v1/auth/me` | 当前账号资料（含 avatar/rating/peak/rank_name/win_rate 等计算字段） |
 | `GET /api/v1/users/{user_id}` | 公开资料、在线状态与好友关系状态 |
 | `GET /api/v1/users/search?q=` | 按用户名搜索活跃账号（最多 20 条） |
-| `PATCH /api/v1/users/me/avatar` | 更新预置头像 |
+| `PATCH /api/v1/users/me/avatar` | 更新预置头像；同时移除自定义图片并把 `avatar_version` 归零 |
+| `PUT /api/v1/users/me/avatar-image` | 上传自定义头像（`{"image": "data:image/jpeg;base64,..."}`，仅 JPEG/PNG，解码后 ≤256KB、边长 ≤1024） |
+| `DELETE /api/v1/users/me/avatar-image` | 移除自定义头像，回落到预置印章 |
+| `GET /api/v1/users/{user_id}/avatar` | 公开读取自定义头像图片；`?v=<avatar_version>` 参与缓存键，可长缓存 |
 | `GET /api/v1/friends` | 好友列表、收到的申请、发出的申请与未读数 |
 | `POST /api/v1/friends/requests` | 发送好友申请（`{"user_id": ...}`） |
 | `POST /api/v1/friends/requests/{id}/accept` | 同意好友申请 |
@@ -150,7 +156,7 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 | `WS cancel_match` | 离开排位队列 |
 | `WS queue_status` | 服务端返回 queued/idle、队列人数、当前积分/段位 |
 | `WS match_found` | 匹配成功，返回 game_id、执子颜色、对手昵称和双方赛前积分 |
-| `WS game_state` | 权威快照新增 `rated`、`your_rating_before/after`、`opponent_rating_before/after`、`rating_delta`、双方 user_id 与头像 |
+| `WS game_state` | 权威快照新增 `rated`、`your_rating_before/after`、`opponent_rating_before/after`、`rating_delta`、双方 user_id/头像版本/已解锁成就，以及本人的 `your_new_achievements` |
 | `WS invite_to_room` | 房主邀请在线好友加入自建房 |
 | `WS respond_room_invite` | 被邀请者接受/拒绝邀请 |
 | `WS room_invitation` | 服务端推送给被邀请者的对局邀请 |
@@ -239,15 +245,17 @@ cd C:\Users\a1325\Desktop\Gomoku
 server\.venv\Scripts\python.exe -m unittest discover -s server/tests -v
 ```
 
-当前 **47 项**测试覆盖：
+当前 **58 项**测试覆盖：
 
-- 用户名 + 密码注册、登录、refresh 轮换/重放、登出、认证响应积分字段；
+- 用户名 + 密码注册、登录、refresh 轮换/重放、登出、认证响应积分/成就字段；
 - 双 WebSocket 建房/邀请/加入/落子/拒绝/认输/再战、服务器五连判定、断线重连；
 - 快速匹配、取消匹配、排位房、随机黑白、终局 Elo 结算、自建房不计分；
 - 排行榜、个人资料与最近战绩；
 - 最近对局/单局棋谱的参与者权限、分页、认输终局；
-- 头像更新与用户搜索、好友申请/同意/删除、在线状态推送、私聊历史与实时推送；
-- 自建房邀请接受/拒绝、非好友/离线好友拒绝，以及快照中的双方 user_id/头像；
+- 预置头像更新、自定义头像上传/读取/移除、非法格式/过大/超尺寸图片拒绝；
+- 用户搜索、好友申请/同意/删除、在线状态推送、私聊历史与实时推送；
+- 自建房邀请接受/拒绝、非好友/离线好友拒绝，以及快照中的双方 user_id/头像/勋章；
+- 排位首胜/连胜结算与新解锁成就快照；
 - Elo 期望分/K 值/段位边界/最低分保护。
 
 另做过本机真实 Uvicorn + 两个 WebSocket 客户端完整排位对局验证：两名 1200 分玩家

@@ -13,6 +13,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     UniqueConstraint,
     text,
 )
@@ -42,6 +43,34 @@ class User(Base):
         server_default=text(f"'{DEFAULT_AVATAR}'"),
         nullable=False,
     )
+    # 自定义头像：JPEG data URL（含 data:image/jpeg;base64, 前缀）。
+    # 体积上限由 shared.avatar 与接口层共同约束；为空时使用预置印章。
+    # 延迟加载：排行榜/好友列表每次会读取大量 User 行，头像图片不应该
+    # 跟着每一个账号查询被搬进内存；只有头像读取接口显式查询这一列。
+    avatar_image: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, default=None, deferred=True
+    )
+    # 是否存在自定义图片。``avatar_image`` 被延迟加载，排行榜/好友列表
+    # 只读这个布尔列即可判断是否需要向客户端下发头像版本。
+    has_avatar_image: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=text("false"),
+        nullable=False,
+    )
+    # 内部修订号：每次上传/移除自定义头像都会递增，保证图片 URL 的
+    # 版本号永不复用（避免清空后再上传时客户端命中旧缓存）。
+    # 对外只暴露 public_avatar_version：没有图片时恒为 0。
+    avatar_version: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+
+    @property
+    def public_avatar_version(self) -> int:
+        """对外可见的头像版本号；没有自定义图片时为 0。"""
+        if not self.has_avatar_image:
+            return 0
+        return max(0, self.avatar_version)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=utcnow_naive, nullable=False
@@ -71,6 +100,13 @@ class User(Base):
         Integer, default=0, server_default=text("0"), nullable=False
     )
     draws: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    # 连胜统计用于成就推导；只有排位对局会更新。
+    current_win_streak: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    best_win_streak: Mapped[int] = mapped_column(
         Integer, default=0, server_default=text("0"), nullable=False
     )
 
