@@ -18,6 +18,7 @@ class GameHistoryHTTPClient(QObject):
 
     recent_ready = Signal(object)  # {"entries": [...], "total": n}
     game_ready = Signal(object)  # {"game_id": ..., "moves": [...]}
+    live_ready = Signal(object)  # {"entries": [...], "total": n}
     failed = Signal(str)
     unauthorized = Signal()
     busy_changed = Signal(bool)
@@ -59,6 +60,10 @@ class GameHistoryHTTPClient(QObject):
             f"/api/v1/games/{quote(game_id, safe='')}",
             access_token,
         )
+
+    def fetch_live(self, access_token: str) -> bool:
+        """读取当前进行中的对局列表（观战入口）。"""
+        return self._start("live", "/api/v1/games/live", access_token)
 
     def abort_all(self) -> None:
         for kind in list(self._replies):
@@ -133,6 +138,8 @@ class GameHistoryHTTPClient(QObject):
                     return
                 if kind == "recent":
                     self.recent_ready.emit(dict(data))
+                elif kind == "live":
+                    self.live_ready.emit(dict(data))
                 else:
                     self.game_ready.emit(dict(data))
                 return

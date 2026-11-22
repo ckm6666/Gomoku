@@ -38,7 +38,7 @@ server/
 │   ├── api/users.py        # /users/{id}、/users/search、头像更新/上传/读取
 │   ├── api/friends.py      # 好友申请/列表/同意/拒绝/删除
 │   ├── api/messages.py     # 好友私聊历史与发送
-│   ├── api/games.py        # /games/recent 与 /games/{id}
+│   ├── api/games.py        # /games/recent、/games/live 与 /games/{id}
 │   └── ws/
 │       ├── endpoint.py     # WebSocket 首帧认证与命令分发
 │       └── rooms.py        # 自建房邀请、匹配队列、排位结算、时钟、重连、再战
@@ -138,6 +138,7 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 | `GET /api/v1/profile/me` | 当前账号积分资料 + 最近 10 场排位记录 |
 | `GET /api/v1/games/recent?limit=20&offset=0` | 当前账号参与过的已结束对局（排位 + 自建房），按结束时间倒序 |
 | `GET /api/v1/games/{game_id}` | 单局完整棋谱与落子序列；仅对局参与者可读，非参与者返回 404 |
+| `GET /api/v1/games/live` | 当前正在进行中的对局列表（观战入口）：双方昵称、模式、手数；不含已结束对局 |
 | `GET /api/v1/auth/me` | 当前账号资料（含 avatar/rating/peak/rank_name/win_rate 等计算字段） |
 | `GET /api/v1/users/{user_id}` | 公开资料、在线状态与好友关系状态 |
 | `GET /api/v1/users/search?q=` | 按用户名搜索活跃账号（最多 20 条） |
@@ -252,7 +253,7 @@ cd C:\Users\a1325\Desktop\Gomoku
 server\.venv\Scripts\python.exe -m unittest discover -s server/tests -v
 ```
 
-当前 **64 项**测试覆盖：
+当前 **76 项**测试覆盖：
 
 - 用户名 + 密码注册、登录、refresh 轮换/重放、登出、认证响应积分/成就字段；
 - 双 WebSocket 建房/邀请/加入/落子/拒绝/认输/再战、服务器五连判定、断线重连；
@@ -264,7 +265,12 @@ server\.venv\Scripts\python.exe -m unittest discover -s server/tests -v
 - 用户搜索、好友申请/同意/删除、在线状态推送、私聊历史与实时推送；
 - 自建房邀请接受/拒绝、非好友/离线好友拒绝，以及快照中的双方 user_id/头像/勋章；
 - 排位首胜/连胜结算与新解锁成就快照；
-- Elo 期望分/K 值/段位边界/最低分保护。
+- Elo 期望分/K 值/段位边界/最低分保护；
+- 观战（第三客户端旁观）：只读快照与实时更新、落子/认输/悔棋/再战/发言一律被拒、
+  玩家不能观战自己的对局、断线与退出观战不影响对局双方、断线重连补发快照、
+  `GET /games/live` 进行中对局列表，以及开局/终局时向空闲客户端推送 `live_games_changed`。
 
 另做过本机真实 Uvicorn + 两个 WebSocket 客户端完整排位对局验证：两名 1200 分玩家
 对局后变为 1220/1180，排行榜与最近战绩同步更新。
+另做过本机真实 Uvicorn + 三个 WebSocket 客户端的观战验证：两名玩家对局、
+第三方旁观，旁观者操作无效，旁观者退出或断线后玩家照常对局。

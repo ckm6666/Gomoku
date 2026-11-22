@@ -39,6 +39,8 @@ CLIENT_PING = "ping"
 CLIENT_CHAT = "chat"
 CLIENT_INVITE_TO_ROOM = "invite_to_room"
 CLIENT_RESPOND_ROOM_INVITE = "respond_room_invite"
+# 观战：旁观者以对局编号进入别人正在进行的一局，只接收权威快照。
+CLIENT_WATCH_GAME = "watch_game"
 
 # 服务端 → 客户端
 SERVER_AUTHENTICATED = "authenticated"
@@ -58,6 +60,8 @@ SERVER_ROOM_INVITATION = "room_invitation"
 SERVER_ROOM_INVITE_RESULT = "room_invite_result"
 SERVER_FRIEND_EVENT = "friend_event"
 SERVER_DIRECT_MESSAGE = "direct_message"
+# 进行中的对局列表发生变化（有人开局或终局），客户端据此刷新对战广场。
+SERVER_LIVE_GAMES_CHANGED = "live_games_changed"
 
 _ALLOWED_MESSAGE_TYPES = {
     CLIENT_AUTH,
@@ -75,6 +79,7 @@ _ALLOWED_MESSAGE_TYPES = {
     CLIENT_CHAT,
     CLIENT_INVITE_TO_ROOM,
     CLIENT_RESPOND_ROOM_INVITE,
+    CLIENT_WATCH_GAME,
     SERVER_AUTHENTICATED,
     SERVER_ROOM_CREATED,
     SERVER_GAME_STATE,
@@ -92,6 +97,7 @@ _ALLOWED_MESSAGE_TYPES = {
     SERVER_ROOM_INVITE_RESULT,
     SERVER_FRIEND_EVENT,
     SERVER_DIRECT_MESSAGE,
+    SERVER_LIVE_GAMES_CHANGED,
 }
 
 # 服务端 → 客户端的消息类型集合。
@@ -118,6 +124,7 @@ SERVER_MESSAGE_TYPES = frozenset(
         SERVER_ROOM_INVITE_RESULT,
         SERVER_FRIEND_EVENT,
         SERVER_DIRECT_MESSAGE,
+        SERVER_LIVE_GAMES_CHANGED,
     }
 )
 
@@ -139,7 +146,8 @@ class GameSnapshot:
     is_draw: bool
     is_game_over: bool
     move_no: int
-    your_color: Player
+    # 执子颜色。观战者没有棋子，服务器下发 None，并用 is_spectator 标记。
+    your_color: Optional[Player]
     # 服务端局面版本：悔棋会让 move_no 变小，客户端据此区分回滚与过期快照。
     state_version: int = 0
     # 终局原因：five/draw/resign/timeout/escape；对局中为空。
@@ -172,6 +180,8 @@ class GameSnapshot:
     opponent_rating_before: int | None = None
     opponent_rating_after: int | None = None
     rating_delta: int | None = None
+    # 观战标记：True 表示这条快照属于旁观者，没有执子颜色，也不能操作。
+    is_spectator: bool = False
 
 
 def _parse_player(value: Any, field: str) -> Player:
@@ -257,11 +267,22 @@ def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
         current_player = _parse_player(
             payload["current_player"], "current_player"
         )
-        your_color = _parse_player(payload["your_color"], "your_color")
         move_no = payload["move_no"]
         status = payload["status"]
     except KeyError as exc:
         raise ProtocolError(f"game_state 缺少字段：{exc.args[0]}") from exc
+
+    # 观战者没有执子颜色：只有 is_spectator 为真时才允许 your_color 缺省。
+    is_spectator = payload.get("is_spectator", False)
+    if not isinstance(is_spectator, bool):
+        raise ProtocolError("is_spectator 必须是布尔值")
+    raw_color = payload.get("your_color")
+    if raw_color is None:
+        if not is_spectator:
+            raise ProtocolError("your_color 必须是 'black' 或 'white'")
+        your_color = None
+    else:
+        your_color = _parse_player(raw_color, "your_color")
 
     if not isinstance(game_id, str) or not game_id.strip():
         raise ProtocolError("game_id 必须是非空字符串")
@@ -400,6 +421,7 @@ def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
         opponent_rating_before=optional_rating("opponent_rating_before"),
         opponent_rating_after=optional_rating("opponent_rating_after"),
         rating_delta=rating_delta,
+        is_spectator=is_spectator,
     )
 
 
@@ -481,6 +503,7 @@ __all__ = [
     "CLIENT_CHAT",
     "CLIENT_INVITE_TO_ROOM",
     "CLIENT_RESPOND_ROOM_INVITE",
+    "CLIENT_WATCH_GAME",
     "SERVER_AUTHENTICATED",
     "SERVER_ROOM_CREATED",
     "SERVER_GAME_STATE",
@@ -498,6 +521,7 @@ __all__ = [
     "SERVER_ROOM_INVITE_RESULT",
     "SERVER_FRIEND_EVENT",
     "SERVER_DIRECT_MESSAGE",
+    "SERVER_LIVE_GAMES_CHANGED",
     "SERVER_MESSAGE_TYPES",
     "GameSnapshot",
     "parse_game_state",

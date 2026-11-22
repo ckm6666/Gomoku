@@ -193,6 +193,24 @@ class RecentGamesResponse(BaseModel):
     total: int
 
 
+class LiveGameEntry(BaseModel):
+    """正在进行的对局摘要，供观战入口展示。"""
+
+    game_id: str
+    rated: bool
+    black_username: str
+    white_username: str
+    black_user_id: str
+    white_user_id: str
+    move_no: int
+    status: str
+
+
+class LiveGamesResponse(BaseModel):
+    entries: list[LiveGameEntry]
+    total: int
+
+
 class AvatarUpdateRequest(BaseModel):
     avatar: Annotated[str, Field(min_length=1, max_length=16)]
 

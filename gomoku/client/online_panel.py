@@ -92,6 +92,8 @@ logger = logging.getLogger(__name__)
 CHAT_INPUT_HINT = "说点什么…（回车发送）"
 #: 对话日志展开状态在 QSettings 里的键名。
 SETTINGS_CHAT_LOG_VISIBLE = "chat_log_visible"
+#: 观战列表最多展示的对局条数，避免大厅页面被拉得过长。
+MAX_LIVE_GAME_ROWS = 10
 
 _EMPTY_BOARD: tuple[tuple[Cell, ...], ...] = tuple(
     tuple(None for _ in range(BOARD_SIZE)) for _ in range(BOARD_SIZE)
@@ -116,6 +118,9 @@ def online_victory_notice(
 ) -> Optional[tuple[str, str]]:
     """对手认输或逃跑且己方获胜时，返回胜利弹窗的标题与正文。"""
     if snapshot is None or not snapshot.is_game_over:
+        return None
+    if snapshot.is_spectator:
+        # 观战者不是对局双方，不能收到“你获胜”的弹窗。
         return None
     if snapshot.winner is None or snapshot.winner is not snapshot.your_color:
         return None
@@ -368,6 +373,23 @@ class OnlinePanel(InkBackdrop):
         )
         self._recent_games_entries: list = []
 
+        # 观战列表单独用一个 HTTP 客户端：它的失败提示不应该混进
+        # “最近对局”的状态栏里。
+        self._live_client = GameHistoryHTTPClient(
+            self._api_base_url or None,
+            timeout_seconds=self.config.request_timeout_seconds,
+            parent=self,
+        )
+        self._live_client.live_ready.connect(self._on_live_ready)
+        self._live_client.failed.connect(self._on_live_failed)
+        self._live_client.unauthorized.connect(
+            self._on_history_unauthorized
+        )
+        self._live_client.busy_changed.connect(
+            self._on_history_busy_changed
+        )
+        self._live_games_entries: list = []
+
         self._social_client = SocialHTTPClient(
             self._api_base_url or None,
             timeout_seconds=self.config.request_timeout_seconds,
@@ -385,6 +407,8 @@ class OnlinePanel(InkBackdrop):
         self._chat_panels: dict[str, PrivateChatPanel] = {}
         self._pending_profile_user_id = ""
         self._pending_chat_user: Optional[dict] = None
+        # 观战结束后的去处：从对战广场进去的，回到广场而不是大厅。
+        self._watching_from_plaza = False
 
         self._heartbeat_timer = QTimer(self)
         self._heartbeat_timer.setInterval(20_000)
@@ -402,6 +426,12 @@ class OnlinePanel(InkBackdrop):
         self._undo_notice_timer = QTimer(self)
         self._undo_notice_timer.setSingleShot(True)
         self._undo_notice_timer.timeout.connect(self._clear_undo_notice)
+
+        # 对战广场的兜底刷新：服务器会推送“对局列表变了”，但推送可能
+        # 在断线期间丢失，定时兜底保证列表不会一直停在前一次的结果上。
+        self._live_refresh_timer = QTimer(self)
+        self._live_refresh_timer.setInterval(10_000)
+        self._live_refresh_timer.timeout.connect(self._on_live_timer)
 
         self._build_ui()
         self._show_auth_page()
@@ -465,9 +495,11 @@ class OnlinePanel(InkBackdrop):
         self.stack.setObjectName("onlineStack")
         self.auth_page = self._build_auth_page()
         self.lobby_page = self._build_lobby_page()
+        self.plaza_page = self._build_plaza_page()
         self.game_page = self._build_game_page()
         self.stack.addWidget(self.auth_page)
         self.stack.addWidget(self.lobby_page)
+        self.stack.addWidget(self.plaza_page)
         self.stack.addWidget(self.game_page)
         root.addWidget(self.stack)
 
@@ -615,9 +647,15 @@ class OnlinePanel(InkBackdrop):
         self.friends_button.setObjectName("smallButton")
         self.friends_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.friends_button.setAutoDefault(False)
+        # 对战广场：进行中对局的观战入口，单独占一页，不占大厅。
+        self.plaza_button = QPushButton("对战广场", card)
+        self.plaza_button.setObjectName("smallButton")
+        self.plaza_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.plaza_button.setAutoDefault(False)
         header.addWidget(self.self_avatar)
         header.addWidget(title)
         header.addStretch(1)
+        header.addWidget(self.plaza_button)
         header.addWidget(self.friends_button)
         header.addWidget(self.rating_badge_label)
         layout.addLayout(header)
@@ -834,6 +872,7 @@ class OnlinePanel(InkBackdrop):
         self.quick_match_button.clicked.connect(self._on_quick_match)
         self.create_room_button.clicked.connect(self._on_create_room)
         self.friends_button.clicked.connect(self._open_friends_panel)
+        self.plaza_button.clicked.connect(self._on_plaza_clicked)
         self.leaderboard_table.cellClicked.connect(
             self._on_leaderboard_cell_clicked
         )
@@ -854,6 +893,112 @@ class OnlinePanel(InkBackdrop):
         )
         self.logout_button.clicked.connect(self._logout)
 
+        return page
+
+    def _build_plaza_page(self) -> QWidget:
+        """对战广场：集中管理所有进行中的对局，并提供观战入口。
+
+        这一页单独存在，不占用大厅：大厅只留一个“对战广场”入口按钮。
+        """
+        page = QWidget(self)
+        page.setObjectName("onlinePage")
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea(page)
+        scroll.setObjectName("onlineScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        viewport = scroll.viewport()
+        viewport.setAutoFillBackground(False)
+        viewport.setAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground, True
+        )
+
+        container = QWidget(scroll)
+        container.setObjectName("onlineScrollBody")
+        container.setAutoFillBackground(False)
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(18, 10, 18, 10)
+        outer.setSpacing(12)
+        outer.addStretch(1)
+
+        card = QFrame(container)
+        card.setObjectName("onlineCard")
+        card.setMaximumWidth(660)
+        card.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(26, 22, 26, 22)
+        layout.setSpacing(9)
+
+        header = QHBoxLayout()
+        title = QLabel("对战广场", card)
+        title.setObjectName("onlineTitle")
+        self.refresh_live_button = QPushButton("刷新", card)
+        self.refresh_live_button.setObjectName("smallButton")
+        self.refresh_live_button.setCursor(
+            Qt.CursorShape.PointingHandCursor
+        )
+        self.refresh_live_button.setAutoDefault(False)
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(self.refresh_live_button)
+        layout.addLayout(header)
+
+        hint = QLabel(
+            "这里列出所有正在进行的对局，点“观战”即可进去旁观；"
+            "观战者只能看，不能落子或发言。对局开始会自动出现，结束会自动消失。",
+            card,
+        )
+        hint.setObjectName("hintLabel")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        # 每行一局：一个说明标签 + 一个“观战”按钮。
+        self.live_games_container = QWidget(card)
+        self.live_games_layout = QVBoxLayout(self.live_games_container)
+        self.live_games_layout.setContentsMargins(0, 0, 0, 0)
+        self.live_games_layout.setSpacing(6)
+        layout.addWidget(self.live_games_container)
+
+        self.live_status_label = QLabel(
+            "正在加载进行中的对局…", card
+        )
+        self.live_status_label.setObjectName("hintLabel")
+        self.live_status_label.setWordWrap(True)
+        layout.addWidget(self.live_status_label)
+
+        footer = QHBoxLayout()
+        self.plaza_status_label = QLabel(card)
+        self.plaza_status_label.setObjectName("onlineStatus")
+        self.plaza_status_label.setWordWrap(True)
+        self.plaza_status_label.setMinimumHeight(22)
+        self.plaza_back_button = QPushButton("返回大厅", card)
+        self.plaza_back_button.setObjectName("undoButton")
+        self.plaza_back_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        footer.addWidget(self.plaza_status_label, 1)
+        footer.addWidget(self.plaza_back_button)
+        layout.addSpacing(2)
+        layout.addLayout(footer)
+
+        card_row = QHBoxLayout()
+        card_row.setContentsMargins(0, 0, 0, 0)
+        card_row.addStretch(1)
+        card_row.addWidget(card, 20)
+        card_row.addStretch(1)
+        outer.addLayout(card_row)
+        outer.addStretch(1)
+        scroll.setWidget(container)
+        page_layout.addWidget(scroll)
+
+        self.refresh_live_button.clicked.connect(self._on_refresh_live)
+        self.plaza_back_button.clicked.connect(self._on_plaza_back)
         return page
 
     def _build_game_page(self) -> QWidget:
@@ -1056,11 +1201,15 @@ class OnlinePanel(InkBackdrop):
     # ------------------------------------------------------------------
     def _show_auth_page(self) -> None:
         self.stack.setCurrentWidget(self.auth_page)
+        # 回到登录页就不该再刷新对战广场了。
+        self._live_refresh_timer.stop()
         self.auth_status_label.setText("")
         self._refresh_auth_availability()
 
     def _show_lobby_page(self, message: str = "") -> None:
         self.stack.setCurrentWidget(self.lobby_page)
+        # 对战广场不在大厅上，离开页面时停掉它的定时刷新。
+        self._live_refresh_timer.stop()
         if self._auth_session is not None:
             user = self._auth_session.user.username
         elif self._session is not None:
@@ -1072,9 +1221,33 @@ class OnlinePanel(InkBackdrop):
         self._update_rating_summary()
         self._refresh_lobby_controls()
 
+    def _show_plaza_page(self, message: str = "") -> None:
+        """打开对战广场：进行中的对局列表在这里集中管理。"""
+        self.stack.setCurrentWidget(self.plaza_page)
+        self.plaza_status_label.setText(message)
+        self._refresh_plaza_controls()
+        self._fetch_live_games()
+        if not self._live_refresh_timer.isActive():
+            self._live_refresh_timer.start()
+
+    def _on_plaza_clicked(self) -> None:
+        """大厅里的“对战广场”入口。"""
+        if self._session is not None and self._session.in_room:
+            self._set_lobby_status(
+                "你已经在对局中，无法进入对战广场", error=True
+            )
+            return
+        self._show_plaza_page()
+
+    def _on_plaza_back(self) -> None:
+        """从对战广场返回大厅。"""
+        self._show_lobby_page()
+
     def _show_game_page(self) -> None:
         if self.stack.currentWidget() is not self.game_page:
             self.stack.setCurrentWidget(self.game_page)
+        # 进到对局页就不再需要刷新广场列表了。
+        self._live_refresh_timer.stop()
 
     def _refresh_auth_availability(self) -> None:
         available = bool(self._api_base_url and self._ws_url)
@@ -1123,9 +1296,28 @@ class OnlinePanel(InkBackdrop):
                 and has_selection
                 and bool(self._recent_games_entries)
             )
+        if hasattr(self, "refresh_live_button"):
+            self.refresh_live_button.setEnabled(
+                connected and not self._live_client.busy
+            )
+        # 对战广场入口：已经在对局里时不能进去看别的棋局。
+        self.plaza_button.setEnabled(connected and not pending)
         self.logout_button.setEnabled(
             not self._auth_client.busy and not pending
         )
+
+    def _refresh_plaza_controls(self) -> None:
+        """对战广场页的控件状态。"""
+        connected = (
+            self._session is not None
+            and self._session.is_authenticated
+            and self._ws_connected
+            and not self._closing
+        )
+        self.refresh_live_button.setEnabled(
+            connected and not self._live_client.busy
+        )
+        self.plaza_back_button.setEnabled(not self._closing)
 
     @staticmethod
     def _set_status_label(label: QLabel, text: str, error: bool) -> None:
@@ -2198,6 +2390,135 @@ class OnlinePanel(InkBackdrop):
             self._auth_session.access_token, game_id
         )
 
+    # ------------------------------------------------------------------
+    # 对战广场：进行中的对局列表
+    # ------------------------------------------------------------------
+    def _fetch_live_games(self) -> None:
+        """拉取进行中的对局列表（对战广场）。
+
+        只在广场页可见时拉取：其它页面要这个列表没有意义，白白发请求。
+        """
+        if self._auth_session is None or self._session is None:
+            return
+        if self.stack.currentWidget() is not self.plaza_page:
+            return
+        if self._live_client.busy:
+            return
+        self._live_client.fetch_live(self._auth_session.access_token)
+
+    def _on_refresh_live(self) -> None:
+        """手动刷新进行中的对局列表。"""
+        self._fetch_live_games()
+
+    def _on_live_timer(self) -> None:
+        """兜底刷新：推送可能因为断线丢失，定时补一次。"""
+        self._fetch_live_games()
+
+    def _on_live_games_changed(self) -> None:
+        """服务器推送“对局列表变了”：有新对局开始或已有对局结束。"""
+        if self.stack.currentWidget() is not self.plaza_page:
+            return
+        self._fetch_live_games()
+
+    def _on_live_ready(self, data: object) -> None:
+        """收到进行中的对局列表并渲染到对战广场。"""
+        if self._auth_session is None or self._logging_out:
+            return
+        if not isinstance(data, Mapping):
+            return
+        raw_entries = data.get("entries")
+        entries = raw_entries if isinstance(raw_entries, list) else []
+        self._live_games_entries = [
+            entry for entry in entries if isinstance(entry, Mapping)
+        ]
+        total = data.get("total", len(self._live_games_entries))
+        if not isinstance(total, int) or isinstance(total, bool):
+            total = len(self._live_games_entries)
+        self._fill_live_games(self._live_games_entries, total)
+        self._refresh_plaza_controls()
+
+    def _on_live_failed(self, message: str) -> None:
+        """读取进行中对局失败：提示在广场页，不影响其它区块。"""
+        logger.warning("读取进行中对局失败：%s", message)
+        if self.stack.currentWidget() is self.plaza_page:
+            self.live_status_label.setText(
+                message or "无法加载进行中的对局"
+            )
+        self._refresh_plaza_controls()
+
+    def _fill_live_games(self, entries: list, total: int) -> None:
+        """重建进行中对局列表；最多展示前若干条，避免页面无限变长。"""
+        while self.live_games_layout.count():
+            item = self.live_games_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        shown = entries[:MAX_LIVE_GAME_ROWS]
+        for entry in shown:
+            self.live_games_layout.addWidget(
+                self._make_live_game_row(entry)
+            )
+        if not entries:
+            self.live_status_label.setText("当前没有进行中的对局")
+            return
+        if len(shown) < total:
+            self.live_status_label.setText(
+                f"共 {total} 局进行中，最多显示前 {len(shown)} 局"
+            )
+        else:
+            self.live_status_label.setText(f"共 {total} 局进行中")
+
+    def _make_live_game_row(self, entry: Mapping) -> QWidget:
+        """构造一行“进行中对局”的说明与观战按钮。"""
+        row = QWidget(self.live_games_container)
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(8)
+        label = QLabel(self._format_live_entry(entry), row)
+        label.setObjectName("rankSummary")
+        label.setWordWrap(True)
+        row_layout.addWidget(label, 1)
+        button = QPushButton("观战", row)
+        button.setObjectName("undoButton")
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setAutoDefault(False)
+        game_id = entry.get("game_id")
+        if isinstance(game_id, str) and game_id:
+            button.clicked.connect(
+                lambda _checked=False, gid=game_id: self._on_watch_game(gid)
+            )
+        else:
+            button.setEnabled(False)
+        row_layout.addWidget(button, 0)
+        return row
+
+    @staticmethod
+    def _format_live_entry(entry: Mapping) -> str:
+        """把一条进行中的对局格式化成一行中文说明。"""
+        black = str(entry.get("black_username") or "黑方")
+        white = str(entry.get("white_username") or "白方")
+        mode = "排位" if entry.get("rated") else "自建房"
+        move_no = entry.get("move_no", 0)
+        if not isinstance(move_no, int) or isinstance(move_no, bool):
+            move_no = 0
+        return f"{black}（黑）对 {white}（白）· {mode} · 第 {move_no} 手"
+
+    def _on_watch_game(self, game_id: str) -> None:
+        """开始观战指定的进行中对局。"""
+        session = self._session
+        if session is None or not game_id:
+            return
+        if session.in_room or session.is_spectator:
+            self.plaza_status_label.setText(
+                "你已经在对局中，无法开始观战"
+            )
+            return
+        if session.watch_game(game_id):
+            # 真正的切换由服务器下发的观战快照触发（_sync_online_ui）。
+            self._watching_from_plaza = True
+            self.plaza_status_label.setText("正在进入观战…")
+
     def _clear_profile_ui(self) -> None:
         self._profile_user = None
         self._leaderboard_entries = []
@@ -2205,6 +2526,9 @@ class OnlinePanel(InkBackdrop):
         self.leaderboard_status_label.setText("登录后自动加载排行榜")
         self._update_rating_summary()
         self._recent_games_entries = []
+        self._live_games_entries = []
+        if hasattr(self, "live_games_layout"):
+            self._fill_live_games([], 0)
         if hasattr(self, "recent_games_table"):
             self.recent_games_table.setRowCount(0)
             self.history_status_label.setText(
@@ -2312,6 +2636,7 @@ class OnlinePanel(InkBackdrop):
         self._teardown_ws()
         self._profile_client.abort_all()
         self._history_client.abort_all()
+        self._live_client.abort_all()
         self._social_client.abort_all()
         self._auth_client.logout()
         self._auth_session = None
@@ -2325,6 +2650,7 @@ class OnlinePanel(InkBackdrop):
         self._auth_session = None
         self._profile_client.abort_all()
         self._history_client.abort_all()
+        self._live_client.abort_all()
         self._social_client.abort_all()
         self._close_social_windows()
         self._clear_profile_ui()
@@ -2367,6 +2693,7 @@ class OnlinePanel(InkBackdrop):
         session.room_invite_result.connect(self._on_room_invite_result)
         session.friend_event.connect(self._on_friend_event)
         session.direct_message.connect(self._on_direct_message)
+        session.live_games_changed.connect(self._on_live_games_changed)
 
         self._open_transport(reset_status=True)
 
@@ -2488,6 +2815,7 @@ class OnlinePanel(InkBackdrop):
         self._teardown_ws()
         self._profile_client.abort_all()
         self._history_client.abort_all()
+        self._live_client.abort_all()
         self._social_client.abort_all()
         self._auth_session = None
         self._close_social_windows()
@@ -2596,7 +2924,7 @@ class OnlinePanel(InkBackdrop):
         self._set_match_status("")
         # 房间关闭后清空对话日志与在飞弹幕。
         self._clear_chat_area()
-        self._show_lobby_page(reason)
+        self._leave_game_page(reason)
         if self._auto_requeue:
             self._auto_requeue = False
             QTimer.singleShot(0, self._on_quick_match)
@@ -2607,6 +2935,9 @@ class OnlinePanel(InkBackdrop):
     def _on_chat_received(self, message: ChatMessage) -> None:
         """收到服务端广播的表情/评论：飞弹幕并写入对话日志。"""
         if self.sender() is not self._session or self._closing:
+            return
+        if self._session is not None and self._session.is_spectator:
+            # 观战者看不到对局内的聊天（弹幕与对话日志都不显示）。
             return
         is_self = bool(
             self._session is not None
@@ -2712,10 +3043,13 @@ class OnlinePanel(InkBackdrop):
         chat_input = getattr(self, "chat_input", None)
         if chat_input is None:
             return
+        session = self._session
         enabled = (
-            self._session is not None
+            session is not None
             and self._ws_connected
-            and self._session.chat_available
+            and session.chat_available
+            # 观战者不发言。
+            and not session.is_spectator
         )
         chat_input.setEnabled(enabled)
         self.chat_send_button.setEnabled(enabled)
@@ -2747,6 +3081,9 @@ class OnlinePanel(InkBackdrop):
 
     def _on_undo_request_received(self, name: str) -> None:
         if self.sender() is not self._session or self._closing:
+            return
+        if self._session is not None and self._session.is_spectator:
+            # 观战者不参与悔棋协商。
             return
         self._show_undo_notice(f"{name or '对手'} 请求悔棋，是否同意？")
         self._sync_game_page()
@@ -2823,7 +3160,8 @@ class OnlinePanel(InkBackdrop):
         if not self._closing:
             self._play_online_result_sound()
             QTimer.singleShot(0, self._show_online_victory_notice)
-        if self._session is not None:
+        if self._session is not None and not self._session.is_spectator:
+            # 观战不会改变本人的段位，无需重新拉取资料。
             QTimer.singleShot(0, self._refresh_profile_data)
 
     def _show_online_victory_notice(self) -> None:
@@ -2855,6 +3193,9 @@ class OnlinePanel(InkBackdrop):
         """按服务器快照判断胜负，播放对应的终局音效。"""
         snapshot = self._session.snapshot if self._session is not None else None
         if snapshot is None or not snapshot.is_game_over:
+            return
+        if snapshot.is_spectator:
+            # 观战者不是参与者，不该听到自己“赢了”或“输了”的音效。
             return
         audio = get_audio_manager()
         if snapshot.winner is None:
@@ -2895,10 +3236,18 @@ class OnlinePanel(InkBackdrop):
             self._show_game_page()
             self._sync_game_page()
         elif self.stack.currentWidget() is self.game_page:
-            self._show_lobby_page("")
+            self._leave_game_page()
         else:
             self._update_rating_summary()
             self._refresh_lobby_controls()
+
+    def _leave_game_page(self, message: str = "") -> None:
+        """离开对局页：从对战广场进去观战的，回广场；其余回大厅。"""
+        if self._watching_from_plaza:
+            self._watching_from_plaza = False
+            self._show_plaza_page(message)
+        else:
+            self._show_lobby_page(message)
 
     def _sync_game_page(self) -> None:
         self._refresh_chat_controls()
@@ -2906,6 +3255,15 @@ class OnlinePanel(InkBackdrop):
         if session is None:
             return
         snapshot = session.snapshot
+        if snapshot is not None and (
+            session.is_spectator or snapshot.your_color is None
+        ):
+            # 观战者不是对局双方：走独立的只读分支，不能按玩家视角渲染。
+            # 快照里没有执子颜色同样说明这是旁观者视角。
+            self._sync_spectator_page(snapshot)
+            return
+        # 玩家视角：聊天控件重新可见（观战时是被隐藏的）。
+        self._set_chat_visibility(True)
         waiting = session.waiting_for_opponent
         rated = session.rated or (
             snapshot.rated if snapshot is not None else False
@@ -3108,17 +3466,7 @@ class OnlinePanel(InkBackdrop):
         self._last_snapshot = snapshot
         self._maybe_play_online_start(snapshot)
         # 依据服务器时间计算倒计时，不在客户端自行判定超时胜负。
-        if (
-            not snapshot.is_game_over
-            and snapshot.turn_deadline_ms is not None
-            and snapshot.server_now_ms is not None
-        ):
-            seconds = (
-                snapshot.turn_deadline_ms - snapshot.server_now_ms
-            ) / 1000.0
-            self._deadline_monotonic = time.monotonic() + max(0.0, seconds)
-        else:
-            self._deadline_monotonic = None
+        self._apply_snapshot_deadline(snapshot)
 
         current = snapshot.current_player
         over = snapshot.is_game_over
@@ -3284,6 +3632,135 @@ class OnlinePanel(InkBackdrop):
             )
             self.rematch_button.setEnabled(self._ws_connected)
 
+    def _apply_snapshot_deadline(self, snapshot: GameSnapshot) -> None:
+        """依据服务器时间计算本手倒计时，不在客户端自行判定超时胜负。"""
+        if (
+            not snapshot.is_game_over
+            and snapshot.turn_deadline_ms is not None
+            and snapshot.server_now_ms is not None
+        ):
+            seconds = (
+                snapshot.turn_deadline_ms - snapshot.server_now_ms
+            ) / 1000.0
+            self._deadline_monotonic = time.monotonic() + max(0.0, seconds)
+        else:
+            self._deadline_monotonic = None
+
+    def _set_chat_visibility(self, visible: bool) -> None:
+        """整体显示或隐藏聊天控件。
+
+        旁观者不参与对局内的聊天，也看不到双方的发言，因此聊天输入栏与
+        对话日志要一起藏起来。
+        """
+        for widget in (
+            self.emoji_button,
+            self.preset_comment_button,
+            self.chat_input,
+            self.chat_send_button,
+            self.chat_log_toggle_button,
+        ):
+            widget.setVisible(visible)
+        if visible:
+            self._apply_chat_log_visibility(self._chat_log_expanded)
+        else:
+            self.chat_log.setVisible(False)
+
+    def _sync_spectator_page(self, snapshot: GameSnapshot) -> None:
+        """观战页：只读展示棋盘与双方信息，隐藏一切玩家专属的操作。"""
+        session = self._session
+        rated = snapshot.rated
+        self.room_title_label.setText(
+            "观战 · 排位赛" if rated else "观战 · 自建房"
+        )
+        # 旁观者不能邀请好友进自己的房间。
+        self.invite_friend_button.setVisible(False)
+        self.connection_label.setText(
+            "已连接" if self._ws_connected else "连接中断"
+        )
+        self.game_error_label.setText("")
+
+        current = snapshot.current_player
+        over = snapshot.is_game_over
+        winner = snapshot.winner
+        if over:
+            if winner is None:
+                black_status = white_status = "本局平局"
+            elif winner is Player.BLACK:
+                black_status, white_status = "获胜", "本局结束"
+            else:
+                black_status, white_status = "本局结束", "获胜"
+        else:
+            black_status = "落子中" if current is Player.BLACK else "等待"
+            white_status = "落子中" if current is Player.WHITE else "等待"
+
+        # 两张身份卡展示的是对局中的两名玩家，而不是旁观者自己。
+        self.you_card.set_content(
+            snapshot.black_name or "黑方",
+            Player.BLACK,
+            current is Player.BLACK,
+            black_status,
+            avatar=snapshot.black_avatar,
+            user_id=snapshot.black_user_id,
+            avatar_version=snapshot.black_avatar_version,
+            achievements=snapshot.black_achievements,
+        )
+        self.opponent_card.set_content(
+            snapshot.white_name or "白方",
+            Player.WHITE,
+            current is Player.WHITE,
+            white_status,
+            avatar=snapshot.white_avatar,
+            user_id=snapshot.white_user_id,
+            avatar_version=snapshot.white_avatar_version,
+            achievements=snapshot.white_achievements,
+        )
+
+        if over:
+            if winner is None:
+                self._set_game_pill("本局平局", result=True)
+            elif winner is Player.BLACK:
+                self._set_game_pill("黑方获胜", result=True)
+            else:
+                self._set_game_pill("白方获胜", result=True)
+            self.clock_label.setText("对局结束")
+        elif not self._ws_connected:
+            self._set_game_pill("连接中断", result=False)
+        elif current is Player.BLACK:
+            self._set_game_pill("黑方回合", result=False)
+        else:
+            self._set_game_pill("白方回合", result=False)
+
+        self.move_label.setText(f"第 {snapshot.move_no} 手")
+        self._last_snapshot = snapshot
+        self._maybe_play_online_start(snapshot)
+        self._apply_snapshot_deadline(snapshot)
+        # 观战者只读：棋盘不接受任何点击。
+        if session is not None:
+            self.board_widget.set_view(session.view)
+        self.board_widget.set_interaction_enabled(False)
+        self.board_widget.update()
+        self._update_clock_label()
+
+        # 观战者不参与积分与成就结算，这两个标签始终隐藏。
+        self.game_rating_label.clear()
+        self.game_rating_label.setVisible(False)
+        self.game_achievement_label.clear()
+        self.game_achievement_label.setVisible(False)
+        self._clear_undo_notice()
+
+        # 只有“退出观战”可用，其余玩家操作全部隐藏。
+        self._set_action_visibility(
+            resign=False,
+            rematch=False,
+            leave=True,
+            undo=False,
+            reject_undo=False,
+        )
+        self.leave_button.setText("退出观战")
+        self.leave_button.setEnabled(self._ws_connected)
+        # 旁观者不发言，也看不到双方的聊天。
+        self._set_chat_visibility(False)
+
     def _update_achievement_notice(
         self, snapshot: Optional[GameSnapshot]
     ) -> None:
@@ -3347,7 +3824,7 @@ class OnlinePanel(InkBackdrop):
         if not self._ws_connected:
             self.clock_label.setText("连接中断")
             return
-        if self._session.undo_pending:
+        if self._session.undo_pending and not self._session.is_spectator:
             self.clock_label.setText(
                 "等待对手回应悔棋"
                 if self._session.undo_requested_by_you
@@ -3375,9 +3852,11 @@ class OnlinePanel(InkBackdrop):
         self._clock_timer.stop()
         self._reconnect_timer.stop()
         self._undo_notice_timer.stop()
+        self._live_refresh_timer.stop()
         self._auth_client.abort()
         self._profile_client.abort_all()
         self._history_client.abort_all()
+        self._live_client.abort_all()
         self._social_client.abort_all()
         self._close_social_windows()
         self._teardown_ws()

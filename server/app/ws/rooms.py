@@ -38,6 +38,7 @@ from gomoku.shared.protocol import (
     SERVER_CHAT,
     SERVER_FRIEND_EVENT,
     SERVER_GAME_STATE,
+    SERVER_LIVE_GAMES_CHANGED,
     SERVER_MATCH_FOUND,
     SERVER_MOVE_REJECTED,
     SERVER_OPPONENT_STATUS,
@@ -166,6 +167,10 @@ class Room:
     winner_user_id: Optional[str] = None
     result_reason: Optional[str] = None
     connections: dict[str, ClientConnection] = field(default_factory=dict)
+    # 观战者：不是本局玩家，只接收权威快照，不能进行任何操作。
+    # 刻意不放进 connections——那个字典会被聊天广播、房间关闭广播和再战
+    # 投票逻辑遍历，放进去等于悄悄给观战者发了玩家权限。
+    spectators: dict[str, ClientConnection] = field(default_factory=dict)
     rematch_votes: set[str] = field(default_factory=set)
     processed_moves: dict[str, int] = field(default_factory=dict)
     # 服务端局面版本。悔棋会让手数变小，客户端用版本号识别回滚快照。
@@ -266,6 +271,10 @@ class RoomManager:
         self._session_factory = session_factory
         self._rooms_by_code: dict[str, Room] = {}
         self._room_by_user: dict[str, Room] = {}
+        # 观战者 → 正在观战的房间。观战者绝不进 _room_by_user：
+        # 那张表表示“这个人是本局玩家”，混进去会让离开房间/断线/重连
+        # 逻辑把观战者当成对局参与者处理。
+        self._spectator_by_user: dict[str, Room] = {}
         self._connections: dict[str, ClientConnection] = {}
         self._queue: dict[str, QueuedPlayer] = {}
         self._invites: dict[str, RoomInvite] = {}
@@ -342,6 +351,10 @@ class RoomManager:
         message = make_message(SERVER_ROOM_CLOSED, {"reason": reason})
         for conn in list(room.connections.values()):
             await conn.send(message)
+        # 观战者不是玩家，但对局结束/房间关闭时也要收到通知，
+        # 否则客户端会一直以为还在观战。
+        for conn in list(room.spectators.values()):
+            await conn.send(message)
 
     async def _send_opponent_status(
         self,
@@ -373,6 +386,24 @@ class RoomManager:
                 },
             )
         )
+
+    async def _notify_live_games_changed(self) -> None:
+        """通知空闲客户端：进行中的对局列表发生了变化。
+
+        对战广场据此即时增删对局条目，不必让客户端自己轮询。通知只说
+        “变了”，不带列表内容，客户端再按需拉一次接口。
+
+        只通知没有在对局中的连接：正在下棋或正在观战的人不需要这个广播，
+        也不用让多余的消息插进对局的消息流里。
+        """
+        message = make_message(SERVER_LIVE_GAMES_CHANGED, {})
+        for user_id, conn in list(self._connections.items()):
+            if (
+                user_id in self._room_by_user
+                or user_id in self._spectator_by_user
+            ):
+                continue
+            await conn.send(message)
 
     # ------------------------------------------------------------------
     # 匹配队列辅助
@@ -436,8 +467,12 @@ class RoomManager:
 
     def _room_state_payload(self, room: Room, user_id: str) -> dict:
         color = room.color_for(user_id)
+        # 观战者没有执子颜色，但仍然可以拿到完整的权威快照。
+        is_spectator = False
         if color is None:
-            raise RuntimeError("用户不属于该房间")
+            if user_id not in room.spectators:
+                raise RuntimeError("用户不属于该房间")
+            is_spectator = True
         opponent_id = room.opponent_id(user_id)
         last_move = room.game.last_move
         status = room.status
@@ -451,7 +486,8 @@ class RoomManager:
                 for row in room.game.board
             ],
             "current_player": _color_text(room.game.current_player),
-            "your_color": _color_text(color),
+            "your_color": _color_text(color) if color else None,
+            "is_spectator": is_spectator,
             "move_no": room.game.move_count,
             "status": status,
             "state_version": room.state_version,
@@ -495,8 +531,16 @@ class RoomManager:
             "server_now_ms": _now_ms(),
             "move_timeout_seconds": room.turn_seconds,
             "opponent_online": (
-                room.opponent_id(user_id) in room.connections
-                if room.opponent_id(user_id) else False
+                # 观战者没有“对手”这个概念：报告双方是否都在线。
+                (
+                    room.black_user_id in room.connections
+                    and room.white_user_id in room.connections
+                )
+                if is_spectator
+                else (
+                    room.opponent_id(user_id) in room.connections
+                    if room.opponent_id(user_id) else False
+                )
             ),
             "rated": room.rated,
             "your_rating_before": room.rating_before.get(user_id),
@@ -532,6 +576,10 @@ class RoomManager:
                 conn,
                 request_id if user_id == request_user_id else None,
             )
+        # 观战者也接收同一份权威快照（观战没有待回应的落子请求，
+        # 所以不携带 request_id）。
+        for conn in list(room.spectators.values()):
+            await self._send_game_state(room, conn)
 
     async def _send_rematch_status(self, room: Room) -> None:
         for user_id, conn in list(room.connections.items()):
@@ -656,12 +704,19 @@ class RoomManager:
             queued = self._queue.get(conn.user_id)
             if queued is not None:
                 queued.conn = conn
+            watched = self._spectator_by_user.get(conn.user_id)
         if old_conn is not None and old_conn is not conn:
             await old_conn.close(4001, "账号已在另一处连接")
 
         try:
             room = self._room_by_user.get(conn.user_id)
             if room is None:
+                if watched is not None:
+                    # 观战者重连：重新挂上新连接并补发一份快照，
+                    # 否则棋盘会是空白的。
+                    async with watched.lock:
+                        watched.spectators[conn.user_id] = conn
+                        await self._send_game_state(watched, conn)
                 if queued is not None:
                     await self._send_queue_status(conn)
                 return
@@ -700,6 +755,13 @@ class RoomManager:
                 return
             self._connections.pop(conn.user_id, None)
             self._queue.pop(conn.user_id, None)
+            # 观战者断线只是停止接收快照：不能触发逃跑计时、
+            # 不能判作弃局，更不能把房间关掉。
+            # 观战登记本身保留，重连时 attach 才能把棋盘补回来
+            # （和玩家断线后仍保留 _room_by_user 是同一个道理）。
+            watched = self._spectator_by_user.get(conn.user_id)
+            if watched is not None:
+                watched.spectators.pop(conn.user_id, None)
 
         await self._notify_friends_presence(conn, False)
 
@@ -916,6 +978,8 @@ class RoomManager:
         elif joined_room is not None:
             async with joined_room.lock:
                 await self._broadcast_game_state(joined_room)
+            # 对局开始，进行中的对局列表多了一条。
+            await self._notify_live_games_changed()
 
     # ------------------------------------------------------------------
     # 自建房邀请
@@ -1175,6 +1239,8 @@ class RoomManager:
         if joined_room is not None:
             async with joined_room.lock:
                 await self._broadcast_game_state(joined_room)
+            # 对局开始，进行中的对局列表多了一条。
+            await self._notify_live_games_changed()
 
     # ------------------------------------------------------------------
     # 公开排位匹配
@@ -1243,6 +1309,8 @@ class RoomManager:
             await target.send(message)
         if room is not None:
             await self._broadcast_game_state(room)
+            # 排位匹配成功，进行中的对局列表多了一条。
+            await self._notify_live_games_changed()
 
     async def _match_queued_locked(
         self, conn: ClientConnection
@@ -1378,6 +1446,7 @@ class RoomManager:
             return
         room = self._room_by_user.get(conn.user_id)
         if room is None:
+            await self._leave_spectating(conn)
             return
 
         error: Optional[str] = None
@@ -1391,10 +1460,105 @@ class RoomManager:
                     await self._mark_waiting_game_abandoned(room, "left")
                 for other in list(room.connections.values()):
                     await other.send(message)
+                # 观战者也要知道房间没了，否则会一直停在一局早已结束的棋盘上。
+                for watcher in list(room.spectators.values()):
+                    await watcher.send(message)
                 self._remove_room_locked(room)
 
         if error:
             await self._send_error(conn, error)
+
+    # ------------------------------------------------------------------
+    # 观战
+    # ------------------------------------------------------------------
+    async def _leave_spectating(self, conn: ClientConnection) -> None:
+        """观战者退出观战：只结束自己的观战，不影响对局双方。"""
+        async with self._state_lock:
+            watched = self._spectator_by_user.pop(conn.user_id, None)
+            if watched is not None:
+                watched.spectators.pop(conn.user_id, None)
+        if watched is None:
+            return
+        # 只通知观战者本人；房间和玩家的状态一律不动。
+        await conn.send(
+            make_message(SERVER_ROOM_CLOSED, {"reason": "已退出观战"})
+        )
+
+    def _find_playing_room(self, game_id: str) -> Optional[Room]:
+        """按对局编号找到正在进行中的房间。"""
+        for room in self._rooms_by_code.values():
+            if room.game_id == game_id and room.status == "playing":
+                return room
+        return None
+
+    async def watch_game(
+        self,
+        conn: ClientConnection,
+        game_id: str,
+        request_id: Optional[str] = None,
+    ) -> None:
+        """观战：旁观者以对局编号进入别人正在进行的一局。
+
+        观战者只接收权威快照，不能落子、认输、悔棋、再战、聊天或邀请；
+        这些入口都不会把观战者当成房间成员。
+        """
+        if not self._is_current_connection(conn):
+            return
+        if not isinstance(game_id, str) or not game_id.strip():
+            await self._send_error(conn, "对局编号无效", request_id)
+            return
+
+        error: Optional[str] = None
+        target: Optional[Room] = None
+        async with self._state_lock:
+            # 观战和匹配不能同时存在，否则被匹配进新房间后身份会打架。
+            self._queue.pop(conn.user_id, None)
+            target = self._find_playing_room(game_id)
+            if target is None:
+                error = "对局不存在或已结束"
+            elif target.color_for(conn.user_id) is not None:
+                # 自己下的棋不能观摩，只能专心下。
+                error = "你不能观摩自己的对局"
+            elif conn.user_id in self._room_by_user:
+                error = "你已经在一个房间中"
+            elif self._rooms_by_code.get(target.code) is not target:
+                # 房间在查找和登记之间被清理掉了。
+                error = "对局不存在或已结束"
+            else:
+                previous = self._spectator_by_user.get(conn.user_id)
+                if previous is not None and previous is not target:
+                    # 换局观战：先退出上一局，避免同时挂在两局上。
+                    previous.spectators.pop(conn.user_id, None)
+                    self._spectator_by_user.pop(conn.user_id, None)
+                # 幂等：重复观战同一局只是重发一份快照。
+                target.spectators[conn.user_id] = conn
+                self._spectator_by_user[conn.user_id] = target
+
+        if error is not None:
+            await self._send_error(conn, error, request_id)
+            return
+        if target is not None:
+            await self._send_game_state(target, conn)
+
+    def list_live_games(self) -> list[dict]:
+        """列出内存中正在进行中的对局，供观战入口挑选。"""
+        entries = [
+            {
+                "game_id": room.game_id,
+                "rated": room.rated,
+                "black_username": room.black_name,
+                "white_username": room.white_name,
+                "black_user_id": room.black_user_id,
+                "white_user_id": room.white_user_id or "",
+                "move_no": room.game.move_count,
+                "status": room.status,
+            }
+            for room in self._rooms_by_code.values()
+            if room.status == "playing"
+        ]
+        # 手数多的对局更“热”，排在前面；game_id 兜底保证顺序稳定。
+        entries.sort(key=lambda entry: (-entry["move_no"], entry["game_id"]))
+        return entries
 
     # ------------------------------------------------------------------
     # 落子/认输/再战
@@ -1537,6 +1701,10 @@ class RoomManager:
             return
         room = self._room_by_user.get(conn.user_id)
         if room is None:
+            # 观战者没有执子资格，明确拒绝而不是静默忽略，
+            # 否则客户端会把请求当成已受理。
+            if conn.user_id in self._spectator_by_user:
+                await self._send_error(conn, "观战者不能认输")
             return
         async with room.lock:
             if room.status != "playing":
@@ -1717,6 +1885,9 @@ class RoomManager:
             return
         room = self._room_by_user.get(conn.user_id)
         if room is None:
+            # 观战者不是本局玩家，不能发起再战。
+            if conn.user_id in self._spectator_by_user:
+                await self._send_error(conn, "观战者不能发起再战")
             return
         error: Optional[str] = None
         async with room.lock:
@@ -1778,6 +1949,8 @@ class RoomManager:
                             room.state_version = 0
                             self._start_timeout_locked(room)
                             await self._broadcast_game_state(room)
+                            # 再战开新局：列表里的对局编号换了一个。
+                            await self._notify_live_games_changed()
                 else:
                     await self._send_rematch_status(room)
 
@@ -2023,6 +2196,8 @@ class RoomManager:
 
         await self._settle_rated_game_locked(room)
         await self._broadcast_game_state(room)
+        # 对局结束，进行中的对局列表少了一条。
+        await self._notify_live_games_changed()
         if not room.connections:
             self._remove_room_locked(room)
 
@@ -2233,6 +2408,11 @@ class RoomManager:
             if self._room_by_user.get(uid) is room:
                 self._room_by_user.pop(uid, None)
         room.connections.clear()
+        # 房间没了，观战登记也要一并清掉，避免留下悬空的观战者。
+        for uid in list(room.spectators):
+            if self._spectator_by_user.get(uid) is room:
+                self._spectator_by_user.pop(uid, None)
+        room.spectators.clear()
 
     async def shutdown(self) -> None:
         """停止时作废未完成对局并关闭连接，避免数据库残留 playing。"""
@@ -2268,6 +2448,7 @@ class RoomManager:
             await conn.close(1001, "服务器正在关闭")
         self._rooms_by_code.clear()
         self._room_by_user.clear()
+        self._spectator_by_user.clear()
         self._connections.clear()
         self._queue.clear()
 
