@@ -43,6 +43,10 @@ class PrivateChatPanel(PaperPanel):
         )
         self.friend_id = friend_id
         self._seen_ids: set[str] = set()
+        # 对方发来、已经显示在窗口里、但还没被服务端销账的消息。
+        # 实时推送过来的消息服务端并不知道用户已经读过，得由客户端报上去，
+        # 否则未读数会一直挂着。
+        self._pending_read: list[str] = []
         self._last_sent = ""
         # 私聊浮层不是原生窗口，没有系统标题栏上的关闭按钮；面板自己
         # 必须能被关闭，因此显式接受键盘焦点，Esc 才有地方可去。
@@ -156,14 +160,38 @@ class PrivateChatPanel(PaperPanel):
         for message in messages:
             if not isinstance(message, Mapping):
                 continue
-            if self._append(message, self_id, scroll=False):
+            if self._append(
+                message, self_id, scroll=False, read_server_side=True
+            ):
                 added = True
+            # 历史接口返回的消息，服务端已经顺手标成已读——哪怕这条
+            # 是实时推送先到的（已经进了待销账队列），也要一并销掉。
+            message_id = str(message.get("id", ""))
+            if message_id:
+                self._pending_read = [
+                    pending
+                    for pending in self._pending_read
+                    if pending != message_id
+                ]
         if added:
             self._scroll_to_bottom()
 
     def append_message(self, message: Mapping, self_id: str) -> None:
         if self._append(message, self_id, scroll=True):
             self._scroll_to_bottom()
+
+    def pending_read_ids(self) -> list[str]:
+        """已经显示、但还没报给服务端销账的消息 id。"""
+        return list(self._pending_read)
+
+    def mark_reported(self, message_ids: Sequence[str]) -> None:
+        """这些消息已经报给服务端，从待销账队列里拿掉。"""
+        reported = set(message_ids)
+        self._pending_read = [
+            message_id
+            for message_id in self._pending_read
+            if message_id not in reported
+        ]
 
     @property
     def last_draft(self) -> str:
@@ -186,10 +214,14 @@ class PrivateChatPanel(PaperPanel):
         self_id: str,
         *,
         scroll: bool,
+        read_server_side: bool = False,
     ) -> bool:
         """把一条消息画进记录里；已经显示过就跳过。
 
         返回 True 表示这次确实新增了一条。
+
+        ``read_server_side`` 表示服务端已经把这批消息标成已读（历史接口
+        的行为），这时不用再排队等客户端销账。
         """
         message_id = str(message.get("id", ""))
         if message_id:
@@ -198,6 +230,10 @@ class PrivateChatPanel(PaperPanel):
             self._seen_ids.add(message_id)
         sender_id = str(message.get("sender_id", ""))
         is_self = sender_id == self_id
+        if message_id and not is_self and not read_server_side:
+            # 对方发来的消息：先记在待销账队列里，等窗口确实显示着
+            # 它的时侯再报给服务端。
+            self._pending_read.append(message_id)
         sender_name = (
             "我"
             if is_self
@@ -273,9 +309,6 @@ class PrivateChatPanel(PaperPanel):
         # 还能把文本放回输入框。
         self._last_sent = text
         self.send_requested.emit(text)
-
-    def mark_read(self) -> None:
-        """占位：历史加载时服务端已标记已读。"""
 
 
 __all__ = ["PrivateChatPanel"]
