@@ -242,7 +242,7 @@ Gomoku/
 │   ├── requirements*.txt
 │   ├── manage.py                   # 管理员重置密码
 │   └── README.md                   # 服务端安装、部署、PostgreSQL、TLS 说明
-├── tests/                          # 客户端 244 项自动化测试
+├── tests/                          # 客户端 248 项自动化测试
 ├── requirements.txt                # 客户端运行依赖
 ├── requirements-dev.txt            # 客户端开发/打包依赖
 ├── README.md                       # 本文件

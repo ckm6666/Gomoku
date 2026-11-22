@@ -6,6 +6,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -305,6 +306,7 @@ class FakeSocialClient:
     def __init__(self) -> None:
         self.read_calls: list[tuple[str, list[str]]] = []
         self.sent: list[tuple[str, str]] = []
+        self.removed: list[str] = []
 
     def mark_messages_read(
         self, access_token: str, user_id: str, message_ids
@@ -320,6 +322,10 @@ class FakeSocialClient:
 
     def send_message(self, access_token: str, user_id: str, content: str):
         self.sent.append((user_id, content))
+        return True
+
+    def remove_friend(self, access_token: str, user_id: str) -> bool:
+        self.removed.append(user_id)
         return True
 
 
@@ -641,6 +647,133 @@ class SocialPanelIsInWindowTests(unittest.TestCase):
         panel.close()
         self.assertEqual(seen, [True])
         self.assertFalse(panel.isVisible())
+
+
+class _FakeConfirmDialog:
+    """确认弹窗的替身：一律按“取消”处理。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.confirm_requested = False
+
+    def exec(self) -> int:
+        return 0
+
+
+class _ConfirmedDialog(_FakeConfirmDialog):
+    """确认弹窗的替身：一律按“删除”处理。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.confirm_requested = True
+
+
+class FriendRemovalTests(unittest.TestCase):
+    """删除好友：确认之前不能把这一行锁死。"""
+
+    def _friends_data(self, online: bool = True) -> dict:
+        return {
+            "friends": [
+                {
+                    "user_id": "u2",
+                    "username": "好友",
+                    "avatar": "lan",
+                    "online": online,
+                    "unread": 0,
+                }
+            ],
+            "incoming": [],
+            "outgoing": [],
+        }
+
+    def _row_buttons(self, panel: FriendsPanel) -> dict:
+        wanted = ("邀请对局", "聊天", "资料", "删除")
+        return {
+            button.text(): button
+            for button in panel.findChildren(QPushButton)
+            if button.text() in wanted
+        }
+
+    def _panel(self) -> OnlinePanel:
+        panel = OnlinePanel()
+        panel._auth_session = AuthSession(
+            access_token="token",
+            refresh_token="refresh",
+            user=AuthUser(id="me", username="我"),
+            expires_in=3600,
+        )
+        panel._social_client = FakeSocialClient()
+        return panel
+
+    def test_delete_click_keeps_row_usable(self) -> None:
+        """点“删除”只是弹确认框，确认之前不能把这一行锁死。"""
+        panel = FriendsPanel()
+        panel.set_data(self._friends_data())
+        removed: list[str] = []
+        panel.remove_requested.connect(removed.append)
+        buttons = self._row_buttons(panel)
+
+        buttons["删除"].click()
+
+        self.assertEqual(removed, ["u2"])
+        for text, button in buttons.items():
+            self.assertTrue(button.isEnabled(), f"{text} 不该被锁住")
+        panel.close()
+
+    def test_lock_and_unlock_friend_row(self) -> None:
+        """删除确认之后锁行；失败解锁后，行要恢复原样。"""
+        panel = FriendsPanel()
+        panel.set_data(self._friends_data(online=False))
+        buttons = self._row_buttons(panel)
+
+        panel.lock_friend_row("u2")
+        self.assertFalse(buttons["聊天"].isEnabled())
+
+        panel.unlock_friend_row("u2")
+        self.assertTrue(buttons["聊天"].isEnabled())
+        # 离线好友本来就不能邀请对局，解锁不能把它放开了。
+        self.assertFalse(buttons["邀请对局"].isEnabled())
+        panel.close()
+
+    def test_cancelling_delete_keeps_row_usable(self) -> None:
+        """在确认框里点“取消”，聊天和邀请对局还得能点。"""
+        panel = self._panel()
+        panel._friends_data = self._friends_data()
+        friends_panel = FriendsPanel(panel)
+        panel._friends_panel = friends_panel
+        friends_panel.set_data(panel._friends_data)
+        friends_panel.remove_requested.connect(panel._remove_friend)
+        buttons = self._row_buttons(friends_panel)
+
+        with mock.patch(
+            "gomoku.client.online_panel.ConfirmDialog",
+            _FakeConfirmDialog,
+        ):
+            buttons["删除"].click()
+
+        self.assertEqual(panel._social_client.removed, [])
+        for text, button in buttons.items():
+            self.assertTrue(button.isEnabled(), f"{text} 不该被锁住")
+        panel.close()
+
+    def test_confirming_delete_locks_row(self) -> None:
+        """确认删除之后要锁行，防止重复提交。"""
+        panel = self._panel()
+        panel._friends_data = self._friends_data()
+        friends_panel = FriendsPanel(panel)
+        panel._friends_panel = friends_panel
+        friends_panel.set_data(panel._friends_data)
+        friends_panel.remove_requested.connect(panel._remove_friend)
+        buttons = self._row_buttons(friends_panel)
+
+        with mock.patch(
+            "gomoku.client.online_panel.ConfirmDialog",
+            _ConfirmedDialog,
+        ):
+            buttons["删除"].click()
+
+        self.assertEqual(panel._social_client.removed, ["u2"])
+        self.assertFalse(buttons["聊天"].isEnabled())
+        panel.close()
 
 
 if __name__ == "__main__":
