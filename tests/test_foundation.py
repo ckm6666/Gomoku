@@ -12,6 +12,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from gomoku.client.auth import AuthSession  # noqa: E402
 from gomoku.client.config import AppConfig  # noqa: E402
+from gomoku.shared.capabilities import (  # noqa: E402
+    MAX_CAPABILITIES,
+    normalize_capabilities,
+)
 from gomoku.shared.errors import ConfigurationError, ProtocolError  # noqa: E402
 from gomoku.shared.protocol import (  # noqa: E402
     CLIENT_MOVE_INTENT,
@@ -171,11 +175,19 @@ class ProtocolTests(unittest.TestCase):
             "state_version": 5,
             "result_reason": "escape",
             "undo_requester_id": "u2",
+            "undo_remaining": 2,
+            "undo_limit": 3,
+            "undo_cooldown_until_ms": 123456,
+            "undo_cooldown_seconds": 10,
         }
         snapshot = parse_game_state(payload)
         self.assertEqual(snapshot.state_version, 5)
         self.assertEqual(snapshot.result_reason, "escape")
         self.assertEqual(snapshot.undo_requester_id, "u2")
+        self.assertEqual(snapshot.undo_remaining, 2)
+        self.assertEqual(snapshot.undo_limit, 3)
+        self.assertEqual(snapshot.undo_cooldown_until_ms, 123456)
+        self.assertEqual(snapshot.undo_cooldown_seconds, 10)
 
         bad_version = dict(payload)
         bad_version["state_version"] = -1
@@ -272,6 +284,21 @@ class ProtocolTests(unittest.TestCase):
         bad_delta["rating_delta"] = "plus"
         with self.assertRaises(ProtocolError):
             parse_game_state(bad_delta)
+
+    def test_capabilities_are_normalized(self) -> None:
+        self.assertEqual(
+            normalize_capabilities(
+                ["spectate", " spectate ", "undo_quota"]
+            ),
+            ("spectate", "undo_quota"),
+        )
+        self.assertEqual(normalize_capabilities(None), ())
+        with self.assertRaises(ProtocolError):
+            normalize_capabilities("spectate")
+        with self.assertRaises(ProtocolError):
+            normalize_capabilities([1])
+        with self.assertRaises(ProtocolError):
+            normalize_capabilities(["x"] * (MAX_CAPABILITIES + 1))
 
     def test_message_type_constant_is_exported(self) -> None:
         self.assertEqual(SERVER_GAME_STATE, "game_state")

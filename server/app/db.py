@@ -1,8 +1,9 @@
 """异步数据库引擎与建表辅助。
 
 本机好友内测默认 SQLite + aiosqlite；SQLAlchemy URL 保持可切换到
-PostgreSQL（生产配置见 README）。当前阶段使用 ``create_all`` 建表，
-正式公开化前再引入 Alembic 版本化迁移。
+PostgreSQL（生产配置见 README）。正常启动由
+:mod:`server.app.migrations` 执行 Alembic 迁移；``create_tables`` 仅保留
+给引入 Alembic 之前创建的旧库做一次性兼容登记。
 """
 
 from __future__ import annotations
@@ -10,9 +11,10 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, cast
 
 from sqlalchemy import event, inspect, text, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -33,6 +35,15 @@ class Base(DeclarativeBase):
 def utcnow_naive() -> datetime:
     """SQLite/跨数据库更简单的 UTC 无时区时间。"""
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def rowcount_of(result: Any) -> int:
+    """返回 UPDATE/DELETE 的影响行数。
+
+    ``AsyncSession.execute`` 的静态类型是通用 ``Result``，但 DML 实际返回
+    ``CursorResult``；这里统一收窄，避免每个调用点重复 cast。
+    """
+    return int(cast(CursorResult[Any], result).rowcount or 0)
 
 
 def create_engine(settings: Settings) -> AsyncEngine:
@@ -135,6 +146,7 @@ def _apply_additive_schema(connection) -> None:
 
 
 async def create_tables(engine: AsyncEngine) -> None:
+    """旧库兼容建表：仅由 ``prepare_database`` 的 legacy 分支调用。"""
     # 延迟导入，避免 Base 与模型模块的循环导入。
     from server.app import models  # noqa: F401
 
@@ -165,7 +177,7 @@ async def mark_unfinished_games_abandoned(
             )
         )
         await session.commit()
-        count = result.rowcount or 0
+        count = rowcount_of(result)
     if count:
         logger.warning("服务启动：作废 %s 个未完成对局", count)
     return count
@@ -185,6 +197,7 @@ __all__ = [
     "create_session_factory",
     "create_tables",
     "mark_unfinished_games_abandoned",
+    "rowcount_of",
     "sqlite_path_from_url",
     "utcnow_naive",
 ]

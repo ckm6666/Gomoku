@@ -80,7 +80,7 @@ class WebSocketGameTests(ServerTestBase):
                     )
                 )
                 host_after = host.receive_json()
-                guest_after = guest.receive_json()
+                guest.receive_json()
                 self.assertEqual(host_after["type"], SERVER_GAME_STATE)
                 self.assertEqual(host_after["request_id"], "move-1")
                 snap = parse_game_state(host_after["payload"])
@@ -108,7 +108,7 @@ class WebSocketGameTests(ServerTestBase):
                     )
                 )
                 host_after2 = host.receive_json()
-                guest_after2 = guest.receive_json()
+                guest.receive_json()
                 self.assertEqual(
                     parse_game_state(host_after2["payload"]).move_no, 2
                 )

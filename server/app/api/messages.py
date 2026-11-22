@@ -21,7 +21,7 @@ from server.app.api.social_helpers import (
     avatar_version_of,
     push_direct_message,
 )
-from server.app.db import utcnow_naive
+from server.app.db import rowcount_of, utcnow_naive
 from server.app.dependencies import get_current_user, get_db
 from server.app.models import DirectMessage, User
 from server.app.schemas import (
@@ -220,7 +220,7 @@ async def mark_messages_read(
         .values(read_at=utcnow_naive())
     )
     await session.commit()
-    return MarkMessagesReadResponse(read_count=int(result.rowcount or 0))
+    return MarkMessagesReadResponse(read_count=rowcount_of(result))
 
 
 @router.post(

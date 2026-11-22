@@ -1,0 +1,45 @@
+# 生产取向的 Compose：服务端 + PostgreSQL。
+#
+# 启动前在同一目录创建 .env（已被 .gitignore 忽略），至少包含：
+#   GOMOKU_JWT_SECRET=至少32字符的随机字符串
+#   GOMOKU_DB_PASSWORD=URL安全字符的数据库密码
+#
+#   docker compose up -d --build
+
+name: gomoku
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: gomoku
+      POSTGRES_USER: gomoku
+      POSTGRES_PASSWORD: ${GOMOKU_DB_PASSWORD:?set GOMOKU_DB_PASSWORD in .env}
+    volumes:
+      - gomoku-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gomoku -d gomoku"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      GOMOKU_SERVER_ENV: production
+      GOMOKU_JWT_SECRET: ${GOMOKU_JWT_SECRET:?set GOMOKU_JWT_SECRET in .env}
+      GOMOKU_DATABASE_URL: "postgresql+asyncpg://gomoku:${GOMOKU_DB_PASSWORD}@db:5432/gomoku"
+      GOMOKU_LOG_LEVEL: INFO
+      GOMOKU_LOG_FORMAT: json
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+volumes:
+  gomoku-db:

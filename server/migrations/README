@@ -1,0 +1,27 @@
+# 数据库迁移（Alembic）
+
+- 版本文件位于 `versions/`，当前基线为 `0001_baseline`。
+- 服务启动时由 `server.app.migrations.prepare_database` 自动升级到 head。
+- 修改 `server/app/models.py` 后，必须生成新的版本化迁移，不能只依赖
+  `create_all` 修改已存在的表。
+
+在项目根目录生成新迁移（先准备一个可用的数据库）：
+
+```powershell
+$env:GOMOKU_DATABASE_URL = "sqlite+aiosqlite:///server/data/gomoku.db"
+server\.venv\Scripts\alembic.exe -c server\alembic.ini revision --autogenerate -m "描述"
+```
+
+检查/升级：
+
+```powershell
+server\.venv\Scripts\alembic.exe -c server\alembic.ini current
+server\.venv\Scripts\alembic.exe -c server\alembic.ini upgrade head
+```
+
+注意：
+
+- `server/alembic.ini` 必须保持 ASCII，Alembic 使用系统 locale 读取它。
+- 新迁移文件生成后请人工检查，尤其是唯一约束、索引和 SQLite/PostgreSQL
+  兼容性。
+- 多实例部署前需要为迁移增加数据库级 advisory lock，避免并发升级。

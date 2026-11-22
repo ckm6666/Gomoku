@@ -14,11 +14,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from fastapi.testclient import TestClient
+from fastapi.testclient import TestClient  # noqa: E402
 
-from server.app.config import Settings
-from server.app.main import create_app
-from server.app.security import LoginBackoff
+from server.app.config import Settings  # noqa: E402
+from server.app.main import create_app  # noqa: E402
+from server.app.security import LoginBackoff  # noqa: E402
 
 
 class ServerTestBase(unittest.TestCase):
@@ -26,6 +26,13 @@ class ServerTestBase(unittest.TestCase):
 
     #: 掉线判负宽限；需要验证“逃跑”的用例可以调短。
     disconnect_forfeit_seconds: float = 20.0
+    #: 公平性/资源限制；具体用例可覆盖。
+    undo_limit_per_game: int = 3
+    undo_cooldown_seconds: float = 0.0
+    max_spectators_per_room: int = 50
+    max_connections_per_ip: int = 200
+    ws_command_burst: int = 40
+    ws_command_window_seconds: float = 10.0
 
     def setUp(self) -> None:
         # Windows 上 SQLite 文件句柄的释放有延迟，临时目录偶尔会删不掉
@@ -43,6 +50,13 @@ class ServerTestBase(unittest.TestCase):
             turn_seconds=30,
             ws_auth_timeout_seconds=2.0,
             disconnect_forfeit_seconds=self.disconnect_forfeit_seconds,
+            log_level="WARNING",
+            undo_limit_per_game=self.undo_limit_per_game,
+            undo_cooldown_seconds=self.undo_cooldown_seconds,
+            max_spectators_per_room=self.max_spectators_per_room,
+            max_connections_per_ip=self.max_connections_per_ip,
+            ws_command_burst=self.ws_command_burst,
+            ws_command_window_seconds=self.ws_command_window_seconds,
         )
         self.app = create_app(self.settings)
         self._client_cm = TestClient(self.app)

@@ -1,5 +1,7 @@
 # 五子棋 · 双人 / 人机 / 联机排位
 
+[![CI](https://github.com/ckm6666/Gomoku/actions/workflows/ci.yml/badge.svg)](https://github.com/ckm6666/Gomoku/actions/workflows/ci.yml)
+
 一个使用 **Python + PySide6** 编写的 Windows 桌面五子棋游戏：
 
 - 本地双人对战；
@@ -108,14 +110,18 @@
 - **好友与私聊**：按用户名搜索并发送好友申请，对方同意后成为好友；好友浮层显示在线状态，
   支持双方私聊，消息落库保存并支持离线补收。
 - **自建房**：创建后直接从在线好友列表邀请，对方接受即开局，不再需要房间码；休闲对局不计分。
-- **对战广场**：大厅右上角的“对战广场”按钮进入独立页面，集中列出所有正在进行中的对局
+  创建时可关闭“允许观战”，关闭后该局不会出现在对战广场，也不能被第三方旁观。
+- **对战广场**：大厅右上角的“对战广场”按钮进入独立页面，列出允许观战的进行中对局
   （双方昵称、模式、手数）。服务器在开局与终局时推送“对局列表变了”，页面据此即时增删条目，
   另有定时兜底刷新；断线期间的推送不会丢。
 - **观战**：在对战广场点“观战”即可进入旁观；观战者实时同步棋盘、回合与倒计时，但不能落子、
   认输、悔棋、再战、发言或邀请好友，对局双方也不会被打扰；点“退出观战”回到对战广场。
+  每局观战人数有上限，避免热门对局拖慢落子广播。
 - 每手 30 秒服务器倒计时；超时由服务器判负，排位赛同样计入积分。
-- 联机支持**悔棋请求**：只能在自己回合发起；服务器把请求转给对手，对手同意后
-  撤销请求者最后一手及其后的应手，拒绝或 30 秒未回应则棋盘保持不变。
+- 联机支持**悔棋请求**：只能在自己回合发起，每方每局有次数上限且两次请求之间有冷却；
+  服务器把请求转给对手，对手同意后撤销请求者最后一手及其后的应手，拒绝或 30 秒未回应
+  则棋盘保持不变。
+- 认输需要二次确认；排位中掉线、超时和认输都会计入服务器结算。
 - 断线保留房间，客户端自动重连并恢复权威快照；掉线超过 20 秒仍未重连则判对手
   获胜（逃跑），排位赛同样结算积分。
 - 自建房支持认输和双方确认再战（交换黑白）；排位赛不支持同一对手直接再战，
@@ -204,6 +210,7 @@ Gomoku/
 │   │   ├── puzzle.py               # 残局关卡模型与校验
 │   │   ├── record.py               # 棋谱 GameRecord 与校验
 │   │   ├── protocol.py             # 联机协议 v1、快照校验、排位/成就字段
+│   │   ├── capabilities.py         # 协议能力协商常量与校验（双端共用）
 │   │   ├── avatar.py               # 预置印章、自定义头像尺寸/体积约束（双端共用）
 │   │   ├── achievements.py         # 成就目录、解锁条件与进度推导（双端共用）
 │   │   ├── chat.py                 # 表情/评论预设、校验与限流常量（双端共用）
@@ -232,7 +239,14 @@ Gomoku/
 │       ├── config.py               # 非敏感环境配置
 │       ├── logging_setup.py        # 滚动日志与未捕获异常记录
 │       ├── main_window.py          # 主菜单、离线/残局 UI、会话切换、棋谱记录
-│       ├── online_panel.py         # 登录、大厅、对战广场、排行榜、最近对局、联机对局 UI
+│       ├── online_panel.py         # 联机页面编排、网络/会话/UI 同步
+│       ├── online_pages/           # 联机页面构建器
+│       │   ├── auth_page.py        # 登录/注册页
+│       │   ├── lobby_page.py       # 大厅、排位入口、排行榜、最近对局
+│       │   ├── game_page.py        # 对局/观战页棋盘、聊天与操作栏
+│       │   ├── plaza_page.py       # 对战广场（进行中对局列表/刷新/观战入口）
+│       │   └── common.py           # 页面共用常量与空棋盘快照
+│       ├── online_player_card.py   # 联机对局玩家身份卡（头像/执子/积分/勋章）
 │       ├── avatar_widgets.py       # 预置/自定义头像绘制、头像按钮
 │       ├── avatar_images.py        # 自定义头像缓存、异步下载与上传前裁切编码
 │       ├── achievement_widgets.py  # 勋章绘制与完整成就墙浮层
@@ -266,12 +280,16 @@ Gomoku/
 │           ├── local.py            # 本地双人会话
 │           ├── ai.py               # 人机会话
 │           ├── puzzle.py           # 残局会话（限手数 + AI 防守）
+│           ├── online_state.py     # 联机高层阶段枚举（lobby/queued/waiting/playing/spectating）
 │           └── online.py           # 联机/排位服务器确认状态机
 ├── server/                         # 独立 FastAPI 服务端
 │   ├── app/
 │   │   ├── ratings.py              # Elo 与段位纯函数
 │   │   ├── achievement_service.py  # 由账号统计推导成就的服务端辅助
 │   │   ├── avatar_service.py       # 自定义头像 data URL 校验/解码
+│   │   ├── migrations.py           # 启动时执行 Alembic upgrade / 旧库登记基线
+│   │   ├── metrics.py              # Prometheus 指标与房间状态 collector
+│   │   ├── observability.py        # 结构化日志、请求 ID、用户上下文
 │   │   ├── models.py               # 账号/令牌/对局/落子/积分/好友/私聊
 │   │   ├── api/auth.py             # 注册/登录/刷新/登出/me
 │   │   ├── api/ranked.py           # 个人排位资料与排行榜
@@ -279,14 +297,28 @@ Gomoku/
 │   │   ├── api/friends.py          # 好友申请/列表/删除
 │   │   ├── api/messages.py         # 好友私聊历史/发送/已读销账
 │   │   ├── api/games.py            # 最近对局/单局棋谱（仅参与者）与进行中对局列表（观战入口）
-│   │   └── ws/rooms.py             # 自建房邀请、匹配队列、排位结算、时钟、重连、观战
-│   ├── tests/                      # REST + 双/三 WebSocket + Elo/社交/观战测试
+│   │   └── ws/
+│   │       ├── entities.py         # 连接/房间/邀请/队列纯数据实体
+│   │       ├── limits.py           # 命令令牌桶与单 IP 连接配额
+│   │       └── rooms.py            # 自建房邀请、匹配队列、排位结算、时钟、重连、观战
+│   ├── migrations/                 # Alembic 版本化迁移（0001_baseline 起）
+│   ├── alembic.ini                 # 迁移脚本路径与数据库 URL 占位
+│   ├── Dockerfile                  # 服务端生产镜像（非 root、健康检查）
+│   ├── tests/                      # REST + 双/三 WebSocket + Elo/社交/观战/迁移/可观测性测试
 │   ├── requirements*.txt
 │   ├── manage.py                   # 管理员重置密码
 │   └── README.md                   # 服务端安装、部署、PostgreSQL、TLS 说明
-├── tests/                          # 客户端 287 项自动化测试
-├── requirements.txt                # 客户端运行依赖
+├── tests/                          # 客户端 294 项自动化测试
+├── requirements.txt                # 客户端运行依赖（人工维护的版本范围）
+├── requirements.lock               # 客户端运行依赖锁定（含哈希）
+├── requirements-tools.txt          # ruff / mypy / coverage 工具依赖
+├── requirements-tools.lock         # 工具依赖锁定（含哈希）
 ├── requirements-dev.txt            # 客户端开发/打包依赖
+├── requirements-dev.lock           # 开发/打包依赖锁定（含哈希）
+├── pyproject.toml                  # ruff / mypy / coverage 配置
+├── .github/workflows/ci.yml        # CI：lint、类型检查、双端测试、exe/镜像构建
+├── docker-compose.yml              # 服务端 + PostgreSQL 生产取向编排
+├── server/Dockerfile               # 服务端生产镜像
 ├── README.md                       # 本文件
 └── dist/
     └── Gomoku.exe                  # PyInstaller 产物
@@ -310,13 +342,22 @@ cd C:\Users\a1325\Desktop\Gomoku
 .\.venv\Scripts\python.exe main.py
 ```
 
-从零创建：
+从零创建（可复现安装，推荐）：
 
 ```powershell
 py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements.lock
 .\.venv\Scripts\python.exe main.py
 ```
+
+需要开发/打包工具时：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-dev.lock
+```
+
+CI 使用同一套锁文件；如果只是本地调试且不关心版本漂移，也可以继续用
+`pip install -r requirements.txt` / `-r requirements-dev.txt`。
 
 依赖包括：
 
@@ -359,12 +400,24 @@ server\.venv\Scripts\python.exe -m uvicorn server.app.main:app --host 127.0.0.1 
 
 - 注册只需用户名和密码，直接在客户端“联机对战”页完成，无需任何额外凭据。
 - 客户端开发环境默认访问 `http://127.0.0.1:8000` 和 `ws://127.0.0.1:8000/api/v1/ws`。
-- 服务端首次启动会自动在 `server/data/gomoku.db` 建表；Stage 1 旧数据库会自动补上
-  `users.rating` 等积分列和 `rating_events` 表，不需要手工迁移。
+- 服务端首次启动会通过 Alembic 基线迁移在 `server/data/gomoku.db` 建表；引入 Alembic
+  之前创建的旧库会自动补齐历史增量列/表、登记基线并升级到 head，不需要手工迁移。
+  之后的结构变更统一通过 `server/migrations/versions/` 中的版本化迁移完成。
 - 启动本机服务后，打开客户端 → 主菜单“联机对战” → 用用户名 + 密码注册/登录 → 大厅直接
   “开始排位匹配”，或创建自建房后从好友列表邀请在线好友。
 - 默认开发环境没有外部数据库；生产 PostgreSQL、TLS、部署与安全说明见
   [`server/README.md`](server/README.md)。
+
+### 日志、健康检查与指标
+
+- 服务端日志只记录元数据（请求 ID、路由、状态码、耗时、用户/对局 ID），
+  不记录请求体、密码或 token；生产可设 `GOMOKU_LOG_FORMAT=json` 输出 JSON。
+- `GET /api/v1/health/ready` 会检查数据库，适合容器 readiness/负载均衡探针；
+  `GET /api/v1/health` 与 `/health/live` 是轻量存活检查。
+- `GET /metrics` 提供 Prometheus 指标（HTTP 耗时、在线连接、房间/观战数、
+  落子与数据库耗时、对局开始/结束、重连等）；生产应在反向代理层限制访问。
+- 项目根目录提供 `docker-compose.yml`（服务端 + PostgreSQL），详见
+  [`server/README.md`](server/README.md#docker-部署)。
 
 如果服务端不在本机，需在启动客户端前设置：
 
@@ -385,14 +438,14 @@ $env:GOMOKU_WS_BASE_URL  = "wss://your-domain.example"
 | 排位落子 | 服务器确认后显示棋子；等待期间棋盘锁定 |
 | 排位认输/超时 | 对手获胜，服务器结算 Elo 积分 |
 | 继续排位 | 终局后离开当前排位房并重新匹配，不支持同一对手直接再战 |
-| 创建自建房 | 房主执黑，等待好友；不计分，也不需要房间码 |
+| 创建自建房 | 房主执黑，等待好友；不计分，也不需要房间码；可勾选是否允许观战 |
 | 邀请好友 | 在等待页面点击“邀请好友”，选择在线好友；对方接受后自动开局 |
 | 对战广场 | 大厅右上角进入独立页面，集中管理所有进行中的对局；对局开始自动出现、结束自动消失 |
 | 观战 | 在对战广场点“观战”进入旁观；只读，可随时“退出观战”回到对战广场 |
 | 个人信息 | 点击大厅/排行榜/对局头像查看资料；本人可更换头像，他人可加好友或发消息 |
 | 好友/私聊 | 大厅“好友”入口处理申请、查看在线状态、打开私聊浮层 |
 | 认输 | 进行中可认输，对手获胜 |
-| 悔棋 | 自己的回合可请求；对手同意后撤销自己上一手及其后的应手，拒绝/超时则继续当前局面 |
+| 悔棋 | 自己的回合可请求；有每局次数上限和请求冷却；对手同意后撤销自己上一手及其后的应手，拒绝/超时则继续当前局面 |
 | 再来一局 | 仅自建房：双方都点击申请后，服务器开新局并交换黑白 |
 | 离开房间 | 等待中或终局后可用；进行中请先认输 |
 | 断线重连 | 客户端自动尝试重连；20 秒内重连可恢复完整快照，否则判对手获胜（逃跑） |
@@ -490,17 +543,59 @@ cd C:\Users\a1325\Desktop\Gomoku
 server\.venv\Scripts\python.exe -m unittest discover -s server/tests -v
 ```
 
-客户端当前 **287 项**测试覆盖规则、AI、配置/协议、本地/AI/在线会话、排位快照/匹配队列、
+静态检查（CI 会执行同样的命令）：
+
+```powershell
+.\.venv\Scripts\python.exe -m ruff check gomoku tests server/app server/tests server/migrations main.py build.py run_server.py tools
+
+# 类型检查使用服务端依赖环境，与 CI 一致：
+server\.venv\Scripts\python.exe -m pip install --require-hashes -r server\requirements-dev.lock -r requirements-tools.lock
+server\.venv\Scripts\python.exe -m mypy gomoku/shared server/app
+```
+
+需要看覆盖率时：
+
+```powershell
+.\.venv\Scripts\python.exe -m coverage run --branch --source=gomoku -m unittest discover -s tests -t .
+.\.venv\Scripts\python.exe -m coverage report
+```
+
+GitHub Actions 会在 push/PR 时自动执行 ruff、mypy（shared + server）、
+Windows 客户端测试（Python 3.13/3.14）和 Linux 服务端测试（Python 3.13/3.14），
+并输出覆盖率、`dist/Gomoku.exe` 构建产物，以及 Docker 镜像启动/readiness
+smoke test；当前覆盖率基线约为客户端 71%、服务端 78%。
+
+CI 安装依赖时使用带哈希的锁文件，避免同一提交在不同时间装出不同版本。修改
+`requirements*.txt` 或 `server/requirements.txt` 后，需要重新生成锁文件：
+
+```powershell
+.\.venv\Scripts\uv.exe pip compile --universal --generate-hashes --no-header requirements.txt -o requirements.lock
+.\.venv\Scripts\uv.exe pip compile --universal --generate-hashes --no-header requirements-tools.txt -o requirements-tools.lock
+.\.venv\Scripts\uv.exe pip compile --universal --generate-hashes --no-header requirements-dev.txt -o requirements-dev.lock
+.\.venv\Scripts\uv.exe pip compile --universal --generate-hashes --no-header server\requirements.txt -o server\requirements.lock
+.\.venv\Scripts\uv.exe pip compile --universal --generate-hashes --no-header server\requirements-dev.txt -o server\requirements-dev.lock
+.\.venv\Scripts\uv.exe pip compile --universal --generate-hashes --no-header server\requirements-postgres.txt -o server\requirements-postgres.lock
+```
+
+服务端开发/测试可复现安装：
+
+```powershell
+server\.venv\Scripts\python.exe -m pip install --require-hashes -r server\requirements-dev.lock
+```
+
+客户端当前 **294 项**测试覆盖规则、AI、配置/协议、协议能力协商、联机阶段状态机、本地/AI/在线会话、排位快照/匹配队列、
 程序化音频/MP3 解码/缓存/设置持久化、按钮点击滤波器、主菜单导航/返回确认、古风主题资源/
-绘制、终局与确认弹窗、双人模式设置栏和离屏 UI/QThread；在线悔棋请求/回滚快照与逃跑/
-认输胜利提示文案；表情/评论协议校验与清洗、在线会话发言冷却与信号路由、弹幕覆盖层绘制
+绘制、终局与确认弹窗、双人模式设置栏和离屏 UI/QThread；在线悔棋请求/回滚快照/配额与
+冷却、认输二次确认、逃跑/认输胜利提示文案；表情/评论协议校验与清洗、在线会话发言冷却与信号路由、弹幕覆盖层绘制
 与方向、对话日志折叠与持久化；残局题库/残局会话、棋谱模型/JSONL 存储、复盘时间线与复盘
 窗口测试；VCF/VCT 威胁搜索、Zobrist/置换表、开局库、大师档与 AI 提示；以及头像/个人信息、
 好友申请与列表、私聊历史/发送、邀请对局消息、排行榜头像、自定义头像裁切编码、成就进度
 推导、成就墙与勋章 UI 测试；以及观战会话（只读权限门控、观战页面只读渲染）、对战广场页面
 （大厅只留入口、进入广场、推送与定时刷新、退出观战回到广场）。
-服务端当前 **76 项**测试覆盖用户名 + 密码注册/登录/refresh 重放/登出、双 WebSocket 建房/邀请/加入/落子/拒绝/认输/再战、
-五连终局和断线重连、悔棋请求的同意/拒绝与数据库回滚、掉线宽限后的逃跑判负、快速匹配/取消、
+服务端当前 **95 项**测试覆盖用户名 + 密码注册/登录/refresh 重放/登出、双 WebSocket 建房/邀请/加入/落子/拒绝/认输/再战、
+五连终局和断线重连、悔棋请求的同意/拒绝与数据库回滚、悔棋次数/冷却、掉线宽限后的逃跑判负、
+Alembic 全新库/旧库兼容迁移与重复启动幂等、健康检查/请求 ID/Prometheus 指标、
+单 IP 连接数与 WS 命令限流、观战开关/人数上限、协议能力协商与限流器单元测试、快速匹配/取消、
 排位 Elo 结算、自建房不计分、排行榜/资料接口、积分纯函数，最近对局/单局棋谱的参与者权限、
 分页和认输终局，以及头像更新、自定义头像上传/读取/移除与非法图片拒绝、用户搜索、好友
 申请/同意/删除、好友在线状态推送、私聊历史/推送、自建房邀请的接受/拒绝流程和排位连胜/首胜
@@ -517,7 +612,7 @@ UI 测试自动使用 `QT_QPA_PLATFORM=offscreen`，不启动真实网络；真�
 客户端 .venv 安装构建依赖：
 
 ```powershell
-pip install -r requirements-dev.txt
+pip install --require-hashes -r requirements-dev.lock
 ```
 
 推荐用仓库自带的打包脚本（等价于下面的 pyinstaller 命令，并额外检查依赖、
@@ -590,7 +685,11 @@ Authorization 头或 token。当前客户端 token 只保存在内存，关闭�
   refresh token；登录失败只返回通用错误，不按失败次数锁定账号或 IP。
 - 联机棋谱接口只允许对局参与者读取；暂不提供公开分享或第三方导出。
 - 观战只读：观战者不占座位、不落子、不发言，服务器按用户分别下发快照（观战者没有执子
-  颜色）；观战名单只存在于单进程内存，不落库、不对外暴露房间码。
+  颜色）；观战名单只存在于单进程内存，不落库、不对外暴露房间码。自建房可关闭观战，
+  关闭后不进入广场也不能被旁观；每局观战人数有上限。
+- 悔棋每方每局有次数上限和请求冷却；认输需要客户端二次确认。
+- 服务端限制单 IP 的已认证 WebSocket 连接数，并对非心跳命令做令牌桶限流；聊天另有独立限流。
+  生产位于可信反向代理之后时，需显式开启 `GOMOKU_TRUST_PROXY_HEADERS` 才能按真实客户端 IP 限流。
 - 只有公开匹配计分，自建房和再战不计分，排位房只能匹配加入、排位终局不能直接再战，
   但这些措施不能完全杜绝排队串通、故意送分或外部 AI 辅助；当前不作为严格竞技排位运营。
 - 匹配队列和房间状态在单进程内存中；生产只能运行一个 Uvicorn worker，多实例需要

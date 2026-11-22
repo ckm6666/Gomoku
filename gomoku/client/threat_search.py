@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from enum import IntEnum
 from threading import Event
-from typing import Iterable, Optional, Sequence
+from typing import Optional, Sequence
 
 from gomoku.client.board_geometry import neighbor_empty_cells
 from gomoku.shared.rules import (

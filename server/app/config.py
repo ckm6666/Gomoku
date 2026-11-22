@@ -56,6 +56,18 @@ class Settings:
     disconnect_forfeit_seconds: float = 20.0
     max_ws_message_chars: int = 8192
     room_code_length: int = 8
+    # 日志级别与格式（text/json）；生产建议 json 便于采集。
+    log_level: str = "INFO"
+    log_format: str = "text"
+    # 公平性与资源限制。
+    undo_limit_per_game: int = 3
+    undo_cooldown_seconds: float = 10.0
+    max_spectators_per_room: int = 50
+    max_connections_per_ip: int = 20
+    ws_command_burst: int = 40
+    ws_command_window_seconds: float = 10.0
+    # 仅在服务端位于可信反向代理之后时开启，用于读取 X-Forwarded-For。
+    trust_proxy_headers: bool = False
 
     @property
     def is_development(self) -> bool:
@@ -122,6 +134,58 @@ class Settings:
                 "GOMOKU_DISCONNECT_FORFEIT_SECONDS 必须在 0～300 秒"
             )
 
+        log_level = source.get("GOMOKU_LOG_LEVEL", "INFO").strip().upper()
+        if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise ConfigurationError(
+                "GOMOKU_LOG_LEVEL 必须是 DEBUG/INFO/WARNING/ERROR/CRITICAL"
+            )
+        log_format = source.get("GOMOKU_LOG_FORMAT", "text").strip().lower()
+        if log_format not in {"text", "json"}:
+            raise ConfigurationError("GOMOKU_LOG_FORMAT 必须是 text 或 json")
+
+        undo_limit = _int_env(
+            source, "GOMOKU_UNDO_LIMIT_PER_GAME", 3, 0, 20
+        )
+        max_spectators = _int_env(
+            source, "GOMOKU_MAX_SPECTATORS_PER_ROOM", 50, 0, 1000
+        )
+        max_connections = _int_env(
+            source, "GOMOKU_MAX_CONNECTIONS_PER_IP", 20, 1, 1000
+        )
+        ws_burst = _int_env(
+            source, "GOMOKU_WS_COMMAND_BURST", 40, 1, 1000
+        )
+        try:
+            undo_cooldown = float(
+                source.get("GOMOKU_UNDO_COOLDOWN_SECONDS", "10").strip()
+            )
+            ws_window = float(
+                source.get(
+                    "GOMOKU_WS_COMMAND_WINDOW_SECONDS", "10"
+                ).strip()
+            )
+        except ValueError as exc:
+            raise ConfigurationError("悔棋/命令限流参数必须是数字") from exc
+        if undo_cooldown < 0 or undo_cooldown > 600:
+            raise ConfigurationError(
+                "GOMOKU_UNDO_COOLDOWN_SECONDS 必须在 0～600 秒"
+            )
+        if ws_window < 1 or ws_window > 3600:
+            raise ConfigurationError(
+                "GOMOKU_WS_COMMAND_WINDOW_SECONDS 必须在 1～3600 秒"
+            )
+        trust_raw = source.get(
+            "GOMOKU_TRUST_PROXY_HEADERS", "0"
+        ).strip().lower()
+        if trust_raw in {"1", "true", "yes", "on"}:
+            trust_proxy_headers = True
+        elif trust_raw in {"", "0", "false", "no", "off"}:
+            trust_proxy_headers = False
+        else:
+            raise ConfigurationError(
+                "GOMOKU_TRUST_PROXY_HEADERS 必须是 0/1/true/false"
+            )
+
         return cls(
             environment=environment,
             database_url=database_url,
@@ -133,6 +197,15 @@ class Settings:
             ws_idle_timeout_seconds=idle_timeout,
             disconnect_forfeit_seconds=disconnect_forfeit,
             room_code_length=8,
+            log_level=log_level,
+            log_format=log_format,
+            undo_limit_per_game=undo_limit,
+            undo_cooldown_seconds=undo_cooldown,
+            max_spectators_per_room=max_spectators,
+            max_connections_per_ip=max_connections,
+            ws_command_burst=ws_burst,
+            ws_command_window_seconds=ws_window,
+            trust_proxy_headers=trust_proxy_headers,
         )
 
 

@@ -5,6 +5,16 @@ from __future__ import annotations
 import asyncio
 import unittest
 
+from starlette.websockets import WebSocketDisconnect
+
+from gomoku.shared.capabilities import SERVER_CAPABILITIES
+from gomoku.shared.protocol import (
+    CLIENT_AUTH,
+    CLIENT_PING,
+    SERVER_AUTHENTICATED,
+    SERVER_PONG,
+    make_message,
+)
 from server.app.security import LoginBackoff
 from server.tests.helpers import ServerTestBase
 
@@ -53,6 +63,41 @@ class AuthAPITests(ServerTestBase):
         response = self.client.get("/api/v1/health")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "ok")
+
+    def test_websocket_auth_reports_capabilities(self) -> None:
+        response = self.register("capability_player")
+        token = response.json()["access_token"]
+        with self.client.websocket_connect("/api/v1/ws") as ws:
+            ws.send_json(
+                make_message(
+                    CLIENT_AUTH,
+                    {
+                        "access_token": token,
+                        "capabilities": ["spectate", "future_feature"],
+                    },
+                )
+            )
+            message = ws.receive_json()
+            self.assertEqual(message["type"], SERVER_AUTHENTICATED)
+            reported = set(message["payload"]["capabilities"])
+            self.assertTrue(set(SERVER_CAPABILITIES).issubset(reported))
+            # 收到 pong 说明 attach 已完成、命令循环已启动，关闭时不会
+            # 与 attach 的异步收尾竞争。
+            ws.send_json(make_message(CLIENT_PING, {}))
+            self.assertEqual(ws.receive_json()["type"], SERVER_PONG)
+
+    def test_websocket_auth_rejects_bad_capabilities(self) -> None:
+        response = self.register("bad_capability_player")
+        token = response.json()["access_token"]
+        with self.client.websocket_connect("/api/v1/ws") as ws:
+            ws.send_json(
+                make_message(
+                    CLIENT_AUTH,
+                    {"access_token": token, "capabilities": "spectate"},
+                )
+            )
+            with self.assertRaises(WebSocketDisconnect):
+                ws.receive_json()
 
     def test_register_login_me(self) -> None:
         response = self.register("棋手甲")

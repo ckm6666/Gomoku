@@ -46,8 +46,15 @@ class _SpectateTestBase(ServerTestBase):
         message = ws.receive_json()
         self.assertEqual(message["type"], SERVER_AUTHENTICATED)
 
-    def _open_game(self, host, guest) -> str:
-        host.send_json(make_message(CLIENT_CREATE_ROOM, {}))
+    def _open_game(
+        self, host, guest, allow_spectators: bool = True
+    ) -> str:
+        host.send_json(
+            make_message(
+                CLIENT_CREATE_ROOM,
+                {"allow_spectators": allow_spectators},
+            )
+        )
         created = host.receive_json()
         self.assertEqual(created["type"], SERVER_ROOM_CREATED)
         code = created["payload"]["room_code"]
@@ -520,6 +527,80 @@ class LiveGamesApiTests(_SpectateTestBase):
                 self.assertNotIn(
                     game_id, [entry["game_id"] for entry in body["entries"]]
                 )
+
+
+class SpectatePrivacyTests(_SpectateTestBase):
+    def test_private_room_not_listed_or_watchable(self) -> None:
+        host_token, _ = self._register_access("private_host")
+        guest_token, _ = self._register_access("private_guest")
+        viewer_token, _ = self._register_access("private_viewer")
+
+        with self.client.websocket_connect("/api/v1/ws") as host:
+            with self.client.websocket_connect("/api/v1/ws") as guest:
+                with self.client.websocket_connect("/api/v1/ws") as viewer:
+                    self._authenticate(host, host_token)
+                    self._authenticate(guest, guest_token)
+                    self._authenticate(viewer, viewer_token)
+                    game_id = self._open_game(
+                        host, guest, allow_spectators=False
+                    )
+
+                    response = self.client.get(
+                        "/api/v1/games/live",
+                        headers=self.auth_headers(viewer_token),
+                    )
+                    self.assertEqual(
+                        response.status_code, 200, response.text
+                    )
+                    live_ids = [
+                        entry["game_id"]
+                        for entry in response.json()["entries"]
+                    ]
+                    self.assertNotIn(game_id, live_ids)
+
+                    viewer.send_json(
+                        make_message(
+                            CLIENT_WATCH_GAME, {"game_id": game_id}
+                        )
+                    )
+                    error = self._receive_type(viewer, SERVER_ERROR)
+                    self.assertIn(
+                        "未开启观战", error["payload"]["reason"]
+                    )
+
+
+class SpectatorCapTests(_SpectateTestBase):
+    max_spectators_per_room = 1
+
+    def test_spectator_cap_is_enforced(self) -> None:
+        host_token, _ = self._register_access("cap_host")
+        guest_token, _ = self._register_access("cap_guest")
+        first_token, _ = self._register_access("cap_viewer1")
+        second_token, _ = self._register_access("cap_viewer2")
+
+        with self.client.websocket_connect("/api/v1/ws") as host:
+            with self.client.websocket_connect("/api/v1/ws") as guest:
+                with self.client.websocket_connect("/api/v1/ws") as first:
+                    with self.client.websocket_connect(
+                        "/api/v1/ws"
+                    ) as second:
+                        self._authenticate(host, host_token)
+                        self._authenticate(guest, guest_token)
+                        self._authenticate(first, first_token)
+                        self._authenticate(second, second_token)
+                        game_id = self._open_game(host, guest)
+
+                        self._watch(first, game_id)
+                        second.send_json(
+                            make_message(
+                                CLIENT_WATCH_GAME,
+                                {"game_id": game_id},
+                            )
+                        )
+                        error = self._receive_type(second, SERVER_ERROR)
+                        self.assertIn(
+                            "人数已满", error["payload"]["reason"]
+                        )
 
 
 if __name__ == "__main__":

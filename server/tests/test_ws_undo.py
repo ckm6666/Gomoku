@@ -12,6 +12,7 @@ from gomoku.shared.protocol import (
     CLIENT_UNDO_REQUEST,
     CLIENT_UNDO_RESPONSE,
     SERVER_AUTHENTICATED,
+    SERVER_ERROR,
     SERVER_GAME_STATE,
     SERVER_OPPONENT_STATUS,
     SERVER_ROOM_CREATED,
@@ -59,6 +60,36 @@ class _WsTestBase(ServerTestBase):
         )
         sender.receive_json()
         other.receive_json()
+
+    def _started_game(self, host, guest) -> None:
+        """黑、白各一手，轮到黑棋（房主）请求悔棋。"""
+        self._open_game(host, guest)
+        self._move(host, guest, 7, 7, "setup-m1")
+        self._move(guest, host, 7, 8, "setup-m2")
+
+    def _request_and_decline(self, host, guest) -> None:
+        host.send_json(
+            make_message(
+                CLIENT_UNDO_REQUEST,
+                {},
+                request_id="quota-request",
+            )
+        )
+        host.receive_json()  # status requested
+        host.receive_json()  # game state
+        guest.receive_json()  # status requested
+        guest.receive_json()  # game state
+        guest.send_json(
+            make_message(
+                CLIENT_UNDO_RESPONSE,
+                {"accept": False},
+                request_id="quota-decline",
+            )
+        )
+        host.receive_json()  # status declined
+        host.receive_json()  # game state
+        guest.receive_json()
+        guest.receive_json()
 
 
 class UndoRequestTests(_WsTestBase):
@@ -192,6 +223,57 @@ class UndoRequestTests(_WsTestBase):
                 self.assertEqual(
                     error["request_id"], "undo-out-of-turn"
                 )
+
+
+class UndoQuotaTests(_WsTestBase):
+    undo_limit_per_game = 1
+    undo_cooldown_seconds = 0.0
+
+    def test_undo_limit_is_enforced(self) -> None:
+        host_token = self._register_access("quota_host")
+        guest_token = self._register_access("quota_guest")
+        with self.client.websocket_connect("/api/v1/ws") as host:
+            with self.client.websocket_connect("/api/v1/ws") as guest:
+                self._authenticate(host, host_token)
+                self._authenticate(guest, guest_token)
+                self._started_game(host, guest)
+
+                self._request_and_decline(host, guest)
+                host.send_json(
+                    make_message(
+                        CLIENT_UNDO_REQUEST,
+                        {},
+                        request_id="quota-exhausted",
+                    )
+                )
+                error = host.receive_json()
+                self.assertEqual(error["type"], SERVER_ERROR)
+                self.assertIn("次数已用完", error["payload"]["reason"])
+
+
+class UndoCooldownTests(_WsTestBase):
+    undo_cooldown_seconds = 10.0
+
+    def test_undo_cooldown_is_enforced(self) -> None:
+        host_token = self._register_access("cooldown_host")
+        guest_token = self._register_access("cooldown_guest")
+        with self.client.websocket_connect("/api/v1/ws") as host:
+            with self.client.websocket_connect("/api/v1/ws") as guest:
+                self._authenticate(host, host_token)
+                self._authenticate(guest, guest_token)
+                self._started_game(host, guest)
+
+                self._request_and_decline(host, guest)
+                host.send_json(
+                    make_message(
+                        CLIENT_UNDO_REQUEST,
+                        {},
+                        request_id="cooldown-too-fast",
+                    )
+                )
+                error = host.receive_json()
+                self.assertEqual(error["type"], SERVER_ERROR)
+                self.assertIn("频繁", error["payload"]["reason"])
 
 
 class DisconnectForfeitTests(_WsTestBase):

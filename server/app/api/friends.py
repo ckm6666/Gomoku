@@ -23,7 +23,7 @@ from server.app.api.social_helpers import (
     ordered_pair,
     push_friend_event,
 )
-from server.app.db import utcnow_naive
+from server.app.db import rowcount_of, utcnow_naive
 from server.app.dependencies import get_current_user, get_db
 from server.app.models import DirectMessage, Friendship, User
 from server.app.ratings import rank_for_rating
@@ -251,7 +251,7 @@ async def accept_friend_request(
         )
         .values(status="accepted", updated_at=utcnow_naive())
     )
-    if result.rowcount == 0:
+    if rowcount_of(result) == 0:
         await session.rollback()
         raise HTTPException(
             status_code=404, detail="好友申请不存在或已处理"
@@ -294,7 +294,7 @@ async def decline_friend_request(
             Friendship.status == "pending",
         )
     )
-    if result.rowcount == 0:
+    if rowcount_of(result) == 0:
         await session.rollback()
         raise HTTPException(
             status_code=404, detail="好友申请不存在或已处理"
@@ -328,7 +328,7 @@ async def remove_friend(
             Friendship.status == "accepted",
         )
     )
-    if result.rowcount == 0:
+    if rowcount_of(result) == 0:
         await session.rollback()
         raise HTTPException(status_code=404, detail="好友关系不存在")
     await session.commit()
