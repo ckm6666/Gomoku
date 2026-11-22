@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,6 +15,8 @@ from server.app.models import Game, Move as MoveRow, RatingEvent, User
 from server.app.schemas import (
     GameDetailResponse,
     GameMove,
+    LiveGameEntry,
+    LiveGamesResponse,
     RecentGameEntry,
     RecentGamesResponse,
 )
@@ -121,6 +123,25 @@ async def recent_games(
         )
 
     return RecentGamesResponse(entries=entries, total=int(total or 0))
+
+
+@router.get("/games/live", response_model=LiveGamesResponse)
+async def live_games(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> LiveGamesResponse:
+    """当前正在进行中的对局列表，供观战入口挑选。
+
+    路由必须排在 ``/games/{game_id}`` 之前，否则 "live" 会被当成
+    对局编号。房间表只存在于应用生命周期内，所以先取属性再判断。
+    """
+    room_manager = getattr(request.app.state, "room_manager", None)
+    entries: list[LiveGameEntry] = []
+    if room_manager is not None:
+        entries = [
+            LiveGameEntry(**entry) for entry in room_manager.list_live_games()
+        ]
+    return LiveGamesResponse(entries=entries, total=len(entries))
 
 
 @router.get("/games/{game_id}", response_model=GameDetailResponse)

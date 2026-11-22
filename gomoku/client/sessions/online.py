@@ -45,12 +45,14 @@ from gomoku.shared.protocol import (
     CLIENT_RESIGN,
     CLIENT_UNDO_REQUEST,
     CLIENT_UNDO_RESPONSE,
+    CLIENT_WATCH_GAME,
     SERVER_AUTHENTICATED,
     SERVER_CHAT,
     SERVER_DIRECT_MESSAGE,
     SERVER_ERROR,
     SERVER_FRIEND_EVENT,
     SERVER_GAME_STATE,
+    SERVER_LIVE_GAMES_CHANGED,
     SERVER_MATCH_FOUND,
     SERVER_MOVE_REJECTED,
     SERVER_MESSAGE_TYPES,
@@ -132,6 +134,8 @@ class OnlineGameSession(GameSession):
     room_invite_result = Signal(object)  # 邀请发送/接受/拒绝结果
     friend_event = Signal(object)  # FriendEvent
     direct_message = Signal(object)  # DirectMessage
+    # 进行中的对局列表发生变化（有人开局或终局）。
+    live_games_changed = Signal()
 
     def __init__(
         self,
@@ -149,6 +153,8 @@ class OnlineGameSession(GameSession):
         self._waiting = False
         self._your_color: Optional[Player] = None
         self._game_id: Optional[str] = None
+        # 是否以旁观者身份观战：观战者没有执子颜色，也不能操作棋局。
+        self._spectating: bool = False
         self._active = False
         self._paused = False
         self._closed = False
@@ -218,10 +224,32 @@ class OnlineGameSession(GameSession):
         return self._opponent_online
 
     @property
+    def is_spectator(self) -> bool:
+        """当前是否只是旁观者（观战），而不是对局中的玩家。"""
+        return self._spectating
+
+    @property
     def opponent_username(self) -> str:
+        """对局中的另一方昵称。
+
+        旁观者不是任何一方，不能把其中一人说成自己的对手，因此观战时
+        返回两名玩家的昵称。
+        """
         if self._opponent_username:
             return self._opponent_username
-        if self._snapshot is None or self._your_color is None:
+        if self._snapshot is None:
+            return "对手"
+        if self._spectating:
+            names = [
+                name
+                for name in (
+                    self._snapshot.black_name,
+                    self._snapshot.white_name,
+                )
+                if name
+            ]
+            return "、".join(names) if names else "观战双方"
+        if self._your_color is None:
             return "对手"
         return (
             self._snapshot.white_name
@@ -231,6 +259,7 @@ class OnlineGameSession(GameSession):
 
     @property
     def your_username(self) -> str:
+        """自己的昵称；旁观者返回旁观者自己的昵称。"""
         if self._snapshot is None or self._your_color is None:
             return self._username
         return (
@@ -297,6 +326,9 @@ class OnlineGameSession(GameSession):
         """
         if self._closed or not self._authenticated:
             return False
+        if self._spectating:
+            # 观战者只是旁观，不参与对局内的发言。
+            return False
         if self._snapshot is None:
             # 还没进入对局（等待对手）时不可发言。
             return False
@@ -339,6 +371,7 @@ class OnlineGameSession(GameSession):
             and not self._paused
             and not self._disconnected
             and not self._view.is_game_over
+            and not self._spectating
             and self._your_color is not None
             and self._view.current_player is self._your_color
             and self._pending_move_id is None
@@ -397,6 +430,26 @@ class OnlineGameSession(GameSession):
             make_message(CLIENT_JOIN_ROOM, {"room_code": code})
         )
 
+    def watch_game(self, game_id: str) -> bool:
+        """以旁观者身份观战一局进行中的对局。
+
+        观战者没有执子颜色，只能接收服务器的权威快照，不能落子、悔棋、
+        认输、再战或发言；服务器会用带 ``is_spectator`` 的快照回应。
+        """
+        if not self._authenticated or self._closed:
+            return False
+        if self._waiting or self._active or self._spectating:
+            # 已经在房间里（作为玩家或旁观者），不能再开新的一局。
+            return False
+        game_id = game_id.strip()
+        if not game_id:
+            self.error.emit("对局编号无效")
+            return False
+        if not self._send(make_message(CLIENT_WATCH_GAME, {"game_id": game_id})):
+            return False
+        self._spectating = True
+        return True
+
     def invite_to_room(self, user_id: str) -> bool:
         """邀请一位在线好友加入自己的等待房间。"""
         if not self._authenticated or self._closed or not user_id:
@@ -443,6 +496,9 @@ class OnlineGameSession(GameSession):
     # ------------------------------------------------------------------
     def request_move(self, row: int, col: int) -> bool:
         """发送落子意图；本地棋盘只等服务器权威快照更新。"""
+        if self._spectating:
+            # 观战者不能落子（纵深防御，正常情况下 accepts_human_input 已拦截）。
+            return False
         if not self.accepts_human_input:
             return False
         try:
@@ -465,6 +521,9 @@ class OnlineGameSession(GameSession):
 
     def request_undo(self) -> bool:
         """向对手发起悔棋请求；实际回滚等服务器确认后广播。"""
+        if self._spectating:
+            # 观战者不参与悔棋。
+            return False
         if not self.can_undo:
             return False
         request_id = uuid.uuid4().hex
@@ -482,6 +541,7 @@ class OnlineGameSession(GameSession):
         if (
             self._closed
             or self._disconnected
+            or self._spectating
             or not self._undo_requester_id
             or self._undo_requester_id == self._user_id
         ):
@@ -498,11 +558,17 @@ class OnlineGameSession(GameSession):
         return False
 
     def resign(self) -> bool:
+        if self._spectating:
+            # 观战者没有棋子，不能认输。
+            return False
         if self._snapshot is None or self._snapshot.is_game_over:
             return False
         return self._send(make_message(CLIENT_RESIGN, {}))
 
     def request_rematch(self) -> bool:
+        if self._spectating:
+            # 观战者不是对局双方，不能申请再战。
+            return False
         if self._rated:
             return False
         if self._snapshot is None or not self._snapshot.is_game_over:
@@ -510,9 +576,16 @@ class OnlineGameSession(GameSession):
         return self._send(make_message(CLIENT_REMATCH, {}))
 
     def leave_room(self) -> bool:
+        """离开房间；对观战者而言这是“退出观战”，不影响两名玩家。"""
         if self._snapshot is None and not self._waiting:
             return False
-        return self._send(make_message(CLIENT_LEAVE_ROOM, {}))
+        sent = self._send(make_message(CLIENT_LEAVE_ROOM, {}))
+        if sent and self._spectating:
+            # 观战者离开只是停止观看：本地立刻回到大厅状态，不必等服务器
+            # 再推一次 room_closed，也不会打扰房间里的两名玩家。
+            self._reset_room_state()
+            self.state_changed.emit()
+        return sent
 
     # ------------------------------------------------------------------
     # 表情/评论
@@ -616,6 +689,7 @@ class OnlineGameSession(GameSession):
         self._waiting = False
         self._your_color = None
         self._game_id = None
+        self._spectating = False
         self._active = False
         self._pending_move_id = None
         self._last_move_no = 0
@@ -694,6 +768,8 @@ class OnlineGameSession(GameSession):
             self._handle_friend_event(message)
         elif message_type == SERVER_DIRECT_MESSAGE:
             self._handle_direct_message(message)
+        elif message_type == SERVER_LIVE_GAMES_CHANGED:
+            self.live_games_changed.emit()
         else:
             logger.warning("忽略未知服务器消息：%s", message_type)
 
@@ -755,6 +831,7 @@ class OnlineGameSession(GameSession):
         self._snapshot = None
         self._view = _empty_view()
         self._your_color = Player.BLACK
+        self._spectating = False
         self._rematch_yours = False
         self._rematch_opponent = False
         self._undo_requester_id = ""
@@ -809,6 +886,8 @@ class OnlineGameSession(GameSession):
             "" if snapshot.rated else self._room_code
         )
         self._your_color = snapshot.your_color
+        # 观战者的快照没有执子颜色（your_color 为 None），由 is_spectator 标记。
+        self._spectating = bool(snapshot.is_spectator)
         self._snapshot = snapshot
         self._active = True
         self._waiting = False
@@ -993,6 +1072,7 @@ class OnlineGameSession(GameSession):
         self._queue_size = 0
         self._rated = True
         self._your_color = color
+        self._spectating = False
         self._room_code = ""
         self._waiting = False
         self._active = False
@@ -1051,6 +1131,11 @@ class OnlineGameSession(GameSession):
             and request_id == self._pending_undo_request_id
         ):
             self._pending_undo_request_id = None
+            self.state_changed.emit()
+        if self._spectating and self._snapshot is None:
+            # 观战请求被服务器拒绝（对局不存在、已在房间中等）：观战没有
+            # 成立，必须回到普通玩家身份，否则界面会一直显示只读视图。
+            self._spectating = False
             self.state_changed.emit()
         self.error.emit(reason if isinstance(reason, str) and reason else "服务器错误")
 

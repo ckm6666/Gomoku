@@ -34,6 +34,7 @@ from gomoku.shared.protocol import (
     CLIENT_LEAVE_ROOM,
     CLIENT_UNDO_REQUEST,
     CLIENT_UNDO_RESPONSE,
+    CLIENT_WATCH_GAME,
     SERVER_AUTHENTICATED,
     SERVER_ERROR,
     SERVER_PONG,
@@ -293,6 +294,21 @@ async def game_websocket(websocket: WebSocket) -> None:
                         )
                 elif message_type == CLIENT_LEAVE_ROOM:
                     await room_manager.leave_room(conn)
+                elif message_type == CLIENT_WATCH_GAME:
+                    # 观战：旁观者按对局编号进入别人正在进行的一局。
+                    game_id = payload.get("game_id")
+                    if not isinstance(game_id, str):
+                        await conn.send(
+                            make_message(
+                                SERVER_ERROR,
+                                {"reason": "对局编号无效"},
+                                request_id=request_id,
+                            )
+                        )
+                    else:
+                        await room_manager.watch_game(
+                            conn, game_id, request_id
+                        )
                 elif message_type == CLIENT_REMATCH:
                     await room_manager.rematch(conn)
                 elif message_type == CLIENT_QUICK_MATCH:
