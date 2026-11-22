@@ -6,6 +6,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
+from gomoku.shared.achievements import (
+    AchievementStats,
+    normalize_achievement_keys,
+    unlocked_achievement_keys,
+)
 from gomoku.shared.avatar import DEFAULT_AVATAR, normalize_avatar
 from gomoku.shared.errors import ProtocolError
 
@@ -36,6 +41,7 @@ class AuthUser:
     id: str
     username: str
     avatar: str = DEFAULT_AVATAR
+    avatar_version: int = 0
     # Stage 2：服务器认证响应携带的排位资料；旧服务器缺省时客户端仍可登录。
     rating: int = 1200
     peak_rating: int = 1200
@@ -48,6 +54,26 @@ class AuthUser:
     next_rank_rating: Optional[int] = None
     rank_progress: int = 0
     win_rate: float = 0.0
+    # 成就与连胜统计（旧服务器缺省为空，客户端按统计推导）。
+    current_win_streak: int = 0
+    best_win_streak: int = 0
+    achievements: tuple[str, ...] = ()
+
+    @property
+    def achievement_keys(self) -> tuple[str, ...]:
+        """优先使用服务器下发的成就；否则按统计本地推导。"""
+        if self.achievements:
+            return self.achievements
+        return unlocked_achievement_keys(
+            AchievementStats(
+                wins=self.wins,
+                rated_games=self.rated_games,
+                current_streak=self.current_win_streak,
+                best_streak=self.best_win_streak,
+                rating=self.rating,
+                peak_rating=self.peak_rating,
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -93,6 +119,7 @@ class AuthSession:
             id=user_id,
             username=_str_field(raw_user, "username"),
             avatar=normalize_avatar(raw_user.get("avatar"), user_id),
+            avatar_version=_optional_int(raw_user, "avatar_version", 0),
             rating=_optional_int(raw_user, "rating", 1200),
             peak_rating=_optional_int(raw_user, "peak_rating", 1200),
             rated_games=_optional_int(raw_user, "rated_games", 0),
@@ -104,6 +131,15 @@ class AuthSession:
             next_rank_rating=next_rank,
             rank_progress=_optional_int(raw_user, "rank_progress", 0),
             win_rate=win_rate,
+            current_win_streak=_optional_int(
+                raw_user, "current_win_streak", 0
+            ),
+            best_win_streak=_optional_int(
+                raw_user, "best_win_streak", 0
+            ),
+            achievements=normalize_achievement_keys(
+                raw_user.get("achievements")
+            ),
         )
         expires_in = data.get("expires_in", 900)
         if not isinstance(expires_in, int) or expires_in <= 0:

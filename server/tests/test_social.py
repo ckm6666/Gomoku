@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import base64
+import struct
 import unittest
+import zlib
 
 from gomoku.shared.protocol import (
     CLIENT_AUTH,
+    CLIENT_CREATE_ROOM,
+    CLIENT_JOIN_ROOM,
     SERVER_AUTHENTICATED,
     SERVER_DIRECT_MESSAGE,
     SERVER_FRIEND_EVENT,
+    SERVER_GAME_STATE,
+    SERVER_ROOM_CREATED,
     make_message,
 )
 from server.tests.helpers import ServerTestBase
@@ -82,6 +89,156 @@ class SocialAPITests(ServerTestBase):
         self.assertEqual(profile.status_code, 200, profile.text)
         self.assertEqual(profile.json()["user"]["avatar"], "mei")
         self.assertEqual(profile.json()["friendship"], "self")
+
+    @staticmethod
+    def _png_data_url(width: int = 16, height: int = 16) -> str:
+        def chunk(kind: bytes, data: bytes) -> bytes:
+            return (
+                struct.pack(">I", len(data))
+                + kind
+                + data
+                + struct.pack(
+                    ">I", zlib.crc32(kind + data) & 0xFFFFFFFF
+                )
+            )
+
+        header = struct.pack(
+            ">IIBBBBB", width, height, 8, 2, 0, 0, 0
+        )
+        raw = b"".join(
+            b"\x00" + b"\xff\x00\x00" * width for _ in range(height)
+        )
+        png = (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", header)
+            + chunk(b"IDAT", zlib.compress(raw))
+            + chunk(b"IEND", b"")
+        )
+        return "data:image/png;base64," + base64.b64encode(
+            png
+        ).decode("ascii")
+
+    def test_avatar_image_upload_fetch_and_remove(self) -> None:
+        token, user = self._register_user("upload_alice")
+        headers = self.auth_headers(token)
+
+        uploaded = self.client.put(
+            "/api/v1/users/me/avatar-image",
+            json={"image": self._png_data_url()},
+            headers=headers,
+        )
+        self.assertEqual(uploaded.status_code, 200, uploaded.text)
+        body = uploaded.json()
+        self.assertEqual(body["avatar_version"], 1)
+        self.assertIn("rank_gold", body["achievements"])
+        public = self.client.get(
+            f"/api/v1/users/{user['id']}", headers=headers
+        )
+        self.assertEqual(public.status_code, 200)
+        self.assertEqual(
+            public.json()["user"]["avatar_version"], 1
+        )
+
+        image = self.client.get(
+            f"/api/v1/users/{user['id']}/avatar?v=1"
+        )
+        self.assertEqual(image.status_code, 200, image.text)
+        self.assertEqual(image.headers["content-type"], "image/png")
+        self.assertTrue(image.content.startswith(b"\x89PNG"))
+
+        # 选择预置印章会移除自定义图片并把版本归零。
+        preset = self.client.patch(
+            "/api/v1/users/me/avatar",
+            json={"avatar": "zhu"},
+            headers=headers,
+        )
+        self.assertEqual(preset.status_code, 200, preset.text)
+        self.assertEqual(preset.json()["avatar_version"], 0)
+        missing = self.client.get(
+            f"/api/v1/users/{user['id']}/avatar"
+        )
+        self.assertEqual(missing.status_code, 404)
+
+        # 版本号只增不减：清空后再次上传不会复用旧缓存 URL。
+        reuploaded = self.client.put(
+            "/api/v1/users/me/avatar-image",
+            json={"image": self._png_data_url()},
+            headers=headers,
+        )
+        self.assertEqual(reuploaded.status_code, 200, reuploaded.text)
+        self.assertEqual(reuploaded.json()["avatar_version"], 3)
+        image_again = self.client.get(
+            f"/api/v1/users/{user['id']}/avatar?v=3"
+        )
+        self.assertEqual(image_again.status_code, 200)
+
+    def test_avatar_image_rejects_invalid_payload(self) -> None:
+        token, _ = self._register_user("upload_bob")
+        headers = self.auth_headers(token)
+
+        bad_type = self.client.put(
+            "/api/v1/users/me/avatar-image",
+            json={"image": "data:image/svg+xml;base64,PHN2Zy8+"},
+            headers=headers,
+        )
+        self.assertEqual(bad_type.status_code, 400)
+
+        bad_magic = self.client.put(
+            "/api/v1/users/me/avatar-image",
+            json={
+                "image": "data:image/png;base64,"
+                + base64.b64encode(b"not a real png").decode("ascii")
+            },
+            headers=headers,
+        )
+        self.assertEqual(bad_magic.status_code, 400)
+
+        too_big = self.client.put(
+            "/api/v1/users/me/avatar-image",
+            json={
+                "image": self._png_data_url(width=2048, height=16)
+            },
+            headers=headers,
+        )
+        self.assertEqual(too_big.status_code, 400)
+
+    def test_avatar_update_reaches_live_room(self) -> None:
+        host_token, host = self._register_user("live_avatar_host")
+        guest_token, _guest = self._register_user("live_avatar_guest")
+        with self.client.websocket_connect(
+            "/api/v1/ws"
+        ) as host_ws, self.client.websocket_connect(
+            "/api/v1/ws"
+        ) as guest_ws:
+            self._authenticate_ws(host_ws, host_token)
+            self._authenticate_ws(guest_ws, guest_token)
+
+            host_ws.send_json(make_message(CLIENT_CREATE_ROOM, {}))
+            created = host_ws.receive_json()
+            self.assertEqual(created["type"], SERVER_ROOM_CREATED)
+            code = created["payload"]["room_code"]
+
+            uploaded = self.client.put(
+                "/api/v1/users/me/avatar-image",
+                json={"image": self._png_data_url()},
+                headers=self.auth_headers(host_token),
+            )
+            self.assertEqual(uploaded.status_code, 200)
+            self.assertEqual(uploaded.json()["avatar_version"], 1)
+
+            guest_ws.send_json(
+                make_message(CLIENT_JOIN_ROOM, {"room_code": code})
+            )
+            payload = None
+            for _ in range(4):
+                message = host_ws.receive_json()
+                if message["type"] == SERVER_GAME_STATE:
+                    payload = message["payload"]
+                    break
+            self.assertIsNotNone(payload)
+            # 房间在头像上传前创建，版本仍然同步到了等待中的房间。
+            self.assertEqual(payload["black_avatar_version"], 1)
+            self.assertEqual(payload["black_avatar"], host["avatar"])
 
     def test_user_search(self) -> None:
         token, _ = self._register_user("search_alice")

@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy import or_, select, update
 from starlette.websockets import WebSocket
 
+from gomoku.shared.achievements import new_achievement_keys
 from gomoku.shared.avatar import DEFAULT_AVATAR, normalize_avatar
 from gomoku.shared.chat import (
     CHAT_BURST,
@@ -53,6 +54,7 @@ from gomoku.shared.social import (
     FRIEND_EVENT_OFFLINE,
     FRIEND_EVENT_ONLINE,
 )
+from server.app.achievement_service import achievement_keys_for_user
 from server.app.config import Settings
 from server.app.db import utcnow_naive
 from server.app.models import (
@@ -98,6 +100,8 @@ class ClientConnection:
     username: str
     websocket: WebSocket
     avatar: str = DEFAULT_AVATAR
+    avatar_version: int = 0
+    achievements: tuple[str, ...] = ()
     rating: int = 0
     connected: bool = True
     _send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -146,6 +150,14 @@ class Room:
     turn_seconds: int
     black_avatar: str = DEFAULT_AVATAR
     white_avatar: str = DEFAULT_AVATAR
+    black_avatar_version: int = 0
+    white_avatar_version: int = 0
+    black_achievements: tuple[str, ...] = ()
+    white_achievements: tuple[str, ...] = ()
+    # 排位结算后本局新解锁的成就；按用户 id 保存，供终局快照提示。
+    new_achievements: dict[str, tuple[str, ...]] = field(
+        default_factory=dict
+    )
     game: GameModel = field(default_factory=GameModel)
     status: str = "waiting"  # waiting/playing/black_won/white_won/draw
     winner_user_id: Optional[str] = None
@@ -197,6 +209,20 @@ class Room:
             return normalize_avatar(self.white_avatar, user_id)
         return DEFAULT_AVATAR
 
+    def avatar_version_for(self, user_id: str) -> int:
+        if user_id == self.black_user_id:
+            return max(0, self.black_avatar_version)
+        if user_id == self.white_user_id:
+            return max(0, self.white_avatar_version)
+        return 0
+
+    def achievements_for(self, user_id: str) -> tuple[str, ...]:
+        if user_id == self.black_user_id:
+            return self.black_achievements
+        if user_id == self.white_user_id:
+            return self.white_achievements
+        return ()
+
     def participant_ids(self) -> list[str]:
         return [
             uid
@@ -246,6 +272,31 @@ class RoomManager:
         conn = self._connections.get(user_id)
         return conn is not None and conn.connected
 
+    async def update_connection_avatar(
+        self, user_id: str, avatar: str, avatar_version: int
+    ) -> None:
+        """头像在 REST 接口更新后，同步到已认证连接与所在房间。
+
+        WebSocket 连接在认证时缓存了头像；如果用户在大厅里换了头像再
+        开局，不刷新缓存会让对手看到旧头像。这里只更新展示字段，不广播，
+        下一份对局快照自然带上新头像。
+        """
+        conn = self._connections.get(user_id)
+        safe_version = max(0, int(avatar_version))
+        if conn is not None:
+            conn.avatar = avatar
+            conn.avatar_version = safe_version
+        room = self._room_by_user.get(user_id)
+        if room is None:
+            return
+        async with room.lock:
+            if room.black_user_id == user_id:
+                room.black_avatar = avatar
+                room.black_avatar_version = safe_version
+            elif room.white_user_id == user_id:
+                room.white_avatar = avatar
+                room.white_avatar_version = safe_version
+
     async def send_to_user(self, user_id: str, message: dict) -> bool:
         """向指定用户的当前连接发送一条消息。"""
         conn = self._connections.get(user_id)
@@ -259,6 +310,8 @@ class RoomManager:
             "id": conn.user_id,
             "username": conn.username,
             "avatar": normalize_avatar(conn.avatar, conn.user_id),
+            "avatar_version": max(0, conn.avatar_version),
+            "achievements": list(conn.achievements),
             "rating": conn.rating,
             "rank_name": rank_for_rating(conn.rating).name,
         }
@@ -409,6 +462,19 @@ class RoomManager:
                 room.avatar_for(room.white_user_id)
                 if room.white_user_id
                 else DEFAULT_AVATAR
+            ),
+            "black_avatar_version": room.avatar_version_for(
+                room.black_user_id
+            ),
+            "white_avatar_version": (
+                room.avatar_version_for(room.white_user_id)
+                if room.white_user_id
+                else 0
+            ),
+            "black_achievements": list(room.black_achievements),
+            "white_achievements": list(room.white_achievements),
+            "your_new_achievements": list(
+                room.new_achievements.get(user_id, ())
             ),
             "turn_deadline_ms": room.turn_deadline_ms,
             "server_now_ms": _now_ms(),
@@ -678,6 +744,8 @@ class RoomManager:
                         white_name="",
                         turn_seconds=self._settings.turn_seconds,
                         black_avatar=conn.avatar,
+                        black_avatar_version=conn.avatar_version,
+                        black_achievements=conn.achievements,
                         connections={conn.user_id: conn},
                     )
                     self._rooms_by_code[code] = room
@@ -729,6 +797,8 @@ class RoomManager:
                     room.white_user_id = conn.user_id
                     room.white_name = conn.username
                     room.white_avatar = conn.avatar
+                    room.white_avatar_version = conn.avatar_version
+                    room.white_achievements = conn.achievements
                     room.status = "playing"
                     room.connections[conn.user_id] = conn
                     self._room_by_user[conn.user_id] = room
@@ -1165,6 +1235,10 @@ class RoomManager:
             turn_seconds=self._settings.turn_seconds,
             black_avatar=black.conn.avatar,
             white_avatar=white.conn.avatar,
+            black_avatar_version=black.conn.avatar_version,
+            white_avatar_version=white.conn.avatar_version,
+            black_achievements=black.conn.achievements,
+            white_achievements=white.conn.achievements,
             status="playing",
             connections={
                 black.conn.user_id: black.conn,
@@ -1427,6 +1501,10 @@ class RoomManager:
                             old_white_name = room.white_name
                             old_black_avatar = room.black_avatar
                             old_white_avatar = room.white_avatar
+                            old_black_version = room.black_avatar_version
+                            old_white_version = room.white_avatar_version
+                            old_black_achievements = room.black_achievements
+                            old_white_achievements = room.white_achievements
                             room.game_id = new_game.id
                             room.black_user_id = old_white
                             room.white_user_id = old_black
@@ -1434,10 +1512,15 @@ class RoomManager:
                             room.white_name = old_black_name
                             room.black_avatar = old_white_avatar
                             room.white_avatar = old_black_avatar
+                            room.black_avatar_version = old_white_version
+                            room.white_avatar_version = old_black_version
+                            room.black_achievements = old_white_achievements
+                            room.white_achievements = old_black_achievements
                             room.game = GameModel()
                             room.status = "playing"
                             room.winner_user_id = None
                             room.result_reason = None
+                            room.new_achievements.clear()
                             room.rematch_votes.clear()
                             room.processed_moves.clear()
                             self._start_timeout_locked(room)
@@ -1639,7 +1722,21 @@ class RoomManager:
                     return
                 if game_row.rating_applied:
                     room.rating_applied = True
+                    room.black_achievements = achievement_keys_for_user(
+                        black_user
+                    )
+                    room.white_achievements = achievement_keys_for_user(
+                        white_user
+                    )
                     return
+
+                # 结算前先记下成就集合，结算后做差得到"本局新解锁"。
+                black_achievements_before = achievement_keys_for_user(
+                    black_user
+                )
+                white_achievements_before = achievement_keys_for_user(
+                    white_user
+                )
 
                 black_change, white_change = calculate_pair(
                     black_user.rating,
@@ -1663,14 +1760,43 @@ class RoomManager:
                     black_user.wins += 1
                     white_user.losses += 1
                     black_score, white_score = "win", "loss"
+                    black_user.current_win_streak += 1
+                    black_user.best_win_streak = max(
+                        black_user.best_win_streak,
+                        black_user.current_win_streak,
+                    )
+                    white_user.current_win_streak = 0
                 elif score_black == 0.0:
                     white_user.wins += 1
                     black_user.losses += 1
                     black_score, white_score = "loss", "win"
+                    white_user.current_win_streak += 1
+                    white_user.best_win_streak = max(
+                        white_user.best_win_streak,
+                        white_user.current_win_streak,
+                    )
+                    black_user.current_win_streak = 0
                 else:
                     black_user.draws += 1
                     white_user.draws += 1
                     black_score = white_score = "draw"
+                    black_user.current_win_streak = 0
+                    white_user.current_win_streak = 0
+
+                black_achievements_after = achievement_keys_for_user(
+                    black_user
+                )
+                white_achievements_after = achievement_keys_for_user(
+                    white_user
+                )
+                new_black_achievements = new_achievement_keys(
+                    black_achievements_before,
+                    black_achievements_after,
+                )
+                new_white_achievements = new_achievement_keys(
+                    white_achievements_before,
+                    white_achievements_after,
+                )
 
                 session.add_all(
                     [
@@ -1719,6 +1845,12 @@ class RoomManager:
         room.rating_delta = {
             black_id: black_change.delta,
             white_id: white_change.delta,
+        }
+        room.black_achievements = black_achievements_after
+        room.white_achievements = white_achievements_after
+        room.new_achievements = {
+            black_id: new_black_achievements,
+            white_id: new_white_achievements,
         }
         room.rating_applied = True
 

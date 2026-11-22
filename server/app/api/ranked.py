@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gomoku.shared.avatar import normalize_avatar
+from server.app.api.social_helpers import avatar_version_of
 from server.app.dependencies import get_current_user, get_db
 from server.app.models import RatingEvent, User
 from server.app.ratings import rank_for_rating
@@ -53,6 +54,7 @@ async def leaderboard(
             user_id=user.id,
             username=user.username,
             avatar=normalize_avatar(user.avatar, user.id),
+            avatar_version=avatar_version_of(user),
             rating=user.rating,
             rank_name=rank_for_rating(user.rating).name,
             rated_games=user.rated_games,

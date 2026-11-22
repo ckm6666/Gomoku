@@ -14,6 +14,7 @@ from gomoku.shared.protocol import (
     SERVER_FRIEND_EVENT,
     make_message,
 )
+from server.app.achievement_service import achievement_keys_for_user
 from server.app.models import Friendship, User
 from server.app.ratings import rank_for_rating
 
@@ -69,12 +70,19 @@ def avatar_of(user: User) -> str:
     return normalize_avatar(user.avatar, user.id)
 
 
+def avatar_version_of(user: User) -> int:
+    """返回对外可见的头像版本号；没有自定义图片时为 0。"""
+    return user.public_avatar_version
+
+
 def user_payload(user: User) -> dict:
     """WebSocket 推送用的用户摘要。"""
     return {
         "id": user.id,
         "username": user.username,
         "avatar": avatar_of(user),
+        "avatar_version": avatar_version_of(user),
+        "achievements": list(achievement_keys_for_user(user)),
         "rating": user.rating,
         "rank_name": rank_for_rating(user.rating).name,
     }
@@ -131,6 +139,7 @@ __all__ = [
     "are_friends",
     "friend_ids",
     "avatar_of",
+    "avatar_version_of",
     "user_payload",
     "is_online",
     "push_to_user",
