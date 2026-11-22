@@ -26,6 +26,8 @@ from server.app.models import DirectMessage, User
 from server.app.schemas import (
     DirectMessageEntry,
     DirectMessagesResponse,
+    MarkMessagesReadRequest,
+    MarkMessagesReadResponse,
     SendDirectMessageRequest,
 )
 
@@ -177,6 +179,44 @@ async def message_history(
             for message in reversed(rows)
         ]
     )
+
+
+@router.post(
+    "/messages/{user_id}/read", response_model=MarkMessagesReadResponse
+)
+async def mark_messages_read(
+    user_id: str,
+    payload: MarkMessagesReadRequest,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> MarkMessagesReadResponse:
+    """把客户端已经显示过的消息标记为已读。
+
+    读取历史时服务端已经顺带标记过一遍，但实时推送进来的消息不会：
+    聊天窗开着时那条消息当场就读完了，如果不给客户端一个销账的入口，
+    未读数会一直挂着，直到下一次拉历史才清零。
+    """
+    await _require_friend(session, current_user, user_id)
+    ids = [
+        message_id
+        for message_id in payload.message_ids
+        if isinstance(message_id, str) and message_id
+    ]
+    if not ids:
+        return MarkMessagesReadResponse(read_count=0)
+    result = await session.execute(
+        update(DirectMessage)
+        .where(
+            DirectMessage.id.in_(ids),
+            # 只认发给"我"、且出自对方的消息：别人的会话不能被顺手标掉。
+            DirectMessage.recipient_id == current_user.id,
+            DirectMessage.sender_id == user_id,
+            DirectMessage.read_at.is_(None),
+        )
+        .values(read_at=utcnow_naive())
+    )
+    await session.commit()
+    return MarkMessagesReadResponse(read_count=int(result.rowcount or 0))
 
 
 @router.post(

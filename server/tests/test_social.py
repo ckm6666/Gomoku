@@ -248,6 +248,118 @@ class SocialAPITests(ServerTestBase):
         )
         self.assertIn(reverse.status_code, (400, 409), reverse.text)
 
+    def test_mark_read_only_clears_reported_messages(self) -> None:
+        """客户端报上来的消息才销账，没报过的仍算未读。"""
+        alice_token, alice = self._register_user("dm_alice")
+        bob_token, bob = self._register_user("dm_bob")
+        self._make_friends(
+            alice_token, alice["id"], bob_token, bob["id"]
+        )
+
+        ids: list[str] = []
+        for index in range(3):
+            sent = self.client.post(
+                f"/api/v1/messages/{bob['id']}",
+                json={"content": f"第 {index} 条"},
+                headers=self.auth_headers(alice_token),
+            )
+            self.assertEqual(sent.status_code, 200, sent.text)
+            ids.append(sent.json()["id"])
+
+        marked = self.client.post(
+            f"/api/v1/messages/{alice['id']}/read",
+            json={"message_ids": ids[:2]},
+            headers=self.auth_headers(bob_token),
+        )
+        self.assertEqual(marked.status_code, 200, marked.text)
+        self.assertEqual(marked.json()["read_count"], 2)
+
+        friends = self.client.get(
+            "/api/v1/friends", headers=self.auth_headers(bob_token)
+        ).json()
+        entries = [
+            f for f in friends["friends"] if f["user_id"] == alice["id"]
+        ]
+        self.assertEqual(entries[0]["unread"], 1)
+
+        # 重复上报不会重复计数。
+        again = self.client.post(
+            f"/api/v1/messages/{alice['id']}/read",
+            json={"message_ids": ids[:2]},
+            headers=self.auth_headers(bob_token),
+        )
+        self.assertEqual(again.json()["read_count"], 0)
+
+    def test_mark_read_ignores_foreign_and_unknown_ids(self) -> None:
+        """别人的消息和不存在的 id 都不能被顺手标成已读。"""
+        alice_token, alice = self._register_user("dm_alice")
+        bob_token, bob = self._register_user("dm_bob")
+        charlie_token, charlie = self._register_user("dm_charlie")
+        self._make_friends(
+            alice_token, alice["id"], bob_token, bob["id"]
+        )
+        self._make_friends(
+            alice_token, alice["id"], charlie_token, charlie["id"]
+        )
+        self._make_friends(
+            bob_token, bob["id"], charlie_token, charlie["id"]
+        )
+
+        to_bob = self.client.post(
+            f"/api/v1/messages/{bob['id']}",
+            json={"content": "只给鲍勃"},
+            headers=self.auth_headers(alice_token),
+        )
+        to_charlie = self.client.post(
+            f"/api/v1/messages/{charlie['id']}",
+            json={"content": "只给查理"},
+            headers=self.auth_headers(alice_token),
+        )
+
+        # 查理上报：发给鲍勃的那条不是他的，不该被标；不存在的 id 也无效。
+        marked = self.client.post(
+            f"/api/v1/messages/{alice['id']}/read",
+            json={
+                "message_ids": [
+                    to_bob.json()["id"],
+                    to_charlie.json()["id"],
+                    "no-such-id",
+                ]
+            },
+            headers=self.auth_headers(charlie_token),
+        )
+        self.assertEqual(marked.status_code, 200, marked.text)
+        self.assertEqual(marked.json()["read_count"], 1)
+
+        bob_friends = self.client.get(
+            "/api/v1/friends", headers=self.auth_headers(bob_token)
+        ).json()
+        entries = [
+            f for f in bob_friends["friends"] if f["user_id"] == alice["id"]
+        ]
+        self.assertEqual(entries[0]["unread"], 1)
+
+        charlie_friends = self.client.get(
+            "/api/v1/friends", headers=self.auth_headers(charlie_token)
+        ).json()
+        entries = [
+            f
+            for f in charlie_friends["friends"]
+            if f["user_id"] == alice["id"]
+        ]
+        self.assertEqual(entries[0]["unread"], 0)
+
+    def test_mark_read_rejects_non_friends(self) -> None:
+        alice_token, alice = self._register_user("dm_alice")
+        bob_token, bob = self._register_user("dm_bob")
+
+        marked = self.client.post(
+            f"/api/v1/messages/{alice['id']}/read",
+            json={"message_ids": ["whatever"]},
+            headers=self.auth_headers(bob_token),
+        )
+        self.assertEqual(marked.status_code, 403, marked.text)
+
     def test_history_only_marks_returned_messages_read(self) -> None:
         """只取回 limit 条时，没取回的消息不能被标成已读。"""
         alice_token, alice = self._register_user("dm_alice")

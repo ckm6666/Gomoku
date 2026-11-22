@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Callable, Mapping, NamedTuple, Optional, Sequence
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -18,6 +18,13 @@ from PySide6.QtWidgets import (
 
 from gomoku.client.avatar_widgets import AvatarView
 from gomoku.client.paper_panel import PaperPanel
+
+
+class _FriendRow(NamedTuple):
+    """好友行信息：行控件与好友的在线状态。"""
+
+    frame: QFrame
+    online: bool
 
 
 class FriendsPanel(PaperPanel):
@@ -50,6 +57,7 @@ class FriendsPanel(PaperPanel):
         self._invite_mode = invite_mode
         self._section_cards: dict[str, QFrame] = {}
         self._section_counts: dict[str, QLabel] = {}
+        self._friend_rows: dict[str, _FriendRow] = {}
 
         title = QLabel(
             "邀请好友对局" if invite_mode else "我的好友", self.card
@@ -332,14 +340,48 @@ class FriendsPanel(PaperPanel):
     ) -> None:
         """执行行内操作。
 
-        接受、拒绝、删除这类操作重复提交没有意义：第二次请求会得到
+        接受、拒绝这类操作重复提交没有意义：第二次请求会得到
         “已经处理过”的错误提示，白白在界面上弹一条红字。所以点过之后
         就把这一行的按钮锁住，等列表刷新后重建。
+
+        删除好友要等用户确认，所以不在这里锁行。
         """
         if lock_row:
             for button in frame.findChildren(QPushButton):
                 button.setEnabled(False)
         callback()
+
+    @staticmethod
+    def _sync_invite_button(row: QFrame, online: bool) -> None:
+        """离线好友不能被邀请对局。"""
+        for button in row.findChildren(QPushButton):
+            if button.text() == "邀请对局":
+                button.setEnabled(online)
+                button.setToolTip("" if online else "好友不在线")
+
+    def lock_friend_row(self, user_id: str) -> None:
+        """锁住某位好友所在行的按钮。
+
+        删除好友要等用户在确认弹窗里点头，确认之后才锁行，避免重复提交。
+        """
+        info = self._friend_rows.get(user_id)
+        if info is None:
+            return
+        for button in info.frame.findChildren(QPushButton):
+            button.setEnabled(False)
+
+    def unlock_friend_row(self, user_id: str) -> None:
+        """解开某位好友所在行的按钮（删除失败时用）。"""
+        info = self._friend_rows.get(user_id)
+        if info is None:
+            return
+        for button in info.frame.findChildren(QPushButton):
+            if button.text() == "邀请对局" and not info.online:
+                button.setEnabled(False)
+                button.setToolTip("好友不在线")
+            else:
+                button.setEnabled(True)
+                button.setToolTip("")
 
     # ------------------------------------------------------------------
     def set_data(self, data: Mapping) -> None:
@@ -407,6 +449,7 @@ class FriendsPanel(PaperPanel):
             self._add_hint(self.outgoing_layout, "暂无已发出的申请")
 
         self._clear_layout(self.friends_layout)
+        self._friend_rows.clear()
         if friends_list:
             for entry in friends_list:
                 if not isinstance(entry, Mapping):
@@ -454,7 +497,8 @@ class FriendsPanel(PaperPanel):
                         lambda _=False, uid=user_id: (
                             self.remove_requested.emit(uid)
                         ),
-                        True,
+                        # 删除要等用户确认后才算提交，这里先不锁行。
+                        False,
                     ),
                 ]
                 row = self._row(
@@ -464,11 +508,8 @@ class FriendsPanel(PaperPanel):
                     unread=unread_count,
                     buttons=buttons,
                 )
-                if not online:
-                    for button in row.findChildren(QPushButton):
-                        if button.text() == "邀请对局":
-                            button.setEnabled(False)
-                            button.setToolTip("好友不在线")
+                self._friend_rows[user_id] = _FriendRow(row, online)
+                self._sync_invite_button(row, online)
                 self.friends_layout.addWidget(row)
         else:
             self._add_hint(
