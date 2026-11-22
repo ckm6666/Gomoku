@@ -126,6 +126,7 @@ class GameRecord:
         non_board_ending = mode == "online" and result_reason.strip() in (
             "resign",
             "timeout",
+            "escape",
         )
         if (
             winner is not None

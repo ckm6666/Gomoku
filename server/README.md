@@ -156,7 +156,9 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 | `WS cancel_match` | 离开排位队列 |
 | `WS queue_status` | 服务端返回 queued/idle、队列人数、当前积分/段位 |
 | `WS match_found` | 匹配成功，返回 game_id、执子颜色、对手昵称和双方赛前积分 |
-| `WS game_state` | 权威快照新增 `rated`、`your_rating_before/after`、`opponent_rating_before/after`、`rating_delta`、双方 user_id/头像版本/已解锁成就，以及本人的 `your_new_achievements` |
+| `WS game_state` | 权威快照新增 `rated`、`your_rating_before/after`、`opponent_rating_before/after`、`rating_delta`、双方 user_id/头像版本/已解锁成就，以及本人的 `your_new_achievements`；`state_version` 标识回滚、`result_reason` 标识终局原因、`undo_requester_id` 标识待回应悔棋 |
+| `WS undo_request` / `undo_response` | 当前回合玩家发起悔棋请求，对手同意或拒绝 |
+| `WS undo_status` | 悔棋状态：requested/accepted/declined/expired/cancelled |
 | `WS invite_to_room` | 房主邀请在线好友加入自建房 |
 | `WS respond_room_invite` | 被邀请者接受/拒绝邀请 |
 | `WS room_invitation` | 服务端推送给被邀请者的对局邀请 |
@@ -169,8 +171,12 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 - 创建自建房者执黑先手，被邀请并接受的玩家执白。
 - 每手默认 30 秒，服务器倒计时；超时由服务器判负。
 - 客户端只发送落子意图；服务器校验座位/回合/坐标/时钟后，先把落子和局面写入数据库，再广播权威快照。
-- 断线不立即结束服务端房间：服务器保留房间与时钟，客户端可在回合时间内重连；重连后服务器下发完整快照。
-- 进行中的对局不支持单方面悔棋；支持认输。
+- 断线不立即结束服务端房间：服务器保留房间与时钟，客户端可在宽限期内重连；重连后服务器下发完整快照。
+- 掉线超过 `GOMOKU_DISCONNECT_FORFEIT_SECONDS`（默认 20 秒）仍未重连，判对手获胜，
+  终局原因记为 `escape`；排位赛照常结算。
+- 进行中的对局不支持单方面悔棋：当前回合玩家可发起悔棋请求，对手同意后服务器删除
+  请求者最后一手及其后的落子（数据库同步删除），拒绝或 30 秒未回应则保持原局面。
+- 支持认输。
 - 自建房双方都申请再战后，服务器创建新对局（不计分）并交换黑白；排位房拒绝再战。
 - 服务重启时未终局对局统一标记为 `abandoned`，客户端回到大厅；不伪装成崩溃恢复。
 - 自建房使用过期时间 60 秒的定向邀请；邀请要求双方为好友且被邀请者在线。内部仍保留随机房间码用于数据库记录，但客户端不再展示或要求输入。
@@ -218,6 +224,7 @@ Start-Process C:\Users\a1325\Desktop\Gomoku\dist\Gomoku.exe
 | `GOMOKU_ACCESS_TOKEN_MINUTES` | `15` | access JWT 有效期 |
 | `GOMOKU_REFRESH_TOKEN_DAYS` | `30` | refresh token 有效期 |
 | `GOMOKU_TURN_SECONDS` | `30` | 每手倒计时，5～600 |
+| `GOMOKU_DISCONNECT_FORFEIT_SECONDS` | `20` | 掉线后等待重连的宽限时间，超时判逃跑，0～300 |
 | `GOMOKU_WS_AUTH_TIMEOUT` | `10` | WebSocket 首帧认证超时 |
 | `GOMOKU_WS_IDLE_TIMEOUT` | `75` | 客户端心跳间隔需短于此 |
 
@@ -245,10 +252,11 @@ cd C:\Users\a1325\Desktop\Gomoku
 server\.venv\Scripts\python.exe -m unittest discover -s server/tests -v
 ```
 
-当前 **58 项**测试覆盖：
+当前 **64 项**测试覆盖：
 
 - 用户名 + 密码注册、登录、refresh 轮换/重放、登出、认证响应积分/成就字段；
 - 双 WebSocket 建房/邀请/加入/落子/拒绝/认输/再战、服务器五连判定、断线重连；
+- 悔棋请求的同意/拒绝、回滚数据库落子、非本回合请求拒绝、掉线宽限后的逃跑判负；
 - 快速匹配、取消匹配、排位房、随机黑白、终局 Elo 结算、自建房不计分；
 - 排行榜、个人资料与最近战绩；
 - 最近对局/单局棋谱的参与者权限、分页、认输终局；

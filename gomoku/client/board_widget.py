@@ -105,7 +105,6 @@ class BoardWidget(QWidget):
             QSizePolicy.Policy.Expanding,
         )
         self.setAccessibleName("五子棋棋盘")
-        self.setToolTip("点击棋盘交叉点落子")
 
     # ------------------------------------------------------------------
     # 尺寸与基础设置

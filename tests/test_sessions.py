@@ -30,6 +30,8 @@ from gomoku.client.sessions import (  # noqa: E402
 from gomoku.shared.protocol import (  # noqa: E402
     CLIENT_CANCEL_MATCH,
     CLIENT_QUICK_MATCH,
+    CLIENT_UNDO_REQUEST,
+    CLIENT_UNDO_RESPONSE,
     SERVER_AUTHENTICATED,
     SERVER_GAME_STATE,
     SERVER_MATCH_FOUND,
@@ -39,6 +41,7 @@ from gomoku.shared.protocol import (  # noqa: E402
     SERVER_REMATCH_STATUS,
     SERVER_ROOM_CLOSED,
     SERVER_ROOM_CREATED,
+    SERVER_UNDO_STATUS,
     make_message,
 )
 from gomoku.shared.rules import BOARD_SIZE, Player  # noqa: E402
@@ -133,6 +136,9 @@ def state_message(
     opponent_rating_before: int | None = None,
     opponent_rating_after: int | None = None,
     rating_delta: int | None = None,
+    state_version: int = 0,
+    result_reason: str = "",
+    undo_requester_id: str = "",
 ) -> dict:
     """构造一个符合协议的服务器局面消息。"""
     return make_message(
@@ -147,6 +153,9 @@ def state_message(
             "last_move": last_move,
             "winning_line": winning_line or [],
             "rated": rated,
+            "state_version": state_version,
+            "result_reason": result_reason,
+            "undo_requester_id": undo_requester_id,
             "room_code": room_code,
             "your_rating_before": your_rating_before,
             "your_rating_after": your_rating_after,
@@ -753,6 +762,228 @@ class OnlineSessionTests(unittest.TestCase):
         finally:
             session.shutdown()
             transport.close()
+
+    def test_undo_request_and_rollback_snapshot(self) -> None:
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        statuses: list[tuple[str, str]] = []
+        session.undo_status_changed.connect(
+            lambda state, reason: statuses.append((state, reason))
+        )
+        try:
+            self._authenticate(transport, session)
+            board = blank_board()
+            board[7][7] = "black"
+            board[7][8] = "white"
+            board[8][8] = "black"
+            board[8][9] = "white"
+            transport.receive(
+                state_message(
+                    board,
+                    current="black",
+                    your_color="black",
+                    move_no=4,
+                    state_version=2,
+                    last_move={"row": 8, "col": 9, "player": "white"},
+                )
+            )
+            self.assertTrue(session.can_undo)
+
+            self.assertTrue(session.request_undo())
+            sent = transport.sent_messages[-1]
+            self.assertEqual(sent["type"], CLIENT_UNDO_REQUEST)
+            self.assertFalse(session.can_undo)
+            self.assertFalse(session.accepts_human_input)
+
+            transport.receive(
+                make_message(
+                    SERVER_UNDO_STATUS,
+                    {
+                        "state": "requested",
+                        "requester_id": "u1",
+                        "requester_name": "tester",
+                    },
+                )
+            )
+            self.assertTrue(session.undo_pending)
+            self.assertTrue(session.undo_requested_by_you)
+            self.assertFalse(session.accepts_human_input)
+
+            transport.receive(
+                make_message(
+                    SERVER_UNDO_STATUS,
+                    {
+                        "state": "accepted",
+                        "requester_id": "u1",
+                        "requester_name": "tester",
+                        "reason": "对手已同意悔棋",
+                    },
+                )
+            )
+            self.assertFalse(session.undo_pending)
+            rolled_back = blank_board()
+            rolled_back[7][7] = "black"
+            rolled_back[7][8] = "white"
+            transport.receive(
+                state_message(
+                    rolled_back,
+                    current="black",
+                    your_color="black",
+                    move_no=2,
+                    state_version=4,
+                    last_move={"row": 7, "col": 8, "player": "white"},
+                )
+            )
+            # 手数下降但版本号更高，必须接受回滚快照。
+            self.assertEqual(session.view.move_count, 2)
+            self.assertTrue(session.accepts_human_input)
+            self.assertIn(("accepted", "对手已同意悔棋"), statuses)
+        finally:
+            session.shutdown()
+            transport.close()
+
+    def test_opponent_undo_request_can_be_accepted(self) -> None:
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        requests: list[str] = []
+        session.undo_request_received.connect(requests.append)
+        try:
+            self._authenticate(transport, session)
+            board = blank_board()
+            board[7][7] = "black"
+            board[7][8] = "white"
+            transport.receive(
+                state_message(
+                    board,
+                    current="white",
+                    your_color="white",
+                    move_no=2,
+                    state_version=1,
+                    last_move={"row": 7, "col": 8, "player": "white"},
+                )
+            )
+            transport.receive(
+                make_message(
+                    SERVER_UNDO_STATUS,
+                    {
+                        "state": "requested",
+                        "requester_id": "u2",
+                        "requester_name": "对手乙",
+                    },
+                )
+            )
+            self.assertEqual(requests, ["对手乙"])
+            self.assertTrue(session.undo_pending)
+            self.assertFalse(session.undo_requested_by_you)
+            self.assertFalse(session.accepts_human_input)
+
+            self.assertTrue(session.respond_undo(True))
+            response = transport.sent_messages[-1]
+            self.assertEqual(response["type"], CLIENT_UNDO_RESPONSE)
+            self.assertTrue(response["payload"]["accept"])
+        finally:
+            session.shutdown()
+            transport.close()
+
+    def test_result_reason_fields_are_parsed(self) -> None:
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        try:
+            self._authenticate(transport, session)
+            board = blank_board()
+            for col in range(3, 8):
+                board[7][col] = "black"
+            transport.receive(
+                state_message(
+                    board,
+                    current="black",
+                    your_color="black",
+                    move_no=5,
+                    status="black_won",
+                    result_reason="escape",
+                )
+            )
+            self.assertIsNotNone(session.snapshot)
+            self.assertEqual(session.snapshot.result_reason, "escape")
+        finally:
+            session.shutdown()
+            transport.close()
+
+
+class OnlineVictoryNoticeTests(unittest.TestCase):
+    """对手认输/逃跑时生成不同的胜利弹窗文案。"""
+
+    @staticmethod
+    def _snapshot(
+        *,
+        winner: Player | None,
+        your_color: Player,
+        reason: str,
+    ):
+        from gomoku.shared.protocol import GameSnapshot
+
+        return GameSnapshot(
+            game_id="g-1",
+            board=tuple(
+                tuple(None for _ in range(BOARD_SIZE))
+                for _ in range(BOARD_SIZE)
+            ),
+            current_player=Player.BLACK,
+            last_move=None,
+            winner=winner,
+            winning_line=(),
+            is_draw=False,
+            is_game_over=True,
+            move_no=1,
+            your_color=your_color,
+            result_reason=reason,
+        )
+
+    def test_resign_and_escape_have_distinct_notices(self) -> None:
+        from gomoku.client.online_panel import online_victory_notice
+
+        self.assertEqual(
+            online_victory_notice(
+                self._snapshot(
+                    winner=Player.BLACK,
+                    your_color=Player.BLACK,
+                    reason="resign",
+                )
+            ),
+            ("对手认输", "对方认输，你获胜！"),
+        )
+        self.assertEqual(
+            online_victory_notice(
+                self._snapshot(
+                    winner=Player.BLACK,
+                    your_color=Player.BLACK,
+                    reason="escape",
+                )
+            ),
+            ("对手逃跑", "对方逃跑，你获胜！"),
+        )
+
+    def test_other_endings_and_losses_have_no_notice(self) -> None:
+        from gomoku.client.online_panel import online_victory_notice
+
+        self.assertIsNone(
+            online_victory_notice(
+                self._snapshot(
+                    winner=Player.BLACK,
+                    your_color=Player.BLACK,
+                    reason="five",
+                )
+            )
+        )
+        self.assertIsNone(
+            online_victory_notice(
+                self._snapshot(
+                    winner=Player.WHITE,
+                    your_color=Player.BLACK,
+                    reason="resign",
+                )
+            )
+        )
 
 
 if __name__ == "__main__":

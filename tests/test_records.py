@@ -76,6 +76,20 @@ class GameRecordTests(unittest.TestCase):
         restored = GameRecord.from_dict(record.to_dict())
         self.assertIs(restored.winner, Player.BLACK)
 
+    def test_escape_ending_can_have_winner_without_board_win(self) -> None:
+        record = GameRecord(
+            record_id="online-escape",
+            created_at="2026-01-01T00:00:00+00:00",
+            mode="online",
+            moves=(Move(7, 7, Player.BLACK),),
+            winner=Player.BLACK,
+            result_reason="escape",
+            black_name="甲",
+            white_name="乙",
+        )
+        restored = GameRecord.from_dict(record.to_dict())
+        self.assertIs(restored.winner, Player.BLACK)
+
     def test_empty_id_is_rejected(self) -> None:
         data = make_record().to_dict()
         data["record_id"] = ""

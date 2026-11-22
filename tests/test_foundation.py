@@ -160,6 +160,33 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(snapshot.your_color, Player.BLACK)
         self.assertFalse(snapshot.is_game_over)
 
+    def test_game_state_undo_metadata_parse(self) -> None:
+        payload = {
+            "game_id": "g-undo",
+            "board": blank_values(),
+            "current_player": "black",
+            "your_color": "black",
+            "move_no": 2,
+            "status": "playing",
+            "state_version": 5,
+            "result_reason": "escape",
+            "undo_requester_id": "u2",
+        }
+        snapshot = parse_game_state(payload)
+        self.assertEqual(snapshot.state_version, 5)
+        self.assertEqual(snapshot.result_reason, "escape")
+        self.assertEqual(snapshot.undo_requester_id, "u2")
+
+        bad_version = dict(payload)
+        bad_version["state_version"] = -1
+        with self.assertRaises(ProtocolError):
+            parse_game_state(bad_version)
+
+        bad_reason = dict(payload)
+        bad_reason["result_reason"] = 5
+        with self.assertRaises(ProtocolError):
+            parse_game_state(bad_reason)
+
     def test_game_state_rejects_bad_board_and_status(self) -> None:
         payload = {
             "game_id": "g-1",

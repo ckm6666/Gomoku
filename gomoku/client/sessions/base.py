@@ -89,7 +89,7 @@ class GameSession(QObject):
         return False
 
     def request_undo(self) -> bool:
-        """请求悔棋；联机会话以后可映射成需要对手同意的请求。"""
+        """请求悔棋；联机会话会把请求发给对手，由对手决定是否同意。"""
         return False
 
     def request_restart(self) -> bool:

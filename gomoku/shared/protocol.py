@@ -31,6 +31,8 @@ CLIENT_MOVE_INTENT = "move_intent"
 CLIENT_RESIGN = "resign"
 CLIENT_LEAVE_ROOM = "leave_room"
 CLIENT_REMATCH = "rematch"
+CLIENT_UNDO_REQUEST = "undo_request"
+CLIENT_UNDO_RESPONSE = "undo_response"
 CLIENT_QUICK_MATCH = "quick_match"
 CLIENT_CANCEL_MATCH = "cancel_match"
 CLIENT_PING = "ping"
@@ -46,6 +48,7 @@ SERVER_MOVE_REJECTED = "move_rejected"
 SERVER_OPPONENT_STATUS = "opponent_status"
 SERVER_ROOM_CLOSED = "room_closed"
 SERVER_REMATCH_STATUS = "rematch_status"
+SERVER_UNDO_STATUS = "undo_status"
 SERVER_QUEUE_STATUS = "queue_status"
 SERVER_MATCH_FOUND = "match_found"
 SERVER_PONG = "pong"
@@ -64,6 +67,8 @@ _ALLOWED_MESSAGE_TYPES = {
     CLIENT_RESIGN,
     CLIENT_LEAVE_ROOM,
     CLIENT_REMATCH,
+    CLIENT_UNDO_REQUEST,
+    CLIENT_UNDO_RESPONSE,
     CLIENT_QUICK_MATCH,
     CLIENT_CANCEL_MATCH,
     CLIENT_PING,
@@ -77,6 +82,7 @@ _ALLOWED_MESSAGE_TYPES = {
     SERVER_OPPONENT_STATUS,
     SERVER_ROOM_CLOSED,
     SERVER_REMATCH_STATUS,
+    SERVER_UNDO_STATUS,
     SERVER_QUEUE_STATUS,
     SERVER_MATCH_FOUND,
     SERVER_PONG,
@@ -102,6 +108,7 @@ SERVER_MESSAGE_TYPES = frozenset(
         SERVER_OPPONENT_STATUS,
         SERVER_ROOM_CLOSED,
         SERVER_REMATCH_STATUS,
+        SERVER_UNDO_STATUS,
         SERVER_QUEUE_STATUS,
         SERVER_MATCH_FOUND,
         SERVER_PONG,
@@ -133,6 +140,12 @@ class GameSnapshot:
     is_game_over: bool
     move_no: int
     your_color: Player
+    # 服务端局面版本：悔棋会让 move_no 变小，客户端据此区分回滚与过期快照。
+    state_version: int = 0
+    # 终局原因：five/draw/resign/timeout/escape；对局中为空。
+    result_reason: str = ""
+    # 当前待回应的悔棋请求发起者；空字符串表示没有请求。
+    undo_requester_id: str = ""
     # 联机房间 UI 的可选元数据（Stage 1 服务端会提供）。
     room_code: str = ""
     black_name: str = ""
@@ -331,6 +344,14 @@ def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
     ):
         raise ProtocolError("rating_delta 必须是整数或 null")
 
+    state_version = optional_int("state_version") or 0
+    result_reason = payload.get("result_reason", "")
+    undo_requester_id = payload.get("undo_requester_id", "")
+    if not isinstance(result_reason, str) or not isinstance(
+        undo_requester_id, str
+    ):
+        raise ProtocolError("result_reason/undo_requester_id 必须是字符串")
+
     black_avatar_version = optional_int("black_avatar_version") or 0
     white_avatar_version = optional_int("white_avatar_version") or 0
     black_achievements = normalize_achievement_keys(
@@ -354,6 +375,9 @@ def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
         is_game_over=is_game_over,
         move_no=move_no,
         your_color=your_color,
+        state_version=state_version,
+        result_reason=result_reason.strip(),
+        undo_requester_id=undo_requester_id,
         room_code=room_code,
         black_name=black_name,
         white_name=white_name,
@@ -449,6 +473,8 @@ __all__ = [
     "CLIENT_RESIGN",
     "CLIENT_LEAVE_ROOM",
     "CLIENT_REMATCH",
+    "CLIENT_UNDO_REQUEST",
+    "CLIENT_UNDO_RESPONSE",
     "CLIENT_QUICK_MATCH",
     "CLIENT_CANCEL_MATCH",
     "CLIENT_PING",
@@ -462,6 +488,7 @@ __all__ = [
     "SERVER_OPPONENT_STATUS",
     "SERVER_ROOM_CLOSED",
     "SERVER_REMATCH_STATUS",
+    "SERVER_UNDO_STATUS",
     "SERVER_QUEUE_STATUS",
     "SERVER_MATCH_FOUND",
     "SERVER_PONG",

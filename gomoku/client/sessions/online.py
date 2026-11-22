@@ -43,6 +43,8 @@ from gomoku.shared.protocol import (
     CLIENT_REMATCH,
     CLIENT_RESPOND_ROOM_INVITE,
     CLIENT_RESIGN,
+    CLIENT_UNDO_REQUEST,
+    CLIENT_UNDO_RESPONSE,
     SERVER_AUTHENTICATED,
     SERVER_CHAT,
     SERVER_DIRECT_MESSAGE,
@@ -57,6 +59,7 @@ from gomoku.shared.protocol import (
     SERVER_QUEUE_STATUS,
     SERVER_REMATCH_STATUS,
     SERVER_ROOM_CLOSED,
+    SERVER_UNDO_STATUS,
     SERVER_ROOM_CREATED,
     SERVER_ROOM_INVITATION,
     SERVER_ROOM_INVITE_RESULT,
@@ -117,6 +120,10 @@ class OnlineGameSession(GameSession):
     opponent_status_changed = Signal(bool, str)  # online, username
     room_closed = Signal(str)
     rematch_status_changed = Signal(bool, bool)  # yours, opponent
+    # 对手发来悔棋请求；参数为发起者昵称。
+    undo_request_received = Signal(str)
+    # 悔棋状态变化：state(requested/accepted/declined/expired/cancelled), reason。
+    undo_status_changed = Signal(str, str)
     queue_status_changed = Signal(bool, int)  # queued, queue_size
     matched = Signal(str, str)  # game_id, opponent_name
     chat_received = Signal(object)  # ChatMessage
@@ -152,6 +159,10 @@ class OnlineGameSession(GameSession):
         self._opponent_username = ""
         self._rematch_yours = False
         self._rematch_opponent = False
+        self._undo_requester_id = ""
+        self._undo_requester_name = ""
+        self._pending_undo_request_id: Optional[str] = None
+        self._last_state_version = 0
         self._queued = False
         self._queue_size = 0
         self._rated = False
@@ -231,6 +242,22 @@ class OnlineGameSession(GameSession):
     @property
     def rematch_state(self) -> tuple[bool, bool]:
         return self._rematch_yours, self._rematch_opponent
+
+    @property
+    def undo_pending(self) -> bool:
+        """是否存在等待回应的悔棋请求。"""
+        return bool(self._undo_requester_id)
+
+    @property
+    def undo_requested_by_you(self) -> bool:
+        return bool(
+            self._undo_requester_id
+            and self._undo_requester_id == self._user_id
+        )
+
+    @property
+    def undo_requester_name(self) -> str:
+        return self._undo_requester_name
 
     @property
     def queued(self) -> bool:
@@ -315,12 +342,24 @@ class OnlineGameSession(GameSession):
             and self._your_color is not None
             and self._view.current_player is self._your_color
             and self._pending_move_id is None
+            and self._pending_undo_request_id is None
+            and not self._undo_requester_id
         )
 
     @property
     def can_undo(self) -> bool:
-        """联机首版不支持悔棋。"""
-        return False
+        """当前是否可以请求悔棋（自己的回合、已有落子且对手在线）。"""
+        return (
+            self.accepts_human_input
+            and self._opponent_online
+            and self._has_your_stone()
+        )
+
+    def _has_your_stone(self) -> bool:
+        color = self._your_color
+        if color is None:
+            return False
+        return any(cell is color for row in self._view.board for cell in row)
 
     # ------------------------------------------------------------------
     # 通信辅助
@@ -425,7 +464,35 @@ class OnlineGameSession(GameSession):
         return True
 
     def request_undo(self) -> bool:
-        return False
+        """向对手发起悔棋请求；实际回滚等服务器确认后广播。"""
+        if not self.can_undo:
+            return False
+        request_id = uuid.uuid4().hex
+        self._pending_undo_request_id = request_id
+        if not self._send(
+            make_message(CLIENT_UNDO_REQUEST, {}, request_id=request_id)
+        ):
+            self._pending_undo_request_id = None
+            return False
+        self.state_changed.emit()
+        return True
+
+    def respond_undo(self, accept: bool) -> bool:
+        """回应对手的悔棋请求；仅被请求的一方可以操作。"""
+        if (
+            self._closed
+            or self._disconnected
+            or not self._undo_requester_id
+            or self._undo_requester_id == self._user_id
+        ):
+            return False
+        return self._send(
+            make_message(
+                CLIENT_UNDO_RESPONSE,
+                {"accept": bool(accept)},
+                request_id=uuid.uuid4().hex,
+            )
+        )
 
     def request_restart(self) -> bool:
         return False
@@ -556,6 +623,10 @@ class OnlineGameSession(GameSession):
         self._opponent_username = ""
         self._rematch_yours = False
         self._rematch_opponent = False
+        self._undo_requester_id = ""
+        self._undo_requester_name = ""
+        self._pending_undo_request_id = None
+        self._last_state_version = 0
         self._queued = False
         self._queue_size = 0
         self._rated = False
@@ -601,6 +672,8 @@ class OnlineGameSession(GameSession):
             self._handle_opponent_status(message)
         elif message_type == SERVER_REMATCH_STATUS:
             self._handle_rematch_status(message)
+        elif message_type == SERVER_UNDO_STATUS:
+            self._handle_undo_status(message)
         elif message_type == SERVER_QUEUE_STATUS:
             self._handle_queue_status(message)
         elif message_type == SERVER_MATCH_FOUND:
@@ -684,6 +757,10 @@ class OnlineGameSession(GameSession):
         self._your_color = Player.BLACK
         self._rematch_yours = False
         self._rematch_opponent = False
+        self._undo_requester_id = ""
+        self._undo_requester_name = ""
+        self._pending_undo_request_id = None
+        self._last_state_version = 0
         self._queued = False
         self._queue_size = 0
         self._rated = False
@@ -706,12 +783,22 @@ class OnlineGameSession(GameSession):
             self.error.emit("服务器返回了无效棋局")
             return
 
-        if (
-            self._game_id == snapshot.game_id
-            and snapshot.move_no < self._last_move_no
-        ):
-            logger.warning("丢弃过期服务器快照：move_no=%s", snapshot.move_no)
-            return
+        same_game = self._game_id == snapshot.game_id
+        if same_game:
+            # 新版服务端用 state_version 识别回滚；没有版本号时退回手数比较，
+            # 兼容旧快照并拒绝迟到消息。
+            if snapshot.state_version or self._last_state_version:
+                if snapshot.state_version < self._last_state_version:
+                    logger.warning(
+                        "丢弃过期服务器快照：version=%s",
+                        snapshot.state_version,
+                    )
+                    return
+            elif snapshot.move_no < self._last_move_no:
+                logger.warning(
+                    "丢弃过期服务器快照：move_no=%s", snapshot.move_no
+                )
+                return
 
         was_over = self._view.is_game_over
         game_changed = self._game_id != snapshot.game_id
@@ -736,6 +823,21 @@ class OnlineGameSession(GameSession):
         self._rating_delta = snapshot.rating_delta
         self._view = _view_from_snapshot(snapshot)
         self._last_move_no = snapshot.move_no
+        self._last_state_version = snapshot.state_version
+        self._undo_requester_id = snapshot.undo_requester_id
+        if snapshot.undo_requester_id:
+            self._undo_requester_name = (
+                snapshot.black_name
+                if snapshot.undo_requester_id == snapshot.black_user_id
+                else (
+                    snapshot.white_name
+                    if snapshot.undo_requester_id == snapshot.white_user_id
+                    else "对手"
+                )
+            )
+        else:
+            self._undo_requester_name = ""
+            self._pending_undo_request_id = None
         self._opponent_online = (
             snapshot.opponent_online
             if snapshot.opponent_online is not None
@@ -798,6 +900,54 @@ class OnlineGameSession(GameSession):
         )
         self.state_changed.emit()
 
+    def _handle_undo_status(self, message: Mapping[str, Any]) -> None:
+        """更新悔棋请求状态；请求与结果都只认服务器广播。"""
+        payload = message.get("payload", {})
+        if not isinstance(payload, Mapping):
+            return
+        state = payload.get("state")
+        if state not in (
+            "requested",
+            "accepted",
+            "declined",
+            "expired",
+            "cancelled",
+        ):
+            logger.warning("丢弃非法悔棋状态：%s", state)
+            return
+        requester_id = payload.get("requester_id")
+        if not isinstance(requester_id, str):
+            requester_id = ""
+        requester_name = payload.get("requester_name")
+        if not isinstance(requester_name, str) or not requester_name:
+            requester_name = "对手"
+        was_mine = bool(requester_id) and requester_id == self._user_id
+        reason = payload.get("reason")
+        reason_text = reason if isinstance(reason, str) else ""
+        if state == "accepted":
+            reason_text = "对手已同意悔棋" if was_mine else "你已同意悔棋"
+        elif state == "declined":
+            reason_text = (
+                "对手拒绝了悔棋请求" if was_mine else "你已拒绝悔棋请求"
+            )
+        elif state == "expired":
+            reason_text = "悔棋请求已超时"
+        elif state == "cancelled" and not reason_text:
+            reason_text = "悔棋请求已取消"
+
+        if state == "requested":
+            self._undo_requester_id = requester_id
+            self._undo_requester_name = requester_name
+            self._pending_undo_request_id = None
+            if requester_id and requester_id != self._user_id:
+                self.undo_request_received.emit(requester_name)
+        else:
+            self._undo_requester_id = ""
+            self._undo_requester_name = ""
+            self._pending_undo_request_id = None
+        self.undo_status_changed.emit(state, reason_text)
+        self.state_changed.emit()
+
     def _handle_queue_status(self, message: Mapping[str, Any]) -> None:
         payload = message.get("payload", {})
         if not isinstance(payload, Mapping):
@@ -852,6 +1002,10 @@ class OnlineGameSession(GameSession):
         self._last_move_no = 0
         self._rematch_yours = False
         self._rematch_opponent = False
+        self._undo_requester_id = ""
+        self._undo_requester_name = ""
+        self._pending_undo_request_id = None
+        self._last_state_version = 0
         self._opponent_username = (
             opponent_name if isinstance(opponent_name, str) else ""
         )
@@ -891,6 +1045,12 @@ class OnlineGameSession(GameSession):
             and request_id == self._pending_move_id
         ):
             self._pending_move_id = None
+            self.state_changed.emit()
+        if (
+            self._pending_undo_request_id is not None
+            and request_id == self._pending_undo_request_id
+        ):
+            self._pending_undo_request_id = None
             self.state_changed.emit()
         self.error.emit(reason if isinstance(reason, str) and reason else "服务器错误")
 
@@ -940,6 +1100,9 @@ class OnlineGameSession(GameSession):
             return
         self._disconnected = True
         self._pending_move_id = None
+        self._undo_requester_id = ""
+        self._undo_requester_name = ""
+        self._pending_undo_request_id = None
         was_queued = self._queued
         self._queued = False
         self._queue_size = 0
@@ -952,6 +1115,7 @@ class OnlineGameSession(GameSession):
         if self._closed:
             return
         self._pending_move_id = None
+        self._pending_undo_request_id = None
         self.error.emit(message or "网络错误")
         self.state_changed.emit()
 
