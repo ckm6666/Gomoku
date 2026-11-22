@@ -289,6 +289,23 @@ py -3 -m venv .venv
 
 ## 启动联机服务端
 
+### 快捷方式（推荐）
+
+在项目根目录执行下面任意一条即可启动服务，等价于
+`python -m uvicorn server.app.main:app --host 127.0.0.1 --port 8000`：
+
+```powershell
+python run_server.py
+```
+
+- `run_server.py` 会自动挑选解释器：优先使用独立的服务端虚拟环境 `server\.venv`，
+  其次回退到当前解释器（需已安装 `fastapi` / `uvicorn`）。
+- 脚本会自动补齐开发环境变量：`GOMOKU_SERVER_ENV=development` 与
+  `GOMOKU_JWT_SECRET`（持久化到 `server/data/.dev_jwt_secret`，重启后客户端登录 token 依然有效）。
+- 可选参数：`--port 9000`、`--host 0.0.0.0`、`--no-reload`（默认已开启热重载）、`--env production`。
+
+### 手动命令
+
 在另一个终端中，从项目根目录运行。服务端使用独立 `server\.venv`，不要与客户端 PySide6 环境混用。
 
 ```powershell
