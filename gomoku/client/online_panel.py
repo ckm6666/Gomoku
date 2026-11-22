@@ -362,6 +362,7 @@ class OnlinePanel(InkBackdrop):
             self._on_social_unauthorized
         )
         self._friends_data: dict = {}
+        self._pending_removal_user_id = ""
         self._friends_panel: Optional[FriendsPanel] = None
         self._profile_panel: Optional[ProfilePanel] = None
         self._chat_panels: dict[str, PrivateChatPanel] = {}
@@ -1584,7 +1585,12 @@ class OnlinePanel(InkBackdrop):
         )
         dialog.exec()
         if not dialog.confirm_requested:
+            # 取消删除：这一行不能锁，聊天和邀请对局还得能点。
             return
+        # 确认之后再锁行。锁早了的话，用户一取消，这一行就再也点不动。
+        self._pending_removal_user_id = user_id
+        if self._friends_panel is not None:
+            self._friends_panel.lock_friend_row(user_id)
         self._social_client.remove_friend(
             self._auth_session.access_token, user_id
         )
@@ -1645,13 +1651,22 @@ class OnlinePanel(InkBackdrop):
     ) -> None:
         if not user_id:
             return
-        existing = self._chat_panels.get(user_id)
-        if existing is not None:
-            existing.show()
-            return
         resolved_name, avatar, avatar_version = self._username_avatar(
             user_id, username
         )
+        existing = self._chat_panels.get(user_id)
+        if existing is not None:
+            # 聊天窗可以被关闭，重新点“聊天”时把旧窗拉回来：刷新一下
+            # 好友资料，再补拉一次历史（关闭期间对方可能发过消息）。
+            existing.set_friend(
+                resolved_name, avatar, avatar_version=avatar_version
+            )
+            existing.show()
+            if self._auth_session is not None:
+                self._social_client.fetch_messages(
+                    self._auth_session.access_token, user_id, limit=200
+                )
+            return
         window = PrivateChatPanel(
             user_id, resolved_name, avatar, self, avatar_version
         )
@@ -1700,9 +1715,50 @@ class OnlinePanel(InkBackdrop):
         if window is not None:
             window.append_message(payload, self_id)
             window.set_status("")
+        if window is not None and window.isVisible():
+            # 聊天窗正开着，这条消息当场就读完了：让服务端销账，
+            # 免得好友列表里的未读数一直挂着。
+            self._report_messages_read(message.sender_id, window)
         else:
+            # 没有聊天窗，或者窗被关掉了：这条消息算未读，好友列表
+            # 上要冒出未读标记来。
             self._show_status(f"收到 {message.sender_name} 的新消息")
             self._refresh_friends()
+
+    def _report_messages_read(
+        self, user_id: str, window: PrivateChatPanel
+    ) -> None:
+        """把窗口里已读的消息报给服务端，并清掉本地未读数。"""
+        message_ids = window.pending_read_ids()
+        if message_ids:
+            window.mark_reported(message_ids)
+            if self._auth_session is not None:
+                self._social_client.mark_messages_read(
+                    self._auth_session.access_token, user_id, message_ids
+                )
+        self._clear_friend_unread(user_id)
+
+    def _clear_friend_unread(self, user_id: str) -> None:
+        """把某位好友的未读数清零。
+
+        先在本地改一次，好友列表立刻不再显示未读；再向服务端要一次
+        好友列表校准——本地只剩“已经显示过”的消息才算读完，服务端
+        才知道最终数字。
+        """
+        friends = self._friends_data.get("friends", [])
+        changed = False
+        if isinstance(friends, list):
+            for entry in friends:
+                if not isinstance(entry, Mapping):
+                    continue
+                if str(entry.get("user_id", "")) != user_id:
+                    continue
+                if entry.get("unread"):
+                    entry["unread"] = 0
+                    changed = True
+        if changed and self._friends_panel is not None:
+            self._friends_panel.set_data(self._friends_data)
+        self._refresh_friends()
 
     # ------------------------------------------------------------------
     # 好友事件/自建房邀请
@@ -1858,6 +1914,7 @@ class OnlinePanel(InkBackdrop):
             self._refresh_open_profile()
             return
         if kind in ("friend_decline", "friend_remove"):
+            self._pending_removal_user_id = ""
             self._refresh_friends()
             self._refresh_open_profile()
             return
@@ -1879,6 +1936,17 @@ class OnlinePanel(InkBackdrop):
             window.set_history(messages, self_id)
             window.set_status("")
             window.set_send_enabled(True)
+            # 历史接口已经把返回的消息标成已读，好友列表上的未读数要
+            # 跟着归零，否则会出现"消息读完了还显示未读"。
+            if window.isVisible():
+                # 实时推送先到、还没被历史覆盖的那几条，仍然要销账。
+                self._report_messages_read(user_id, window)
+            else:
+                self._clear_friend_unread(user_id)
+            return
+        if kind.startswith("messages_read:"):
+            # 销账成功：好友列表的未读数已经本地清零，这里等下一次
+            # 好友列表刷新校准即可，不必再发一次请求。
             return
         if kind.startswith("message_send:"):
             user_id = kind.split(":", 1)[1]
@@ -1895,6 +1963,19 @@ class OnlinePanel(InkBackdrop):
 
     def _on_social_failed(self, kind: str, message: str) -> None:
         logger.warning("社交请求失败 kind=%s：%s", kind, message)
+        if kind.startswith("messages_read:"):
+            # 销账请求是后台动作，失败了下次刷新好友列表自然会把
+            # 未读数补回来，不用拿红色报错打扰用户。
+            return
+        if kind == "friend_remove":
+            # 删除失败：对方仍是好友，把锁住的那一行解开。
+            pending = self._pending_removal_user_id
+            self._pending_removal_user_id = ""
+            if self._friends_panel is not None and pending:
+                self._friends_panel.unlock_friend_row(pending)
+        elif kind in ("friend_accept", "friend_decline"):
+            # 接受/拒绝失败：申请还在列表里，重新拉一次把行按钮解锁。
+            self._refresh_friends()
         if kind.startswith("messages:") or kind.startswith(
             "message_send:"
         ):

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 from urllib.parse import quote
 
 from PySide6.QtCore import QByteArray, QObject, QUrl, Signal
@@ -147,6 +147,32 @@ class SocialHTTPClient(QObject):
             access_token,
         )
 
+    def mark_messages_read(
+        self,
+        access_token: str,
+        user_id: str,
+        message_ids: Sequence[str],
+    ) -> bool:
+        """把已经显示过的消息标记为已读。
+
+        只报真正显示过的 id：服务端据此销账，没看过的消息仍留在未读
+        计数里，不会被顺手清零。
+        """
+        ids = [
+            message_id
+            for message_id in message_ids
+            if isinstance(message_id, str) and message_id
+        ][:200]
+        if not ids:
+            return False
+        return self._start(
+            f"messages_read:{user_id}",
+            "POST",
+            f"/api/v1/messages/{quote(user_id, safe='')}/read",
+            access_token,
+            {"message_ids": ids},
+        )
+
     def send_message(
         self, access_token: str, user_id: str, content: str
     ) -> bool:
@@ -242,7 +268,7 @@ class SocialHTTPClient(QObject):
         entry = self._replies.pop(token, None)
         if entry is None:
             # 已经被作废（例如同 kind 的新 GET 顶掉了它）：直接丢弃。
-            reply.deleteLater()
+            self._discard(reply)
             return
         kind, _reply = entry
         if self._latest_get.get(kind) == token:
@@ -277,8 +303,20 @@ class SocialHTTPClient(QObject):
                 self.unauthorized.emit(kind)
                 return
             self.failed.emit(kind, message)
+        except RuntimeError:
+            # 宿主窗口已经销毁，reply 也跟着没了。槽函数里抛出的异常
+            # 会让 PySide 直接中止整个进程，这里必须静默收场。
+            return
         finally:
+            self._discard(reply)
+
+    @staticmethod
+    def _discard(reply: QNetworkReply) -> None:
+        """安全地销毁 reply：它可能已经随宿主窗口一起没了。"""
+        try:
             reply.deleteLater()
+        except RuntimeError:
+            pass
 
     @staticmethod
     def _extract_error(data: Any) -> str:

@@ -283,6 +283,22 @@ class SendDirectMessageRequest(BaseModel):
     content: Annotated[str, Field(min_length=1, max_length=200)]
 
 
+class MarkMessagesReadRequest(BaseModel):
+    """客户端请求把若干条消息标记为已读。
+
+    只接受消息 id，不接受“全部已读”：客户端只把**真正显示过**的消息
+    报上来，没看过的那些必须继续留在未读计数里。
+    """
+
+    message_ids: Annotated[list[str], Field(max_length=200)] = Field(
+        default_factory=list
+    )
+
+
+class MarkMessagesReadResponse(BaseModel):
+    read_count: int = 0
+
+
 class GameDetailResponse(BaseModel):
     game_id: str
     rated: bool

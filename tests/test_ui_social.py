@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -15,10 +16,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtGui import QColor, QImage  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
     QFrame,
+    QLabel,
     QPushButton,
     QWidget,
 )
@@ -50,6 +54,7 @@ from gomoku.shared.achievements import (  # noqa: E402
 )
 from gomoku.shared.avatar import AVATARS  # noqa: E402
 from gomoku.shared.protocol import GameSnapshot  # noqa: E402
+from gomoku.shared.social import DirectMessage  # noqa: E402
 
 QT_APP = QApplication.instance() or QApplication([])
 
@@ -319,6 +324,39 @@ class PrivateChatPanelTests(unittest.TestCase):
         self.assertEqual(window.input.text(), "")
         window.close()
 
+    def test_close_button_hides_the_chat_window(self) -> None:
+        """私聊浮层没有系统标题栏，必须自己提供关闭入口。"""
+        window = PrivateChatPanel("u2", "好友", "lan")
+        window.show()
+        self.assertTrue(window.isVisible())
+        closed: list[bool] = []
+        window.closed.connect(lambda: closed.append(True))
+        window.close_button.click()
+        self.assertFalse(window.isVisible())
+        self.assertEqual(closed, [True])
+
+    def test_escape_closes_the_chat_window(self) -> None:
+        """焦点在输入框里时，Esc 也要能关掉聊天窗。"""
+        window = PrivateChatPanel("u2", "好友", "lan")
+        window.show()
+        window.input.setFocus()
+        QTest.keyClick(window.input, Qt.Key.Key_Escape)
+        self.assertFalse(window.isVisible())
+
+    def test_closed_chat_window_can_be_reopened(self) -> None:
+        """关掉之后重新点“聊天”，窗口要能再回来。"""
+        panel = OnlinePanel()
+        panel._open_private_chat("u2", "好友")
+        window = panel._chat_panels["u2"]
+        # 宿主联机页没有显示，isVisible() 恒为假，只能看显式隐藏标记。
+        self.assertFalse(window.isHidden())
+        window.close()
+        self.assertTrue(window.isHidden())
+        panel._open_private_chat("u2", "好友")
+        self.assertFalse(window.isHidden())
+        self.assertIs(panel._chat_panels["u2"], window)
+        panel.close()
+
 
 class OnlinePanelSocialTests(unittest.TestCase):
     def test_leaderboard_avatar_and_friends_badge(self) -> None:
@@ -427,9 +465,171 @@ class OnlinePanelSocialTests(unittest.TestCase):
         window.close()
 
 
+class FakeSocialClient:
+    """社交 REST 客户端的替身：只记账，不发网络请求。"""
+
+    def __init__(self) -> None:
+        self.read_calls: list[tuple[str, list[str]]] = []
+        self.sent: list[tuple[str, str]] = []
+        self.removed: list[str] = []
+
+    def mark_messages_read(
+        self, access_token: str, user_id: str, message_ids
+    ) -> bool:
+        self.read_calls.append((user_id, list(message_ids)))
+        return True
+
+    def fetch_messages(self, *args, **kwargs) -> bool:
+        return True
+
+    def fetch_friends(self, *args, **kwargs) -> bool:
+        return True
+
+    def send_message(self, access_token: str, user_id: str, content: str):
+        self.sent.append((user_id, content))
+        return True
+
+    def remove_friend(self, access_token: str, user_id: str) -> bool:
+        self.removed.append(user_id)
+        return True
+
+
+class UnreadBadgeTests(unittest.TestCase):
+    """消息读完以后，好友列表上的未读标记必须跟着消失。"""
+
+    def _session(self) -> AuthSession:
+        return AuthSession(
+            access_token="token",
+            refresh_token="refresh",
+            user=AuthUser(id="me", username="我"),
+            expires_in=3600,
+        )
+
+    def _panel(self) -> OnlinePanel:
+        """造一个不发网络请求的联机面板。
+
+        登录态一旦挂上，真实的社交客户端会朝本机 8000 端口发请求；
+        请求还在飞的时候测试结束、面板被回收，回调就会打到已经销毁的
+        对象上，Qt 直接 abort。所以这里把客户端换成只记账的替身。
+        """
+        panel = OnlinePanel()
+        panel._auth_session = self._session()
+        panel._social_client = FakeSocialClient()
+        return panel
+
+    def _friends_data(self, unread: int = 3) -> dict:
+        return {
+            "friends": [
+                {
+                    "user_id": "u2",
+                    "username": "好友",
+                    "avatar": "lan",
+                    "online": True,
+                    "unread": unread,
+                }
+            ],
+            "incoming": [],
+            "outgoing": [],
+        }
+
+    def _incoming(self, message_id: str = "m9") -> DirectMessage:
+        return DirectMessage(
+            id=message_id,
+            sender_id="u2",
+            sender_name="好友",
+            sender_avatar="lan",
+            recipient_id="me",
+            content="在吗",
+            sent_at_ms=2,
+        )
+
+    def test_reading_history_clears_the_unread_count(self) -> None:
+        """读完历史，服务端已标为已读，本地未读数要归零。"""
+        panel = self._panel()
+        panel._friends_data = self._friends_data()
+        panel._open_private_chat("u2", "好友")
+        window = panel._chat_panels["u2"]
+
+        panel._on_social_ready(
+            "messages:u2",
+            {
+                "messages": [
+                    {
+                        "id": "m1",
+                        "sender_id": "u2",
+                        "sender_name": "好友",
+                        "content": "你好",
+                        "sent_at_ms": 1,
+                    }
+                ]
+            },
+        )
+        self.assertEqual(
+            panel._friends_data["friends"][0]["unread"], 0
+        )
+        # 历史接口已经销账，不用再报一次。
+        self.assertEqual(window.pending_read_ids(), [])
+        panel.close()
+
+    def test_friends_panel_badge_disappears_after_reading(self) -> None:
+        """好友列表里的“N 条未读”标记要在读完消息后消失。"""
+        panel = self._panel()
+        friends_panel = FriendsPanel(panel)
+        panel._friends_panel = friends_panel
+        panel._friends_data = self._friends_data()
+        friends_panel.set_data(panel._friends_data)
+
+        def badge_texts() -> list[str]:
+            return [
+                label.text()
+                for label in friends_panel.findChildren(QLabel)
+            ]
+
+        self.assertIn("3 条未读", badge_texts())
+        panel._open_private_chat("u2", "好友")
+        panel._on_social_ready("messages:u2", {"messages": []})
+        self.assertNotIn("3 条未读", badge_texts())
+        panel.close()
+
+    def test_live_message_in_open_window_is_marked_read(self) -> None:
+        """聊天窗开着时来的消息，当场就读完了，未读数要销账。"""
+        panel = self._panel()
+        panel._friends_data = self._friends_data()
+        panel.show()
+        panel._open_private_chat("u2", "好友")
+        window = panel._chat_panels["u2"]
+        window.show()
+        QApplication.instance().processEvents()
+        self.assertTrue(window.isVisible())
+
+        panel._on_direct_message(self._incoming())
+        self.assertEqual(
+            panel._social_client.read_calls, [("u2", ["m9"])]
+        )
+        self.assertEqual(window.pending_read_ids(), [])
+        self.assertEqual(
+            panel._friends_data["friends"][0]["unread"], 0
+        )
+        panel.close()
+
+    def test_live_message_in_closed_window_stays_unread(self) -> None:
+        """聊天窗被关着时来的消息，仍然算未读，不能悄悄销账。"""
+        panel = self._panel()
+        panel._friends_data = self._friends_data()
+        panel.show()
+        panel._open_private_chat("u2", "好友")
+        window = panel._chat_panels["u2"]
+        window.show()
+        window.close()
+
+        panel._on_direct_message(self._incoming())
+        self.assertEqual(panel._social_client.read_calls, [])
+        self.assertEqual(window.pending_read_ids(), ["m9"])
+        panel.close()
+
+
 class SocialRegressionTests(unittest.TestCase):
     """社交界面上几个真实踩过的坑。"""
-
     def test_history_merge_keeps_live_messages(self) -> None:
         """历史与实时推送乱序到达时，消息既不能被抹掉也不能重复。"""
         window = PrivateChatPanel("u2", "好友", "lan")
@@ -612,6 +812,133 @@ class SocialPanelIsInWindowTests(unittest.TestCase):
         panel.close()
         self.assertEqual(seen, [True])
         self.assertFalse(panel.isVisible())
+
+
+class _FakeConfirmDialog:
+    """确认弹窗的替身：一律按“取消”处理。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.confirm_requested = False
+
+    def exec(self) -> int:
+        return 0
+
+
+class _ConfirmedDialog(_FakeConfirmDialog):
+    """确认弹窗的替身：一律按“删除”处理。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.confirm_requested = True
+
+
+class FriendRemovalTests(unittest.TestCase):
+    """删除好友：确认之前不能把这一行锁死。"""
+
+    def _friends_data(self, online: bool = True) -> dict:
+        return {
+            "friends": [
+                {
+                    "user_id": "u2",
+                    "username": "好友",
+                    "avatar": "lan",
+                    "online": online,
+                    "unread": 0,
+                }
+            ],
+            "incoming": [],
+            "outgoing": [],
+        }
+
+    def _row_buttons(self, panel: FriendsPanel) -> dict:
+        wanted = ("邀请对局", "聊天", "资料", "删除")
+        return {
+            button.text(): button
+            for button in panel.findChildren(QPushButton)
+            if button.text() in wanted
+        }
+
+    def _panel(self) -> OnlinePanel:
+        panel = OnlinePanel()
+        panel._auth_session = AuthSession(
+            access_token="token",
+            refresh_token="refresh",
+            user=AuthUser(id="me", username="我"),
+            expires_in=3600,
+        )
+        panel._social_client = FakeSocialClient()
+        return panel
+
+    def test_delete_click_keeps_row_usable(self) -> None:
+        """点“删除”只是弹确认框，确认之前不能把这一行锁死。"""
+        panel = FriendsPanel()
+        panel.set_data(self._friends_data())
+        removed: list[str] = []
+        panel.remove_requested.connect(removed.append)
+        buttons = self._row_buttons(panel)
+
+        buttons["删除"].click()
+
+        self.assertEqual(removed, ["u2"])
+        for text, button in buttons.items():
+            self.assertTrue(button.isEnabled(), f"{text} 不该被锁住")
+        panel.close()
+
+    def test_lock_and_unlock_friend_row(self) -> None:
+        """删除确认之后锁行；失败解锁后，行要恢复原样。"""
+        panel = FriendsPanel()
+        panel.set_data(self._friends_data(online=False))
+        buttons = self._row_buttons(panel)
+
+        panel.lock_friend_row("u2")
+        self.assertFalse(buttons["聊天"].isEnabled())
+
+        panel.unlock_friend_row("u2")
+        self.assertTrue(buttons["聊天"].isEnabled())
+        # 离线好友本来就不能邀请对局，解锁不能把它放开了。
+        self.assertFalse(buttons["邀请对局"].isEnabled())
+        panel.close()
+
+    def test_cancelling_delete_keeps_row_usable(self) -> None:
+        """在确认框里点“取消”，聊天和邀请对局还得能点。"""
+        panel = self._panel()
+        panel._friends_data = self._friends_data()
+        friends_panel = FriendsPanel(panel)
+        panel._friends_panel = friends_panel
+        friends_panel.set_data(panel._friends_data)
+        friends_panel.remove_requested.connect(panel._remove_friend)
+        buttons = self._row_buttons(friends_panel)
+
+        with mock.patch(
+            "gomoku.client.online_panel.ConfirmDialog",
+            _FakeConfirmDialog,
+        ):
+            buttons["删除"].click()
+
+        self.assertEqual(panel._social_client.removed, [])
+        for text, button in buttons.items():
+            self.assertTrue(button.isEnabled(), f"{text} 不该被锁住")
+        panel.close()
+
+    def test_confirming_delete_locks_row(self) -> None:
+        """确认删除之后要锁行，防止重复提交。"""
+        panel = self._panel()
+        panel._friends_data = self._friends_data()
+        friends_panel = FriendsPanel(panel)
+        panel._friends_panel = friends_panel
+        friends_panel.set_data(panel._friends_data)
+        friends_panel.remove_requested.connect(panel._remove_friend)
+        buttons = self._row_buttons(friends_panel)
+
+        with mock.patch(
+            "gomoku.client.online_panel.ConfirmDialog",
+            _ConfirmedDialog,
+        ):
+            buttons["删除"].click()
+
+        self.assertEqual(panel._social_client.removed, ["u2"])
+        self.assertFalse(buttons["聊天"].isEnabled())
+        panel.close()
 
 
 if __name__ == "__main__":

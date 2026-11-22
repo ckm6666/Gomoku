@@ -267,14 +267,14 @@ Gomoku/
 │   │   ├── api/ranked.py           # 个人排位资料与排行榜
 │   │   ├── api/users.py            # 公开资料/用户搜索/头像更新
 │   │   ├── api/friends.py          # 好友申请/列表/删除
-│   │   ├── api/messages.py         # 好友私聊历史与发送
+│   │   ├── api/messages.py         # 好友私聊历史/发送/已读销账
 │   │   ├── api/games.py            # 最近对局与单局棋谱（仅参与者）
 │   │   └── ws/rooms.py             # 自建房邀请、匹配队列、排位结算、时钟、重连
 │   ├── tests/                      # REST + 双 WebSocket + Elo/社交测试
 │   ├── requirements*.txt
 │   ├── manage.py                   # 管理员重置密码
 │   └── README.md                   # 服务端安装、部署、PostgreSQL、TLS 说明
-├── tests/                          # 客户端 222 项自动化测试
+├── tests/                          # 客户端 248 项自动化测试
 ├── requirements.txt                # 客户端运行依赖
 ├── requirements-dev.txt            # 客户端开发/打包依赖
 ├── README.md                       # 本文件
@@ -320,6 +320,23 @@ py -3 -m venv .venv
 ```
 
 ## 启动联机服务端
+
+### 快捷方式（推荐）
+
+在项目根目录执行下面任意一条即可启动服务，等价于
+`python -m uvicorn server.app.main:app --host 127.0.0.1 --port 8000`：
+
+```powershell
+python run_server.py
+```
+
+- `run_server.py` 会自动挑选解释器：优先使用独立的服务端虚拟环境 `server\.venv`，
+  其次回退到当前解释器（需已安装 `fastapi` / `uvicorn`）。
+- 脚本会自动补齐开发环境变量：`GOMOKU_SERVER_ENV=development` 与
+  `GOMOKU_JWT_SECRET`（持久化到 `server/data/.dev_jwt_secret`，重启后客户端登录 token 依然有效）。
+- 可选参数：`--port 9000`、`--host 0.0.0.0`、`--no-reload`（默认已开启热重载）、`--env production`。
+
+### 手动命令
 
 在另一个终端中，从项目根目录运行。服务端使用独立 `server\.venv`，不要与客户端 PySide6 环境混用。
 
