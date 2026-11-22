@@ -34,7 +34,7 @@ class ReplayTimeline:
 
         non_board_ending = (
             record.mode == "online"
-            and record.result_reason in ("resign", "timeout")
+            and record.result_reason in ("resign", "timeout", "escape")
         )
         if (
             record.winner is not None

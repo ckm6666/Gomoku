@@ -52,6 +52,8 @@ class Settings:
     turn_seconds: int = 30
     ws_auth_timeout_seconds: float = 10.0
     ws_idle_timeout_seconds: float = 75.0
+    # 对局中掉线后保留重连的宽限时间；超时仍未回来则判对手获胜（逃跑）。
+    disconnect_forfeit_seconds: float = 20.0
     max_ws_message_chars: int = 8192
     room_code_length: int = 8
 
@@ -104,12 +106,21 @@ class Settings:
             idle_timeout = float(
                 source.get("GOMOKU_WS_IDLE_TIMEOUT", "75").strip()
             )
+            disconnect_forfeit = float(
+                source.get(
+                    "GOMOKU_DISCONNECT_FORFEIT_SECONDS", "20"
+                ).strip()
+            )
         except ValueError as exc:
             raise ConfigurationError("WebSocket 超时必须是数字") from exc
         if auth_timeout <= 0 or auth_timeout > 60:
             raise ConfigurationError("GOMOKU_WS_AUTH_TIMEOUT 必须在 0～60 秒")
         if idle_timeout < 30 or idle_timeout > 3600:
             raise ConfigurationError("GOMOKU_WS_IDLE_TIMEOUT 必须在 30～3600 秒")
+        if disconnect_forfeit <= 0 or disconnect_forfeit > 300:
+            raise ConfigurationError(
+                "GOMOKU_DISCONNECT_FORFEIT_SECONDS 必须在 0～300 秒"
+            )
 
         return cls(
             environment=environment,
@@ -120,6 +131,7 @@ class Settings:
             turn_seconds=turn_seconds,
             ws_auth_timeout_seconds=auth_timeout,
             ws_idle_timeout_seconds=idle_timeout,
+            disconnect_forfeit_seconds=disconnect_forfeit,
             room_code_length=8,
         )
 

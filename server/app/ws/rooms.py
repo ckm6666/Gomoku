@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy import or_, select, update
+from sqlalchemy import delete, or_, select, update
 from starlette.websockets import WebSocket
 
 from gomoku.shared.achievements import new_achievement_keys
@@ -47,6 +47,7 @@ from gomoku.shared.protocol import (
     SERVER_ROOM_CREATED,
     SERVER_ROOM_INVITATION,
     SERVER_ROOM_INVITE_RESULT,
+    SERVER_UNDO_STATUS,
     make_message,
 )
 from gomoku.shared.rules import BOARD_SIZE, Player
@@ -71,6 +72,8 @@ logger = logging.getLogger(__name__)
 
 _ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 _INVITE_TTL_SECONDS = 60.0
+#: 悔棋请求等待对手回应的最长时间；超时自动取消并恢复回合计时。
+_UNDO_REQUEST_TTL_SECONDS = 30.0
 
 
 def _now_ms() -> int:
@@ -165,6 +168,15 @@ class Room:
     connections: dict[str, ClientConnection] = field(default_factory=dict)
     rematch_votes: set[str] = field(default_factory=set)
     processed_moves: dict[str, int] = field(default_factory=dict)
+    # 服务端局面版本。悔棋会让手数变小，客户端用版本号识别回滚快照。
+    state_version: int = 0
+    # 待回应的悔棋请求发起者；为空表示没有请求。
+    undo_requester_id: Optional[str] = None
+    undo_task: Optional[asyncio.Task] = None
+    undo_token: int = 0
+    # 掉线宽限：按用户保存计时任务，重连时取消对应的逃跑判负。
+    escape_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
+    escape_tokens: dict[str, int] = field(default_factory=dict)
     turn_deadline_ms: Optional[int] = None
     timeout_task: Optional[asyncio.Task] = None
     turn_token: int = 0
@@ -442,6 +454,9 @@ class RoomManager:
             "your_color": _color_text(color),
             "move_no": room.game.move_count,
             "status": status,
+            "state_version": room.state_version,
+            "result_reason": room.result_reason or "",
+            "undo_requester_id": room.undo_requester_id or "",
             "last_move": (
                 None
                 if last_move is None
@@ -533,6 +548,40 @@ class RoomManager:
                 )
             )
 
+    def _undo_status_message(
+        self,
+        room: Room,
+        state: str,
+        requester_id: Optional[str],
+        reason: str = "",
+    ) -> dict:
+        return make_message(
+            SERVER_UNDO_STATUS,
+            {
+                "state": state,
+                "requester_id": requester_id or "",
+                "requester_name": (
+                    room.username_for(requester_id)
+                    if requester_id
+                    else ""
+                ),
+                "reason": reason,
+            },
+        )
+
+    async def _broadcast_undo_status(
+        self,
+        room: Room,
+        state: str,
+        requester_id: Optional[str],
+        reason: str = "",
+    ) -> None:
+        message = self._undo_status_message(
+            room, state, requester_id, reason
+        )
+        for conn in list(room.connections.values()):
+            await conn.send(message)
+
     # ------------------------------------------------------------------
     # 连接生命周期
     # ------------------------------------------------------------------
@@ -621,11 +670,21 @@ class RoomManager:
                 if conn.user_id not in room.participant_ids():
                     return
                 room.connections[conn.user_id] = conn
+                self._cancel_escape_timer_locked(room, conn.user_id)
                 if room.status == "waiting":
                     if conn.user_id == room.black_user_id:
                         await self._send_room_created(conn, room)
                 else:
                     await self._send_game_state(room, conn)
+                    if room.undo_requester_id:
+                        # 重连后恢复待回应的悔棋请求。
+                        await conn.send(
+                            self._undo_status_message(
+                                room,
+                                "requested",
+                                room.undo_requester_id,
+                            )
+                        )
                     opponent = room.opponent_id(conn.user_id)
                     if opponent:
                         await self._send_opponent_status(
@@ -664,6 +723,26 @@ class RoomManager:
                 await self._cancel_room_invites(room, "房主已离开")
                 await self._mark_waiting_game_abandoned(room, "host_disconnected")
             else:
+                if room.undo_requester_id:
+                    requester_id = room.undo_requester_id
+                    self._clear_undo_locked(room)
+                    room.state_version += 1
+                    if room.status == "playing":
+                        self._start_timeout_locked(room)
+                    await self._broadcast_undo_status(
+                        room,
+                        "cancelled",
+                        requester_id,
+                        (
+                            "请求方已离线，悔棋请求已取消"
+                            if requester_id == conn.user_id
+                            else "对方已离线，悔棋请求已取消"
+                        ),
+                    )
+                    await self._broadcast_game_state(room)
+                if room.status == "playing":
+                    # 掉线不立刻判负；宽限期内重连即可继续对局。
+                    self._start_escape_timer_locked(room, conn.user_id)
                 opponent = room.opponent_id(conn.user_id)
                 if opponent and opponent in room.connections:
                     await self._send_opponent_status(
@@ -1343,6 +1422,11 @@ class RoomManager:
             if room.status != "playing" or room.game.is_game_over:
                 await self._send_error(conn, "当前对局已结束")
                 return
+            if room.undo_requester_id:
+                await self._send_move_rejected(
+                    conn, request_id, "请先处理悔棋请求"
+                )
+                return
             color = room.color_for(conn.user_id)
             if color is None:
                 await self._send_error(conn, "你不是本局玩家")
@@ -1414,6 +1498,7 @@ class RoomManager:
             room.status = status
             room.winner_user_id = winner_id
             room.result_reason = None
+            room.state_version += 1
             self._cancel_timeout_locked(room)
 
             if status == "playing":
@@ -1461,6 +1546,171 @@ class RoomManager:
             if opponent is None:
                 return
             await self._end_game_locked(room, opponent, "resign")
+
+    async def undo_request(
+        self,
+        conn: ClientConnection,
+        request_id: Optional[str] = None,
+    ) -> None:
+        """请求悔棋：只能在自己回合发起，等待对手同意或拒绝。"""
+        if not self._is_current_connection(conn):
+            return
+        room = self._room_by_user.get(conn.user_id)
+        if room is None:
+            await self._send_error(conn, "你不在房间中", request_id)
+            return
+
+        async with room.lock:
+            if room.connections.get(conn.user_id) is not conn:
+                return
+            if room.status != "playing" or room.game.is_game_over:
+                await self._send_error(
+                    conn, "当前没有进行中的对局", request_id
+                )
+                return
+            color = room.color_for(conn.user_id)
+            if color is None:
+                await self._send_error(conn, "你不是本局玩家", request_id)
+                return
+            if room.undo_requester_id:
+                await self._send_error(
+                    conn, "已有待回应的悔棋请求", request_id
+                )
+                return
+            if room.game.current_player is not color:
+                await self._send_error(
+                    conn, "只能在自己回合请求悔棋", request_id
+                )
+                return
+            if not any(
+                move.player is color for move in room.game.moves
+            ):
+                await self._send_error(conn, "还没有可悔的落子", request_id)
+                return
+            opponent = room.opponent_id(conn.user_id)
+            if opponent is None or opponent not in room.connections:
+                await self._send_error(
+                    conn, "对手已离线，无法请求悔棋", request_id
+                )
+                return
+
+            room.undo_requester_id = conn.user_id
+            room.state_version += 1
+            # 等待回应期间暂停本回合计时，避免对手故意拖延。
+            self._cancel_timeout_locked(room)
+            room.turn_deadline_ms = None
+            self._start_undo_expiry_locked(room)
+            await self._broadcast_undo_status(
+                room, "requested", conn.user_id
+            )
+            await self._broadcast_game_state(room)
+
+    async def undo_response(
+        self,
+        conn: ClientConnection,
+        accept: bool,
+        request_id: Optional[str] = None,
+    ) -> None:
+        """回应对手的悔棋请求；同意后回滚到请求者上一手之前。"""
+        if not self._is_current_connection(conn):
+            return
+        room = self._room_by_user.get(conn.user_id)
+        if room is None:
+            await self._send_error(conn, "你不在房间中", request_id)
+            return
+
+        async with room.lock:
+            if room.connections.get(conn.user_id) is not conn:
+                return
+            requester_id = room.undo_requester_id
+            if requester_id is None:
+                await self._send_error(
+                    conn, "没有待回应的悔棋请求", request_id
+                )
+                return
+            if requester_id == conn.user_id:
+                await self._send_error(
+                    conn, "不能回应自己的悔棋请求", request_id
+                )
+                return
+            if room.opponent_id(requester_id) != conn.user_id:
+                await self._send_error(
+                    conn, "你不是该悔棋请求的对手", request_id
+                )
+                return
+            if room.status != "playing" or room.game.is_game_over:
+                self._clear_undo_locked(room)
+                room.state_version += 1
+                await self._broadcast_undo_status(
+                    room, "cancelled", requester_id, "对局已结束"
+                )
+                return
+
+            requester_color = room.color_for(requester_id)
+            if requester_color is None:
+                self._clear_undo_locked(room)
+                await self._send_error(
+                    conn, "悔棋请求状态异常", request_id
+                )
+                return
+
+            if not accept:
+                self._clear_undo_locked(room)
+                room.state_version += 1
+                self._start_timeout_locked(room)
+                await self._broadcast_undo_status(
+                    room, "declined", requester_id, "对手拒绝了悔棋请求"
+                )
+                await self._broadcast_game_state(room)
+                return
+
+            # 目标手数 = 请求者最后一手之前的手数；其后的对手应手一并撤销。
+            target_move_no = 0
+            for index, move in enumerate(room.game.moves):
+                if move.player is requester_color:
+                    target_move_no = index
+
+            try:
+                async with self._session_factory() as session:
+                    game_row = await session.get(Game, room.game_id)
+                    if game_row is None:
+                        raise RuntimeError("game row missing")
+                    await session.execute(
+                        delete(Move).where(
+                            Move.game_id == room.game_id,
+                            Move.move_no > target_move_no,
+                        )
+                    )
+                    game_row.move_no = target_move_no
+                    game_row.status = "playing"
+                    game_row.winner_user_id = None
+                    game_row.result_reason = None
+                    game_row.ended_at = None
+                    await session.commit()
+            except Exception:
+                logger.exception("悔棋数据库写入失败 room=%s", room.code)
+                await self._send_error(
+                    conn, "服务器保存悔棋失败，请重试", request_id
+                )
+                return
+
+            while room.game.move_count > target_move_no:
+                room.game.undo()
+            self._clear_undo_locked(room)
+            room.status = "playing"
+            room.winner_user_id = None
+            room.result_reason = None
+            room.processed_moves = {
+                move_id: move_no
+                for move_id, move_no in room.processed_moves.items()
+                if move_no <= target_move_no
+            }
+            room.state_version += 1
+            self._start_timeout_locked(room)
+            await self._broadcast_undo_status(
+                room, "accepted", requester_id, "对手已同意悔棋"
+            )
+            await self._broadcast_game_state(room)
 
     async def rematch(self, conn: ClientConnection) -> None:
         if not self._is_current_connection(conn):
@@ -1523,6 +1773,9 @@ class RoomManager:
                             room.new_achievements.clear()
                             room.rematch_votes.clear()
                             room.processed_moves.clear()
+                            self._clear_undo_locked(room)
+                            self._cancel_all_escape_timers_locked(room)
+                            room.state_version = 0
                             self._start_timeout_locked(room)
                             await self._broadcast_game_state(room)
                 else:
@@ -1602,6 +1855,95 @@ class RoomManager:
     # ------------------------------------------------------------------
     # 时钟
     # ------------------------------------------------------------------
+    def _start_undo_expiry_locked(self, room: Room) -> None:
+        """悔棋请求在无人回应时自动过期，避免回合永久暂停。"""
+        self._cancel_undo_timer_locked(room)
+        room.undo_token += 1
+        token = room.undo_token
+        room.undo_task = asyncio.create_task(
+            self._undo_expire_after(room, token)
+        )
+
+    def _cancel_undo_timer_locked(self, room: Room) -> None:
+        task = room.undo_task
+        room.undo_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    def _clear_undo_locked(self, room: Room) -> None:
+        room.undo_requester_id = None
+        self._cancel_undo_timer_locked(room)
+
+    async def _undo_expire_after(self, room: Room, token: int) -> None:
+        try:
+            await asyncio.sleep(_UNDO_REQUEST_TTL_SECONDS)
+            async with room.lock:
+                if (
+                    room.undo_token != token
+                    or room.undo_requester_id is None
+                ):
+                    return
+                requester_id = room.undo_requester_id
+                self._clear_undo_locked(room)
+                room.state_version += 1
+                if room.status == "playing":
+                    self._start_timeout_locked(room)
+                await self._broadcast_undo_status(
+                    room, "expired", requester_id, "悔棋请求已超时"
+                )
+                await self._broadcast_game_state(room)
+        except asyncio.CancelledError:
+            return
+
+    def _start_escape_timer_locked(
+        self, room: Room, user_id: str
+    ) -> None:
+        """掉线宽限计时：到期仍未重连则由对手获胜。"""
+        self._cancel_escape_timer_locked(room, user_id)
+        room.escape_tokens[user_id] = room.escape_tokens.get(user_id, 0) + 1
+        token = room.escape_tokens[user_id]
+        seconds = max(0.05, float(self._settings.disconnect_forfeit_seconds))
+        room.escape_tasks[user_id] = asyncio.create_task(
+            self._escape_after(room, user_id, token, seconds)
+        )
+
+    def _cancel_escape_timer_locked(
+        self, room: Room, user_id: str
+    ) -> None:
+        task = room.escape_tasks.pop(user_id, None)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    def _cancel_all_escape_timers_locked(self, room: Room) -> None:
+        for task in list(room.escape_tasks.values()):
+            if task is not asyncio.current_task():
+                task.cancel()
+        room.escape_tasks.clear()
+
+    async def _escape_after(
+        self,
+        room: Room,
+        user_id: str,
+        token: int,
+        seconds: float,
+    ) -> None:
+        try:
+            await asyncio.sleep(seconds)
+            async with room.lock:
+                if room.escape_tokens.get(user_id) != token:
+                    return
+                room.escape_tasks.pop(user_id, None)
+                if room.status != "playing":
+                    return
+                if user_id in room.connections:
+                    return
+                winner_id = room.opponent_id(user_id)
+                if winner_id is None:
+                    return
+                await self._end_game_locked(room, winner_id, "escape")
+        except asyncio.CancelledError:
+            return
+
     def _cancel_timeout_locked(self, room: Room) -> None:
         task = room.timeout_task
         room.timeout_task = None
@@ -1637,7 +1979,13 @@ class RoomManager:
                 winner_id = room.opponent_id(loser_id)
                 if winner_id is None:
                     return
-                await self._end_game_locked(room, winner_id, "timeout")
+                # 掉线且未在宽限期内回来，按“逃跑”而不是普通超时记录。
+                reason = (
+                    "escape"
+                    if loser_id not in room.connections
+                    else "timeout"
+                )
+                await self._end_game_locked(room, winner_id, reason)
         except asyncio.CancelledError:
             return
 
@@ -1655,6 +2003,9 @@ class RoomManager:
         room.result_reason = reason
         room.turn_deadline_ms = None
         room.rematch_votes.clear()
+        room.state_version += 1
+        self._clear_undo_locked(room)
+        self._cancel_all_escape_timers_locked(room)
         self._cancel_timeout_locked(room)
 
         try:
@@ -1875,6 +2226,8 @@ class RoomManager:
 
     def _remove_room_locked(self, room: Room) -> None:
         self._cancel_timeout_locked(room)
+        self._clear_undo_locked(room)
+        self._cancel_all_escape_timers_locked(room)
         self._rooms_by_code.pop(room.code, None)
         for uid in room.participant_ids():
             if self._room_by_user.get(uid) is room:
@@ -1886,6 +2239,8 @@ class RoomManager:
         rooms = list(self._rooms_by_code.values())
         for room in rooms:
             self._cancel_timeout_locked(room)
+            self._clear_undo_locked(room)
+            self._cancel_all_escape_timers_locked(room)
         active_game_ids = [
             room.game_id
             for room in rooms

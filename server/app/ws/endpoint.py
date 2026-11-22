@@ -32,6 +32,8 @@ from gomoku.shared.protocol import (
     CLIENT_RESPOND_ROOM_INVITE,
     CLIENT_RESIGN,
     CLIENT_LEAVE_ROOM,
+    CLIENT_UNDO_REQUEST,
+    CLIENT_UNDO_RESPONSE,
     SERVER_AUTHENTICATED,
     SERVER_ERROR,
     SERVER_PONG,
@@ -273,6 +275,22 @@ async def game_websocket(websocket: WebSocket) -> None:
                         await room_manager.move(conn, request_id, row, col)
                 elif message_type == CLIENT_RESIGN:
                     await room_manager.resign(conn)
+                elif message_type == CLIENT_UNDO_REQUEST:
+                    await room_manager.undo_request(conn, request_id)
+                elif message_type == CLIENT_UNDO_RESPONSE:
+                    accept = payload.get("accept")
+                    if not isinstance(accept, bool):
+                        await conn.send(
+                            make_message(
+                                SERVER_ERROR,
+                                {"reason": "悔棋回应格式非法"},
+                                request_id=request_id,
+                            )
+                        )
+                    else:
+                        await room_manager.undo_response(
+                            conn, accept, request_id
+                        )
                 elif message_type == CLIENT_LEAVE_ROOM:
                     await room_manager.leave_room(conn)
                 elif message_type == CLIENT_REMATCH:

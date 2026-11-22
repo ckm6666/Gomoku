@@ -168,6 +168,15 @@ QLabel#onlineStatus[error="true"] {
     color: #9E3B2E;
 }
 
+QLabel#onlineUndoStatus {
+    color: #7A4A24;
+    background-color: #F3E6D2;
+    border: 1px solid #C9B99F;
+    border-radius: 4px;
+    padding: 3px 8px;
+    font-size: 12px;
+}
+
 QLabel#onlineError {
     color: #9E3B2E;
     font-size: 12px;

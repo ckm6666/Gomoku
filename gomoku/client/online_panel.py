@@ -60,6 +60,7 @@ from gomoku.client.ui_theme import ONLINE_BACKDROP_SPEC, InkBackdrop
 from gomoku.client.board_widget import BoardWidget
 from gomoku.client.config import AppConfig
 from gomoku.client.danmaku import DanmakuOverlay
+from gomoku.client.modal_overlay import NoticeOverlay
 from gomoku.client.net.game_history_api import GameHistoryHTTPClient
 from gomoku.client.net.http_api import AuthHTTPClient
 from gomoku.client.net.profile_api import ProfileHTTPClient
@@ -108,6 +109,21 @@ def _empty_view() -> BoardView:
         is_game_over=False,
         move_count=0,
     )
+
+
+def online_victory_notice(
+    snapshot: Optional[GameSnapshot],
+) -> Optional[tuple[str, str]]:
+    """对手认输或逃跑且己方获胜时，返回胜利弹窗的标题与正文。"""
+    if snapshot is None or not snapshot.is_game_over:
+        return None
+    if snapshot.winner is None or snapshot.winner is not snapshot.your_color:
+        return None
+    if snapshot.result_reason == "resign":
+        return ("对手认输", "对方认输，你获胜！")
+    if snapshot.result_reason == "escape":
+        return ("对手逃跑", "对方逃跑，你获胜！")
+    return None
 
 
 def _format_game_time(value: object) -> str:
@@ -290,6 +306,7 @@ class OnlinePanel(InkBackdrop):
         self._achievements_panel: Optional[AchievementPanel] = None
         self._leaderboard_entries: list = []
         self._achievement_notice_game_id = ""
+        self._victory_notice_game_id = ""
         self._auto_requeue = False
         self._refresh_after_auth_refresh = False
         # 对话日志的展开状态（逻辑值，不受页面是否在前台影响）。
@@ -381,6 +398,10 @@ class OnlinePanel(InkBackdrop):
         self._reconnect_timer = QTimer(self)
         self._reconnect_timer.setSingleShot(True)
         self._reconnect_timer.timeout.connect(self._attempt_reconnect)
+
+        self._undo_notice_timer = QTimer(self)
+        self._undo_notice_timer.setSingleShot(True)
+        self._undo_notice_timer.timeout.connect(self._clear_undo_notice)
 
         self._build_ui()
         self._show_auth_page()
@@ -908,10 +929,15 @@ class OnlinePanel(InkBackdrop):
         self.game_status_pill.setMinimumWidth(112)
         self.clock_label = QLabel("—", page)
         self.clock_label.setObjectName("onlineClock")
+        self.undo_status_label = QLabel("", page)
+        self.undo_status_label.setObjectName("onlineUndoStatus")
+        self.undo_status_label.setWordWrap(True)
+        self.undo_status_label.setVisible(False)
         self.move_label = QLabel("第 0 手", page)
         self.move_label.setObjectName("moveInfo")
         info.addWidget(self.game_status_pill)
         info.addWidget(self.clock_label)
+        info.addWidget(self.undo_status_label)
         info.addStretch(1)
         info.addWidget(self.move_label)
         left_column.addLayout(info)
@@ -980,6 +1006,11 @@ class OnlinePanel(InkBackdrop):
         actions = QHBoxLayout()
         actions.setSpacing(8)
         actions.addStretch(1)
+        self.undo_button = QPushButton("请求悔棋", page)
+        self.undo_button.setObjectName("undoButton")
+        self.undo_reject_button = QPushButton("拒绝悔棋", page)
+        self.undo_reject_button.setObjectName("undoButton")
+        self.undo_reject_button.setVisible(False)
         self.resign_button = QPushButton("认输", page)
         self.resign_button.setObjectName("undoButton")
         self.rematch_button = QPushButton("申请再战", page)
@@ -987,6 +1018,8 @@ class OnlinePanel(InkBackdrop):
         self.leave_button = QPushButton("离开房间", page)
         self.leave_button.setObjectName("undoButton")
         for button in (
+            self.undo_button,
+            self.undo_reject_button,
             self.resign_button,
             self.rematch_button,
             self.leave_button,
@@ -996,6 +1029,8 @@ class OnlinePanel(InkBackdrop):
             actions.addWidget(button)
         layout.addLayout(actions)
 
+        self.undo_button.clicked.connect(self._on_undo_clicked)
+        self.undo_reject_button.clicked.connect(self._on_undo_declined)
         self.resign_button.clicked.connect(self._on_resign)
         self.rematch_button.clicked.connect(self._on_rematch)
         self.leave_button.clicked.connect(self._on_leave_room)
@@ -2316,6 +2351,10 @@ class OnlinePanel(InkBackdrop):
         session.stone_placed.connect(self._on_online_stone_placed)
         session.game_over.connect(self._on_online_game_over)
         session.error.connect(self._on_online_error)
+        session.undo_request_received.connect(
+            self._on_undo_request_received
+        )
+        session.undo_status_changed.connect(self._on_undo_status_changed)
         session.room_created.connect(self._on_room_created)
         session.room_closed.connect(self._on_room_closed)
         session.queue_status_changed.connect(
@@ -2692,6 +2731,52 @@ class OnlinePanel(InkBackdrop):
         if self._session is not None and self._session.accepts_human_input:
             self._session.request_move(row, col)
 
+    def _on_undo_clicked(self) -> None:
+        """正常时发起悔棋请求；对手请求待回应时，此按钮表示同意。"""
+        if self._session is None:
+            return
+        if self._session.undo_pending:
+            if not self._session.undo_requested_by_you:
+                self._session.respond_undo(True)
+            return
+        self._session.request_undo()
+
+    def _on_undo_declined(self) -> None:
+        if self._session is not None and self._session.undo_pending:
+            self._session.respond_undo(False)
+
+    def _on_undo_request_received(self, name: str) -> None:
+        if self.sender() is not self._session or self._closing:
+            return
+        self._show_undo_notice(f"{name or '对手'} 请求悔棋，是否同意？")
+        self._sync_game_page()
+
+    def _on_undo_status_changed(self, state: str, reason: str) -> None:
+        if self.sender() is not self._session or self._closing:
+            return
+        if state == "requested":
+            if self._session is not None and self._session.undo_requested_by_you:
+                self._show_undo_notice("已发送悔棋请求，等待对手回应…")
+        elif state == "accepted":
+            self._show_undo_notice(reason or "悔棋成功")
+        elif state == "declined":
+            self._show_undo_notice(reason or "对手拒绝了悔棋请求")
+        elif state == "expired":
+            self._show_undo_notice(reason or "悔棋请求已超时")
+        elif state == "cancelled":
+            self._show_undo_notice(reason or "悔棋请求已取消")
+        self._sync_game_page()
+
+    def _show_undo_notice(self, text: str) -> None:
+        self.undo_status_label.setText(text)
+        self.undo_status_label.setVisible(bool(text))
+        if text:
+            self._undo_notice_timer.start(5000)
+
+    def _clear_undo_notice(self) -> None:
+        self.undo_status_label.setText("")
+        self.undo_status_label.setVisible(False)
+
     def _on_resign(self) -> None:
         if self._session is not None:
             self._session.resign()
@@ -2737,8 +2822,34 @@ class OnlinePanel(InkBackdrop):
         self._sync_online_ui()
         if not self._closing:
             self._play_online_result_sound()
+            QTimer.singleShot(0, self._show_online_victory_notice)
         if self._session is not None:
             QTimer.singleShot(0, self._refresh_profile_data)
+
+    def _show_online_victory_notice(self) -> None:
+        """对手认输/逃跑后的胜利弹窗；同一局只弹一次。"""
+        if self._closing or self._session is None:
+            return
+        snapshot = self._session.snapshot
+        notice = online_victory_notice(snapshot)
+        if notice is None or snapshot is None:
+            return
+        if self._victory_notice_game_id == snapshot.game_id:
+            return
+        if (
+            not self.isVisible()
+            or self.stack.currentWidget() is not self.game_page
+        ):
+            return
+        self._victory_notice_game_id = snapshot.game_id
+        title, message = notice
+        overlay = NoticeOverlay(
+            title, message, parent=self, seal_text="胜"
+        )
+        try:
+            overlay.exec()
+        finally:
+            overlay.deleteLater()
 
     def _play_online_result_sound(self) -> None:
         """按服务器快照判断胜负，播放对应的终局音效。"""
@@ -2948,10 +3059,15 @@ class OnlinePanel(InkBackdrop):
             self.game_rating_label.clear()
             self.game_rating_label.setVisible(False)
             self._update_achievement_notice(None)
+            self._clear_undo_notice()
             self.board_widget.set_view(session.view)
             self.board_widget.set_interaction_enabled(False)
             self._set_action_visibility(
-                resign=False, rematch=False, leave=True
+                resign=False,
+                rematch=False,
+                leave=True,
+                undo=False,
+                reject_undo=False,
             )
             self.rematch_button.setEnabled(False)
             self.leave_button.setText("离开房间")
@@ -3008,6 +3124,7 @@ class OnlinePanel(InkBackdrop):
         over = snapshot.is_game_over
         winner = snapshot.winner
         if over:
+            self._clear_undo_notice()
             if snapshot.your_rating_after is not None:
                 your_rating = snapshot.your_rating_after
             if snapshot.opponent_rating_after is not None:
@@ -3122,12 +3239,32 @@ class OnlinePanel(InkBackdrop):
         self.board_widget.update()
         self._update_clock_label()
 
+        undo_pending = session.undo_pending
+        undo_mine = session.undo_requested_by_you
+        reject_undo = not over and undo_pending and not undo_mine
         self._set_action_visibility(
-            resign=not over, rematch=over, leave=over
+            resign=not over,
+            rematch=over,
+            leave=over,
+            undo=not over,
+            reject_undo=reject_undo,
         )
         self.resign_button.setEnabled(not over and self._ws_connected)
         self.leave_button.setEnabled(over and self._ws_connected)
+        self.undo_reject_button.setEnabled(reject_undo and self._ws_connected)
         if not over:
+            if undo_pending:
+                self.undo_button.setText(
+                    "等待对方同意" if undo_mine else "同意悔棋"
+                )
+                self.undo_button.setEnabled(
+                    self._ws_connected and not undo_mine
+                )
+            else:
+                self.undo_button.setText("请求悔棋")
+                self.undo_button.setEnabled(
+                    self._ws_connected and session.can_undo
+                )
             self.leave_button.setText("离开房间")
             return
         if rated:
@@ -3184,7 +3321,12 @@ class OnlinePanel(InkBackdrop):
         resign: bool,
         rematch: bool,
         leave: bool,
+        *,
+        undo: bool,
+        reject_undo: bool,
     ) -> None:
+        self.undo_button.setVisible(undo)
+        self.undo_reject_button.setVisible(reject_undo)
         self.resign_button.setVisible(resign)
         self.rematch_button.setVisible(rematch)
         self.leave_button.setVisible(leave)
@@ -3204,6 +3346,13 @@ class OnlinePanel(InkBackdrop):
             return
         if not self._ws_connected:
             self.clock_label.setText("连接中断")
+            return
+        if self._session.undo_pending:
+            self.clock_label.setText(
+                "等待对手回应悔棋"
+                if self._session.undo_requested_by_you
+                else "请回应悔棋请求"
+            )
             return
         if self._deadline_monotonic is None:
             self.clock_label.setText("等待服务器…")
@@ -3225,6 +3374,7 @@ class OnlinePanel(InkBackdrop):
         self._heartbeat_timer.stop()
         self._clock_timer.stop()
         self._reconnect_timer.stop()
+        self._undo_notice_timer.stop()
         self._auth_client.abort()
         self._profile_client.abort_all()
         self._history_client.abort_all()

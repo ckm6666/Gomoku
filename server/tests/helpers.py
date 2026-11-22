@@ -24,6 +24,9 @@ from server.app.security import LoginBackoff
 class ServerTestBase(unittest.TestCase):
     """每个测试拥有独立临时数据库、独立 FastAPI app 和 TestClient。"""
 
+    #: 掉线判负宽限；需要验证“逃跑”的用例可以调短。
+    disconnect_forfeit_seconds: float = 20.0
+
     def setUp(self) -> None:
         # Windows 上 SQLite 文件句柄的释放有延迟，临时目录偶尔会删不掉
         # （WinError 32），ignore_cleanup_errors 让清理失败不影响用例结果。
@@ -39,6 +42,7 @@ class ServerTestBase(unittest.TestCase):
             refresh_token_days=30,
             turn_seconds=30,
             ws_auth_timeout_seconds=2.0,
+            disconnect_forfeit_seconds=self.disconnect_forfeit_seconds,
         )
         self.app = create_app(self.settings)
         self._client_cm = TestClient(self.app)
