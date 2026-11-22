@@ -1,14 +1,30 @@
-"""预置头像定义，客户端与服务端共用。
+"""头像定义，客户端与服务端共用。
 
-头像不使用上传图片，而是由古典纹样字符 + 配色组成的小型印章。这样
-无需文件存储/静态资源服务，也不引入图片上传的安全与隐私问题；用户名
-哈希可为每个账号生成稳定的默认头像。本模块不依赖 Qt。
+每个账号始终有一个**预置印章头像**（古典纹样字符 + 配色），可在
+12 枚印章中自由选择；选择操作不需要文件存储，用户名哈希还能为每个
+账号生成稳定的默认头像。
+
+在此之上，登录账号可以上传一张本地图片作为自定义头像：客户端把图片
+裁成方形并编码为 JPEG data URL，服务端只校验格式/体积/尺寸后原样保存，
+再通过 ``GET /api/v1/users/{id}/avatar`` 提供给所有客户端。上传图片
+仅作为预置印章的覆盖层；移除自定义图片后自动回落到预置印章。
+
+本模块不依赖 Qt。
 """
 
 from __future__ import annotations
 
 import zlib
 from dataclasses import dataclass
+
+#: 上传头像的边长（逻辑像素）。客户端会先裁切/缩放到这个尺寸。
+AVATAR_IMAGE_PIXELS = 192
+#: 服务端接受的最大图片字节数（解码后）。
+AVATAR_IMAGE_MAX_BYTES = 256 * 1024
+#: 服务端接受的最大边长，防止绕过客户端上传超大图片。
+AVATAR_IMAGE_MAX_DIMENSION = 1024
+#: 客户端上传时使用的 MIME 类型；服务端按文件头再次校验。
+AVATAR_IMAGE_MEDIA_TYPE = "image/jpeg"
 
 
 @dataclass(frozen=True)
@@ -74,6 +90,10 @@ __all__ = [
     "AVATAR_BY_KEY",
     "AVATAR_KEYS",
     "DEFAULT_AVATAR",
+    "AVATAR_IMAGE_PIXELS",
+    "AVATAR_IMAGE_MAX_BYTES",
+    "AVATAR_IMAGE_MAX_DIMENSION",
+    "AVATAR_IMAGE_MEDIA_TYPE",
     "is_valid_avatar",
     "default_avatar_for",
     "normalize_avatar",

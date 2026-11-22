@@ -292,8 +292,17 @@ class FriendsPanel(PaperPanel):
 
         user_id = self._user_id(entry)
         username = str(entry.get("username", "玩家"))
+        avatar_version = entry.get("avatar_version", 0)
+        if not isinstance(avatar_version, int) or isinstance(
+            avatar_version, bool
+        ):
+            avatar_version = 0
         avatar = AvatarView(
-            entry.get("avatar", ""), user_id, 36, frame
+            entry.get("avatar", ""),
+            user_id,
+            36,
+            frame,
+            avatar_version=max(0, avatar_version),
         )
         if online is not None:
             avatar.set_online(online)

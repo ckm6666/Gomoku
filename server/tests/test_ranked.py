@@ -128,6 +128,17 @@ class RankedMatchTests(ServerTestBase):
                 self.assertIs(white_end.winner, white_end.your_color)
                 self.assertGreater(white_end.rating_delta or 0, 0)
                 self.assertLess(black_end.rating_delta or 0, 0)
+                # 胜者本局解锁“首胜”并同步到双方卡片；负者没有新成就。
+                self.assertIn(
+                    "first_win", white_end.your_new_achievements
+                )
+                self.assertIn("first_win", white_end.white_achievements)
+                self.assertNotIn(
+                    "first_win", black_end.black_achievements
+                )
+                self.assertEqual(black_end.your_new_achievements, ())
+                self.assertEqual(black_end.black_avatar_version, 0)
+                self.assertEqual(white_end.white_avatar_version, 0)
                 self.assertGreater(
                     white_end.your_rating_after or 0,
                     white_end.your_rating_before or 0,
@@ -169,6 +180,16 @@ class RankedMatchTests(ServerTestBase):
                 profile_data = profile.json()
                 self.assertEqual(profile_data["user"]["wins"], 1)
                 self.assertEqual(profile_data["user"]["rated_games"], 1)
+                self.assertEqual(
+                    profile_data["user"]["current_win_streak"], 1
+                )
+                self.assertEqual(
+                    profile_data["user"]["best_win_streak"], 1
+                )
+                self.assertIn(
+                    "first_win",
+                    profile_data["user"]["achievements"],
+                )
                 self.assertEqual(
                     profile_data["recent_games"][0]["opponent_username"],
                     black_name,
@@ -266,6 +287,79 @@ class RankedMatchTests(ServerTestBase):
         self.assertEqual(me.status_code, 200)
         self.assertEqual(me.json()["rating"], 1200)
         self.assertEqual(me.json()["rated_games"], 0)
+
+    def _play_ranked_and_resign(
+        self,
+        first_token: str,
+        second_token: str,
+        loser_is_first: bool,
+    ) -> None:
+        """匹配一局后让指定玩家认输。
+
+        使用临时的两个 WebSocket；函数退出时连接断开，终局房间随之清理，
+        下一局可以重新匹配。
+        """
+        with self.client.websocket_connect(
+            "/api/v1/ws"
+        ) as first_ws, self.client.websocket_connect(
+            "/api/v1/ws"
+        ) as second_ws:
+            self._authenticate(first_ws, first_token)
+            self._authenticate(second_ws, second_token)
+            first_ws.send_json(make_message(CLIENT_QUICK_MATCH, {}))
+            first_ws.receive_json()  # queue_status: queued
+            second_ws.send_json(make_message(CLIENT_QUICK_MATCH, {}))
+
+            for ws in (first_ws, second_ws):
+                self._receive_type(ws, SERVER_QUEUE_STATUS)
+                self._receive_type(ws, SERVER_MATCH_FOUND)
+                self._receive_type(ws, SERVER_GAME_STATE)
+
+            loser_ws = first_ws if loser_is_first else second_ws
+            loser_ws.send_json(make_message(CLIENT_RESIGN, {}))
+            for ws in (first_ws, second_ws):
+                end = self._receive_type(ws, SERVER_GAME_STATE)
+                self.assertNotEqual(end["payload"]["status"], "playing")
+
+    def test_ranked_win_streak_unlocks_and_resets(self) -> None:
+        winner_token = self._register_access("streak_winner")
+        loser_token = self._register_access("streak_loser")
+
+        for expected_streak in (1, 2, 3):
+            self._play_ranked_and_resign(
+                winner_token, loser_token, loser_is_first=False
+            )
+            profile = self.client.get(
+                "/api/v1/profile/me",
+                headers=self.auth_headers(winner_token),
+            ).json()["user"]
+            self.assertEqual(
+                profile["current_win_streak"], expected_streak
+            )
+            self.assertEqual(profile["best_win_streak"], expected_streak)
+            if expected_streak == 3:
+                self.assertIn("streak_3", profile["achievements"])
+            else:
+                self.assertNotIn("streak_3", profile["achievements"])
+
+        # 赢家输掉一局：当前连胜清零，历史最高连胜与已获勋章保留。
+        self._play_ranked_and_resign(
+            winner_token, loser_token, loser_is_first=True
+        )
+        profile = self.client.get(
+            "/api/v1/profile/me",
+            headers=self.auth_headers(winner_token),
+        ).json()["user"]
+        self.assertEqual(profile["current_win_streak"], 0)
+        self.assertEqual(profile["best_win_streak"], 3)
+        self.assertIn("streak_3", profile["achievements"])
+
+        leaderboard = self.client.get(
+            "/api/v1/leaderboard",
+            headers=self.auth_headers(winner_token),
+        ).json()
+        for entry in leaderboard["entries"]:
+            self.assertIn("avatar_version", entry)
 
     def test_leaderboard_requires_auth_and_is_empty_initially(self) -> None:
         unauth = self.client.get("/api/v1/leaderboard")

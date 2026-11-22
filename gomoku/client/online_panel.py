@@ -32,8 +32,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gomoku.client.achievement_widgets import (
+    AchievementPanel,
+    achievement_names,
+    achievement_pixmap,
+)
 from gomoku.client.audio import get_audio_manager
 from gomoku.client.auth import AuthSession
+from gomoku.client.avatar_images import (
+    avatar_image_cache,
+    configure_avatar_images,
+)
 from gomoku.client.avatar_widgets import AvatarButton, avatar_icon
 from gomoku.client.board_view import BoardView
 from gomoku.client.chat_widgets import (
@@ -57,6 +66,12 @@ from gomoku.client.net.profile_api import ProfileHTTPClient
 from gomoku.client.net.websocket_transport import QtWebSocketTransport
 from gomoku.client.sessions.online import OnlineGameSession
 from gomoku.client.sound_control import SoundButton
+from gomoku.shared.achievements import (
+    ACHIEVEMENT_BY_KEY,
+    MATCH_MEDAL_LIMIT,
+    normalize_achievement_keys,
+    top_achievement_keys,
+)
 from gomoku.shared.avatar import normalize_avatar
 from gomoku.shared.chat import (
     CHAT_KIND_EMOJI,
@@ -117,6 +132,14 @@ def _result_label(value: object) -> str:
     }.get(value, "—")
 
 
+def _entry_avatar_version(entry: Mapping) -> int:
+    """从资料字典里安全读取头像版本号。"""
+    value = entry.get("avatar_version", 0)
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return 0
+
+
 class OnlinePlayerCard(QFrame):
     """在线对局身份卡，可随再战交换黑白更新颜色。"""
 
@@ -147,12 +170,22 @@ class OnlinePlayerCard(QFrame):
         text_layout = QVBoxLayout()
         text_layout.setContentsMargins(0, 0, 0, 0)
         text_layout.setSpacing(0)
+        name_row = QHBoxLayout()
+        name_row.setContentsMargins(0, 0, 0, 0)
+        name_row.setSpacing(4)
         self._name = QLabel("玩家", self)
         self._name.setObjectName("playerName")
+        self._medal_row = QHBoxLayout()
+        self._medal_row.setContentsMargins(0, 0, 0, 0)
+        self._medal_row.setSpacing(3)
+        name_row.addWidget(self._name)
+        name_row.addLayout(self._medal_row)
+        name_row.addStretch(1)
         self._caption = QLabel("等待", self)
         self._caption.setObjectName("playerCaption")
-        text_layout.addWidget(self._name)
+        text_layout.addLayout(name_row)
         text_layout.addWidget(self._caption)
+        self._achievement_keys: tuple[str, ...] = ()
 
         layout.addWidget(
             self.avatar_button, 0, Qt.AlignmentFlag.AlignVCenter
@@ -169,8 +202,13 @@ class OnlinePlayerCard(QFrame):
         rating: Optional[int] = None,
         avatar: str = "",
         user_id: str = "",
+        avatar_version: int = 0,
+        achievements: tuple[str, ...] = (),
     ) -> None:
-        self.avatar_button.set_avatar(avatar, user_id)
+        self.avatar_button.set_avatar(
+            avatar, user_id, max(0, int(avatar_version))
+        )
+        self._set_achievements(achievements)
         badge_name = (
             "stoneBadgeBlack" if color is Player.BLACK else "stoneBadgeWhite"
         )
@@ -191,6 +229,33 @@ class OnlinePlayerCard(QFrame):
                 widget.style().unpolish(widget)
                 widget.style().polish(widget)
             self.update()
+
+    def _set_achievements(self, achievements: object) -> None:
+        """在名字右侧显示最稀有的几枚成就勋章。"""
+        keys = top_achievement_keys(
+            normalize_achievement_keys(achievements),
+            MATCH_MEDAL_LIMIT,
+        )
+        if keys == self._achievement_keys:
+            return
+        self._achievement_keys = keys
+        while self._medal_row.count():
+            item = self._medal_row.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        for key in keys:
+            spec = ACHIEVEMENT_BY_KEY.get(key)
+            if spec is None:
+                continue
+            badge = QLabel(self)
+            badge.setPixmap(
+                achievement_pixmap(spec, 20, self.devicePixelRatioF())
+            )
+            badge.setFixedSize(20, 20)
+            badge.setToolTip(f"{spec.name} · {spec.description}")
+            self._medal_row.addWidget(badge)
 
 
 class OnlinePanel(InkBackdrop):
@@ -222,7 +287,9 @@ class OnlinePanel(InkBackdrop):
         self._audio_game_id: Optional[str] = None
         self._deadline_monotonic: Optional[float] = None
         self._profile_user: Optional[dict] = None
+        self._achievements_panel: Optional[AchievementPanel] = None
         self._leaderboard_entries: list = []
+        self._achievement_notice_game_id = ""
         self._auto_requeue = False
         self._refresh_after_auth_refresh = False
         # 对话日志的展开状态（逻辑值，不受页面是否在前台影响）。
@@ -231,6 +298,11 @@ class OnlinePanel(InkBackdrop):
         self._settings = QSettings()
 
         self._api_base_url, self._ws_url = self._resolve_urls()
+        # 自定义头像按需下载；离线模式没有地址时缓存器保持静默。
+        configure_avatar_images(self._api_base_url or "")
+        avatar_image_cache().image_loaded.connect(
+            self._on_avatar_image_loaded
+        )
         self._auth_client = AuthHTTPClient(
             self._api_base_url or None,
             timeout_seconds=self.config.request_timeout_seconds,
@@ -892,6 +964,13 @@ class OnlinePanel(InkBackdrop):
         self.game_rating_label.setVisible(False)
         layout.addWidget(self.game_rating_label)
 
+        self.game_achievement_label = QLabel(page)
+        self.game_achievement_label.setObjectName("onlineAchievementResult")
+        self.game_achievement_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.game_achievement_label.setWordWrap(True)
+        self.game_achievement_label.setVisible(False)
+        layout.addWidget(self.game_achievement_label)
+
         self.game_error_label = QLabel(page)
         self.game_error_label.setObjectName("onlineError")
         self.game_error_label.setWordWrap(True)
@@ -1107,8 +1186,51 @@ class OnlinePanel(InkBackdrop):
         raw_user = data.get("user")
         if isinstance(raw_user, Mapping):
             self._profile_user = dict(raw_user)
+            self._sync_auth_user_from_profile(raw_user)
         self._update_self_avatar()
         self._update_rating_summary()
+
+    def _sync_auth_user_from_profile(self, raw_user: Mapping) -> None:
+        """把资料接口的最新头像/成就/战绩同步进登录会话。"""
+        if self._auth_session is None:
+            return
+        current = self._auth_session.user
+        avatar = raw_user.get("avatar")
+        if not isinstance(avatar, str) or not avatar:
+            avatar = current.avatar
+        achievements = normalize_achievement_keys(
+            raw_user.get("achievements")
+        )
+        if not achievements:
+            achievements = current.achievement_keys
+
+        def int_value(key: str, fallback: int) -> int:
+            value = raw_user.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+            return fallback
+
+        user = replace(
+            current,
+            avatar=normalize_avatar(avatar, current.id),
+            avatar_version=_entry_avatar_version(raw_user),
+            rating=int_value("rating", current.rating),
+            peak_rating=int_value("peak_rating", current.peak_rating),
+            rated_games=int_value(
+                "rated_games", current.rated_games
+            ),
+            wins=int_value("wins", current.wins),
+            losses=int_value("losses", current.losses),
+            draws=int_value("draws", current.draws),
+            current_win_streak=int_value(
+                "current_win_streak", current.current_win_streak
+            ),
+            best_win_streak=int_value(
+                "best_win_streak", current.best_win_streak
+            ),
+            achievements=achievements,
+        )
+        self._auth_session = replace(self._auth_session, user=user)
 
     def _on_leaderboard_ready(self, data: object) -> None:
         if not isinstance(data, Mapping):
@@ -1163,6 +1285,7 @@ class OnlinePanel(InkBackdrop):
                             entry.get("avatar"),
                             str(entry.get("user_id", "")),
                             20,
+                            avatar_version=_entry_avatar_version(entry),
                         )
                     )
                     item.setToolTip("点击玩家查看个人信息")
@@ -1178,6 +1301,24 @@ class OnlinePanel(InkBackdrop):
             self.leaderboard_status_label.setText(
                 "还没有玩家完成排位赛，成为第一个上榜的人吧"
             )
+
+    def _on_avatar_image_loaded(self, user_id: str, version: int) -> None:
+        """头像图片异步到货后，刷新排行榜里对应的图标。"""
+        for row, entry in enumerate(self._leaderboard_entries):
+            if not isinstance(entry, Mapping):
+                continue
+            if str(entry.get("user_id", "")) != user_id:
+                continue
+            item = self.leaderboard_table.item(row, 1)
+            if item is not None:
+                item.setIcon(
+                    avatar_icon(
+                        entry.get("avatar"),
+                        user_id,
+                        20,
+                        avatar_version=version,
+                    )
+                )
 
     def _on_profile_failed(self, message: str) -> None:
         logger.warning("读取排位资料失败：%s", message)
@@ -1219,7 +1360,9 @@ class OnlinePanel(InkBackdrop):
         if self._auth_session is None:
             return
         user = self._auth_session.user
-        self.self_avatar.set_avatar(user.avatar, user.id)
+        self.self_avatar.set_avatar(
+            user.avatar, user.id, user.avatar_version
+        )
         self.self_avatar.setVisible(True)
 
     def _self_profile(self) -> dict:
@@ -1229,6 +1372,7 @@ class OnlinePanel(InkBackdrop):
             user.setdefault("id", auth_user.id)
             user.setdefault("username", auth_user.username)
             user.setdefault("avatar", auth_user.avatar)
+            user.setdefault("avatar_version", auth_user.avatar_version)
             user.setdefault("rating", auth_user.rating)
             user.setdefault("peak_rating", auth_user.peak_rating)
             user.setdefault("rated_games", auth_user.rated_games)
@@ -1237,6 +1381,15 @@ class OnlinePanel(InkBackdrop):
             user.setdefault("draws", auth_user.draws)
             user.setdefault("rank_name", auth_user.rank_name)
             user.setdefault("win_rate", auth_user.win_rate)
+            user.setdefault(
+                "current_win_streak", auth_user.current_win_streak
+            )
+            user.setdefault(
+                "best_win_streak", auth_user.best_win_streak
+            )
+            user.setdefault(
+                "achievements", list(auth_user.achievement_keys)
+            )
         return {"user": user, "online": True, "friendship": "self"}
 
     def _open_user_profile(self, user_id: str) -> None:
@@ -1267,6 +1420,9 @@ class OnlinePanel(InkBackdrop):
             window.open_friends_requested.connect(
                 self._open_friends_panel
             )
+            window.achievements_requested.connect(
+                self._open_achievements_panel
+            )
             window.destroyed.connect(
                 lambda *_: setattr(self, "_profile_panel", None)
             )
@@ -1274,13 +1430,35 @@ class OnlinePanel(InkBackdrop):
         self._profile_panel.set_profile(profile)
         self._profile_panel.show()
 
+    def _open_achievements_panel(self) -> None:
+        """打开当前资料对应玩家的完整成就墙。"""
+        profile = getattr(self, "_current_profile", None)
+        if not isinstance(profile, Mapping):
+            return
+        user = profile.get("user")
+        if not isinstance(user, Mapping):
+            return
+        if self._achievements_panel is not None:
+            self._achievements_panel.close()
+            self._achievements_panel.deleteLater()
+            self._achievements_panel = None
+        panel = AchievementPanel(user, self)
+        panel.destroyed.connect(
+            lambda *_: setattr(self, "_achievements_panel", None)
+        )
+        self._achievements_panel = panel
+        panel.show()
+
     def _open_avatar_picker(self) -> None:
         if self._auth_session is None:
             return
         picker = AvatarPickerPanel(
-            self._auth_session.user.avatar, self
+            self._auth_session.user.avatar,
+            self,
+            current_version=self._auth_session.user.avatar_version,
         )
         picker.avatar_selected.connect(self._on_avatar_selected)
+        picker.image_selected.connect(self._on_avatar_image_selected)
         picker.exec()
 
     def _on_avatar_selected(self, avatar: str) -> None:
@@ -1290,28 +1468,42 @@ class OnlinePanel(InkBackdrop):
             self._auth_session.access_token, avatar
         )
 
+    def _on_avatar_image_selected(self, data_url: str) -> None:
+        if self._auth_session is None or not data_url:
+            return
+        self._show_status("正在上传头像…")
+        self._social_client.update_avatar_image(
+            self._auth_session.access_token, data_url
+        )
+
     def _apply_avatar_update(self, data: object) -> None:
         if not isinstance(data, Mapping) or self._auth_session is None:
             return
         avatar = data.get("avatar")
         if not isinstance(avatar, str):
             return
+        avatar_version = _entry_avatar_version(data)
         user = replace(
             self._auth_session.user,
             avatar=normalize_avatar(
                 avatar, self._auth_session.user.id
             ),
+            avatar_version=avatar_version,
         )
         self._auth_session = replace(self._auth_session, user=user)
+        avatar_image_cache().invalidate(user.id)
         if self._profile_user is not None:
             self._profile_user["avatar"] = user.avatar
+            self._profile_user["avatar_version"] = user.avatar_version
         self._update_self_avatar()
         if (
             self._profile_panel is not None
             and self._profile_panel.user_id == user.id
         ):
             # 资料浮层此刻显示的不是自己时，不能把本人的头像盖上去。
-            self._profile_panel.set_avatar(user.avatar)
+            self._profile_panel.set_avatar(
+                user.avatar, user.avatar_version
+            )
         self._show_status("头像已更新")
 
     # ------------------------------------------------------------------
@@ -1382,7 +1574,7 @@ class OnlinePanel(InkBackdrop):
     def _remove_friend(self, user_id: str) -> None:
         if self._auth_session is None or not user_id:
             return
-        username, _ = self._username_avatar(user_id)
+        username, _avatar, _version = self._username_avatar(user_id)
         dialog = ConfirmDialog(
             "删除好友",
             f"确定删除好友「{username}」吗？",
@@ -1425,7 +1617,7 @@ class OnlinePanel(InkBackdrop):
 
     def _username_avatar(
         self, user_id: str, fallback: str = ""
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, int]:
         current = getattr(self, "_current_profile", None)
         if isinstance(current, Mapping):
             user = current.get("user")
@@ -1433,6 +1625,7 @@ class OnlinePanel(InkBackdrop):
                 return (
                     str(user.get("username", fallback or "好友")),
                     str(user.get("avatar", "")),
+                    _entry_avatar_version(user),
                 )
         for section in ("friends", "incoming", "outgoing"):
             entries = self._friends_data.get(section, [])
@@ -1446,8 +1639,9 @@ class OnlinePanel(InkBackdrop):
                     return (
                         str(entry.get("username", fallback or "好友")),
                         str(entry.get("avatar", "")),
+                        _entry_avatar_version(entry),
                     )
-        return fallback or "好友", ""
+        return fallback or "好友", "", 0
 
     # ------------------------------------------------------------------
     # 私聊
@@ -1457,12 +1651,16 @@ class OnlinePanel(InkBackdrop):
     ) -> None:
         if not user_id:
             return
-        resolved_name, avatar = self._username_avatar(user_id, username)
+        resolved_name, avatar, avatar_version = self._username_avatar(
+            user_id, username
+        )
         existing = self._chat_panels.get(user_id)
         if existing is not None:
             # 聊天窗可以被关闭，重新点“聊天”时把旧窗拉回来：刷新一下
             # 好友资料，再补拉一次历史（关闭期间对方可能发过消息）。
-            existing.set_friend(resolved_name, avatar)
+            existing.set_friend(
+                resolved_name, avatar, avatar_version=avatar_version
+            )
             existing.show()
             if self._auth_session is not None:
                 self._social_client.fetch_messages(
@@ -1470,7 +1668,7 @@ class OnlinePanel(InkBackdrop):
                 )
             return
         window = PrivateChatPanel(
-            user_id, resolved_name, avatar, self
+            user_id, resolved_name, avatar, self, avatar_version
         )
         window.send_requested.connect(
             lambda text, uid=user_id: self._send_private_message(
@@ -1505,6 +1703,8 @@ class OnlinePanel(InkBackdrop):
             "id": message.id,
             "sender_id": message.sender_id,
             "sender_name": message.sender_name,
+            "sender_avatar": message.sender_avatar,
+            "sender_avatar_version": message.sender_avatar_version,
             "content": message.content,
             "sent_at_ms": message.sent_at_ms,
         }
@@ -1818,7 +2018,11 @@ class OnlinePanel(InkBackdrop):
             self._set_lobby_status(text, error=error)
 
     def _close_social_windows(self) -> None:
-        for panel in (self._friends_panel, self._profile_panel):
+        for panel in (
+            self._friends_panel,
+            self._profile_panel,
+            self._achievements_panel,
+        ):
             if panel is not None:
                 try:
                     panel.close()
@@ -1833,6 +2037,7 @@ class OnlinePanel(InkBackdrop):
                 pass
         self._friends_panel = None
         self._profile_panel = None
+        self._achievements_panel = None
         self._chat_panels.clear()
         self._friends_data = {}
         self._pending_profile_user_id = ""
@@ -2637,11 +2842,25 @@ class OnlinePanel(InkBackdrop):
         self_avatar = (
             self._auth_session.user.avatar if self._auth_session else ""
         )
+        self_avatar_version = (
+            self._auth_session.user.avatar_version
+            if self._auth_session
+            else 0
+        )
+        self_achievements = (
+            self._auth_session.user.achievement_keys
+            if self._auth_session
+            else ()
+        )
         if snapshot is not None:
             black_id = snapshot.black_user_id
             white_id = snapshot.white_user_id
             black_avatar = snapshot.black_avatar
             white_avatar = snapshot.white_avatar
+            black_avatar_version = snapshot.black_avatar_version
+            white_avatar_version = snapshot.white_avatar_version
+            black_achievements = snapshot.black_achievements
+            white_achievements = snapshot.white_achievements
         else:
             black_id = self_id if your_color is Player.BLACK else ""
             white_id = self_id if your_color is Player.WHITE else ""
@@ -2650,6 +2869,22 @@ class OnlinePanel(InkBackdrop):
             )
             white_avatar = (
                 self_avatar if your_color is Player.WHITE else ""
+            )
+            black_avatar_version = (
+                self_avatar_version
+                if your_color is Player.BLACK
+                else 0
+            )
+            white_avatar_version = (
+                self_avatar_version
+                if your_color is Player.WHITE
+                else 0
+            )
+            black_achievements = (
+                self_achievements if your_color is Player.BLACK else ()
+            )
+            white_achievements = (
+                self_achievements if your_color is Player.WHITE else ()
             )
         you_id = black_id if your_color is Player.BLACK else white_id
         opponent_id = (
@@ -2665,6 +2900,26 @@ class OnlinePanel(InkBackdrop):
             if your_color is Player.BLACK
             else black_avatar
         )
+        you_avatar_version = (
+            black_avatar_version
+            if your_color is Player.BLACK
+            else white_avatar_version
+        )
+        opponent_avatar_version = (
+            white_avatar_version
+            if your_color is Player.BLACK
+            else black_avatar_version
+        )
+        you_achievements = (
+            black_achievements
+            if your_color is Player.BLACK
+            else white_achievements
+        )
+        opponent_achievements = (
+            white_achievements
+            if your_color is Player.BLACK
+            else black_achievements
+        )
 
         if waiting:
             self.you_card.set_content(
@@ -2675,6 +2930,8 @@ class OnlinePanel(InkBackdrop):
                 your_rating,
                 avatar=you_avatar,
                 user_id=you_id,
+                avatar_version=you_avatar_version,
+                achievements=you_achievements,
             )
             self.opponent_card.set_content(
                 opponent_name,
@@ -2690,6 +2947,7 @@ class OnlinePanel(InkBackdrop):
             self.move_label.setText("第 0 手")
             self.game_rating_label.clear()
             self.game_rating_label.setVisible(False)
+            self._update_achievement_notice(None)
             self.board_widget.set_view(session.view)
             self.board_widget.set_interaction_enabled(False)
             self._set_action_visibility(
@@ -2708,6 +2966,8 @@ class OnlinePanel(InkBackdrop):
             your_rating,
             avatar=you_avatar,
             user_id=you_id,
+            avatar_version=you_avatar_version,
+            achievements=you_achievements,
         )
         self.opponent_card.set_content(
             opponent_name,
@@ -2717,12 +2977,15 @@ class OnlinePanel(InkBackdrop):
             opponent_rating,
             avatar=opponent_avatar,
             user_id=opponent_id,
+            avatar_version=opponent_avatar_version,
+            achievements=opponent_achievements,
         )
         if snapshot is None:
             self.clock_label.setText("—")
             self.move_label.setText("第 0 手")
             self.game_rating_label.clear()
             self.game_rating_label.setVisible(False)
+            self._update_achievement_notice(None)
             self.board_widget.set_interaction_enabled(False)
             return
 
@@ -2759,6 +3022,8 @@ class OnlinePanel(InkBackdrop):
                 your_rating,
                 avatar=you_avatar,
                 user_id=you_id,
+                avatar_version=you_avatar_version,
+                achievements=you_achievements,
             )
             self.opponent_card.set_content(
                 opponent_name,
@@ -2770,6 +3035,8 @@ class OnlinePanel(InkBackdrop):
                 opponent_rating,
                 avatar=opponent_avatar,
                 user_id=opponent_id,
+                avatar_version=opponent_avatar_version,
+                achievements=opponent_achievements,
             )
             if winner is None:
                 self._set_game_pill("本局平局", result=True)
@@ -2803,9 +3070,11 @@ class OnlinePanel(InkBackdrop):
             else:
                 self.game_rating_label.clear()
                 self.game_rating_label.setVisible(False)
+            self._update_achievement_notice(snapshot)
         else:
             self.game_rating_label.clear()
             self.game_rating_label.setVisible(False)
+            self._update_achievement_notice(None)
             self.you_card.set_content(
                 you_name,
                 your_color,
@@ -2816,6 +3085,8 @@ class OnlinePanel(InkBackdrop):
                 your_rating,
                 you_avatar,
                 you_id,
+                you_avatar_version,
+                you_achievements,
             )
             self.opponent_card.set_content(
                 opponent_name,
@@ -2827,6 +3098,8 @@ class OnlinePanel(InkBackdrop):
                 opponent_rating,
                 opponent_avatar,
                 opponent_id,
+                opponent_avatar_version,
+                opponent_achievements,
             )
             if not self._ws_connected:
                 self._set_game_pill("连接中断", result=False)
@@ -2873,6 +3146,29 @@ class OnlinePanel(InkBackdrop):
                 "接受对手再战" if opponent_requested else "申请再战"
             )
             self.rematch_button.setEnabled(self._ws_connected)
+
+    def _update_achievement_notice(
+        self, snapshot: Optional[GameSnapshot]
+    ) -> None:
+        """终局后展示本局新解锁的成就；同一局只弹一次。"""
+        if snapshot is None or not snapshot.is_game_over:
+            self._achievement_notice_game_id = ""
+            self.game_achievement_label.clear()
+            self.game_achievement_label.setVisible(False)
+            return
+        keys = snapshot.your_new_achievements
+        if not keys:
+            self.game_achievement_label.clear()
+            self.game_achievement_label.setVisible(False)
+            return
+        if self._achievement_notice_game_id == snapshot.game_id:
+            return
+        self._achievement_notice_game_id = snapshot.game_id
+        names = achievement_names(keys)
+        self.game_achievement_label.setText(
+            f"新成就解锁：{names}" if names else ""
+        )
+        self.game_achievement_label.setVisible(bool(names))
 
     def _set_game_pill(self, text: str, result: bool) -> None:
         self.game_status_pill.setText(text)

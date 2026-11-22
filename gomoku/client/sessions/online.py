@@ -20,6 +20,7 @@ from PySide6.QtCore import QObject, Signal
 from gomoku.client.board_view import BoardView
 from gomoku.client.sessions.base import GameSession
 from gomoku.client.transport import Transport
+from gomoku.shared.achievements import normalize_achievement_keys
 from gomoku.shared.chat import (
     CHAT_INTERVAL_SECONDS,
     CHAT_KIND_EMOJI,
@@ -640,12 +641,27 @@ class OnlineGameSession(GameSession):
         self._username = username
         self._reset_room_state()
         rating = user.get("rating")
+        avatar_version = user.get("avatar_version", 0)
+        if (
+            not isinstance(avatar_version, int)
+            or isinstance(avatar_version, bool)
+            or avatar_version < 0
+        ):
+            avatar_version = 0
         self.authenticated.emit(
             {
                 "id": user_id,
                 "username": username,
                 "avatar": user.get("avatar", ""),
-                "rating": rating if isinstance(rating, int) else None,
+                "avatar_version": avatar_version,
+                "achievements": list(
+                    normalize_achievement_keys(
+                        user.get("achievements")
+                    )
+                ),
+                "rating": (
+                    rating if isinstance(rating, int) else None
+                ),
                 "rank_name": user.get("rank_name", ""),
             }
         )

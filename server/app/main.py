@@ -69,7 +69,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     app = FastAPI(
         title="Gomoku Online Service",
-        version="0.3.0",
+        version="0.4.0",
         lifespan=lifespan,
     )
     app.include_router(auth_router, prefix="/api/v1")

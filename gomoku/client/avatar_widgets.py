@@ -1,15 +1,102 @@
-"""预置头像绘制与可点击控件。"""
+"""头像绘制与可点击控件（预置印章 + 自定义上传图片）。"""
 
 from __future__ import annotations
 
 from typing import Optional
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QIcon,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import QLabel, QPushButton, QWidget
 
+from gomoku.client.avatar_images import avatar_image_cache
 from gomoku.client.theme_palette import GOLD, PAPER_LIGHT
 from gomoku.shared.avatar import avatar_preset
+
+
+def _avatar_geometry(
+    safe_size: int, ring: bool
+) -> tuple[QRectF, float]:
+    """返回头像圆形的内缩矩形与边框宽度。"""
+    inset = max(2.0, safe_size * 0.05) if ring else 0.8
+    rect = QRectF(
+        inset,
+        inset,
+        safe_size - inset * 2.0,
+        safe_size - inset * 2.0,
+    )
+    border = max(1.0, safe_size * 0.055)
+    return rect, border
+
+
+def _draw_ring(
+    painter: QPainter, safe_size: int, rect: QRectF
+) -> None:
+    """在头像外侧画金线/纸色双环。"""
+    ring_pen = QPen(QColor(GOLD), max(1.2, safe_size * 0.032))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.setPen(ring_pen)
+    painter.drawEllipse(
+        QRectF(0.9, 0.9, safe_size - 1.8, safe_size - 1.8)
+    )
+    painter.setPen(
+        QPen(QColor(PAPER_LIGHT), max(0.9, safe_size * 0.018))
+    )
+    painter.drawEllipse(rect.adjusted(-1.3, -1.3, 1.3, 1.3))
+
+
+def _image_avatar_pixmap(
+    image: QImage,
+    size: int,
+    dpr: float,
+    *,
+    ring: bool,
+) -> QPixmap:
+    """把上传图片裁成圆形头像。"""
+    safe_size = max(8, int(size))
+    scale = max(1.0, float(dpr))
+    pixels = max(1, round(safe_size * scale))
+    pixmap = QPixmap(pixels, pixels)
+    pixmap.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+    painter.scale(scale, scale)
+
+    rect, border = _avatar_geometry(safe_size, ring)
+    if ring:
+        _draw_ring(painter, safe_size, rect)
+
+    clip = QPainterPath()
+    clip.addEllipse(rect)
+    painter.save()
+    painter.setClipPath(clip)
+    # 图片本身已是方形；仍按短边居中裁切，兼容历史/外部数据。
+    side = min(image.width(), image.height())
+    source = QRectF(
+        (image.width() - side) / 2.0,
+        (image.height() - side) / 2.0,
+        side,
+        side,
+    )
+    painter.drawImage(rect, image, source)
+    painter.restore()
+
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.setPen(QPen(QColor("#F3EBDD"), border))
+    painter.drawEllipse(rect)
+    painter.end()
+    pixmap.setDevicePixelRatio(scale)
+    return pixmap
 
 
 def avatar_pixmap(
@@ -19,11 +106,20 @@ def avatar_pixmap(
     dpr: float = 1.0,
     *,
     ring: bool = False,
+    avatar_version: int = 0,
 ) -> QPixmap:
-    """绘制一个圆形印章头像；大尺寸可加金色外环。"""
-    preset = avatar_preset(avatar, user_id)
+    """绘制圆形头像；有自定义图片时优先使用，否则回落到预置印章。"""
     safe_size = max(8, int(size))
     scale = max(1.0, float(dpr))
+
+    if avatar_version > 0 and user_id:
+        image = avatar_image_cache().image(user_id, avatar_version)
+        if image is not None:
+            return _image_avatar_pixmap(
+                image, safe_size, scale, ring=ring
+            )
+
+    preset = avatar_preset(avatar, user_id)
     pixels = max(1, round(safe_size * scale))
     pixmap = QPixmap(pixels, pixels)
     pixmap.fill(Qt.GlobalColor.transparent)
@@ -33,31 +129,11 @@ def avatar_pixmap(
     painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
     painter.scale(scale, scale)
 
-    inset = max(2.0, safe_size * 0.05) if ring else 0.8
-    rect = QRectF(
-        inset,
-        inset,
-        safe_size - inset * 2.0,
-        safe_size - inset * 2.0,
-    )
-
+    rect, border = _avatar_geometry(safe_size, ring)
     if ring:
-        ring_pen = QPen(QColor(GOLD), max(1.2, safe_size * 0.032))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(ring_pen)
-        painter.drawEllipse(
-            QRectF(0.9, 0.9, safe_size - 1.8, safe_size - 1.8)
-        )
-        painter.setPen(
-            QPen(QColor(PAPER_LIGHT), max(0.9, safe_size * 0.018))
-        )
-        painter.drawEllipse(
-            rect.adjusted(-1.3, -1.3, 1.3, 1.3)
-        )
+        _draw_ring(painter, safe_size, rect)
 
-    painter.setPen(
-        QPen(QColor("#F3EBDD"), max(1.0, safe_size * 0.055))
-    )
+    painter.setPen(QPen(QColor("#F3EBDD"), border))
     painter.setBrush(QColor(preset.background))
     painter.drawEllipse(rect)
 
@@ -79,10 +155,20 @@ def avatar_pixmap(
 
 
 def avatar_icon(
-    avatar: object, user_id: str = "", size: int = 20
+    avatar: object,
+    user_id: str = "",
+    size: int = 20,
+    avatar_version: int = 0,
 ) -> QIcon:
     """返回适合表格/按钮使用的头像图标。"""
-    return QIcon(avatar_pixmap(avatar, user_id, size))
+    return QIcon(
+        avatar_pixmap(
+            avatar,
+            user_id,
+            size,
+            avatar_version=avatar_version,
+        )
+    )
 
 
 class AvatarView(QLabel):
@@ -97,27 +183,49 @@ class AvatarView(QLabel):
         *,
         ring: bool = False,
         online: Optional[bool] = None,
+        avatar_version: int = 0,
     ) -> None:
         super().__init__(parent)
         self._size = max(8, int(size))
         self._user_id = user_id
+        self._avatar: object = avatar
+        self._avatar_version = max(0, int(avatar_version))
         self._ring = ring
         self._online = online
         self.setFixedSize(self._size, self._size)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.set_avatar(avatar, user_id)
+        avatar_image_cache().image_loaded.connect(self._on_image_loaded)
+        self.set_avatar(avatar, user_id, avatar_version)
 
-    def set_avatar(self, avatar: object, user_id: str = "") -> None:
+    def set_avatar(
+        self,
+        avatar: object,
+        user_id: str = "",
+        avatar_version: int = 0,
+    ) -> None:
         self._user_id = user_id
+        self._avatar = avatar
+        self._avatar_version = max(0, int(avatar_version))
+        self._refresh_pixmap()
+
+    def _refresh_pixmap(self) -> None:
         self.setPixmap(
             avatar_pixmap(
-                avatar,
-                user_id,
+                self._avatar,
+                self._user_id,
                 self._size,
                 self.devicePixelRatioF(),
                 ring=self._ring,
+                avatar_version=self._avatar_version,
             )
         )
+
+    def _on_image_loaded(self, user_id: str, version: int) -> None:
+        if (
+            user_id == self._user_id
+            and version == self._avatar_version
+        ):
+            self._refresh_pixmap()
 
     def set_online(self, online: Optional[bool]) -> None:
         self._online = online
@@ -160,10 +268,13 @@ class AvatarButton(QPushButton):
         parent: Optional[QWidget] = None,
         *,
         ring: bool = False,
+        avatar_version: int = 0,
     ) -> None:
         super().__init__(parent)
         self._size = max(8, int(size))
         self._user_id = user_id
+        self._avatar: object = avatar
+        self._avatar_version = max(0, int(avatar_version))
         self._ring = ring
         self.setFixedSize(self._size, self._size)
         self.setFlat(True)
@@ -171,29 +282,48 @@ class AvatarButton(QPushButton):
         self.setStyleSheet(
             "QPushButton { border: none; background: transparent; padding: 0; }"
         )
+        avatar_image_cache().image_loaded.connect(self._on_image_loaded)
         self.clicked.connect(self._emit_clicked)
-        self.set_avatar(avatar, user_id)
+        self.set_avatar(avatar, user_id, avatar_version)
 
     def _emit_clicked(self) -> None:
         if self._user_id:
             self.clicked_id.emit(self._user_id)
 
-    def set_avatar(self, avatar: object, user_id: str = "") -> None:
+    def set_avatar(
+        self,
+        avatar: object,
+        user_id: str = "",
+        avatar_version: int = 0,
+    ) -> None:
         self._user_id = user_id
+        self._avatar = avatar
+        self._avatar_version = max(0, int(avatar_version))
+        self._refresh_icon()
+        self.setEnabled(bool(user_id))
+        self.setVisible(bool(user_id))
+
+    def _refresh_icon(self) -> None:
         self.setIcon(
             QIcon(
                 avatar_pixmap(
-                    avatar,
-                    user_id,
+                    self._avatar,
+                    self._user_id,
                     self._size,
                     self.devicePixelRatioF(),
                     ring=self._ring,
+                    avatar_version=self._avatar_version,
                 )
             )
         )
         self.setIconSize(QSize(self._size, self._size))
-        self.setEnabled(bool(user_id))
-        self.setVisible(bool(user_id))
+
+    def _on_image_loaded(self, user_id: str, version: int) -> None:
+        if (
+            user_id == self._user_id
+            and version == self._avatar_version
+        ):
+            self._refresh_icon()
 
 
 __all__ = [

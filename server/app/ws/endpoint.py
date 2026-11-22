@@ -12,6 +12,10 @@ from typing import Any, Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 
+from gomoku.shared.achievements import (
+    AchievementStats,
+    unlocked_achievement_keys,
+)
 from gomoku.shared.avatar import normalize_avatar
 from gomoku.shared.errors import ProtocolError
 from gomoku.shared.protocol import (
@@ -146,6 +150,21 @@ async def game_websocket(websocket: WebSocket) -> None:
         username = user.username
         rating = user.rating
         avatar = normalize_avatar(user.avatar, user.id)
+        avatar_version = user.public_avatar_version
+        achievements = list(
+            unlocked_achievement_keys(
+                AchievementStats(
+                    wins=user.wins,
+                    rated_games=user.rated_games,
+                    current_streak=user.current_win_streak,
+                    best_streak=user.best_win_streak,
+                    rating=user.rating,
+                    peak_rating=user.peak_rating,
+                )
+            )
+        )
+        current_streak = user.current_win_streak
+        best_streak = user.best_win_streak
 
     conn = ClientConnection(
         connection_id=uuid.uuid4().hex,
@@ -154,6 +173,8 @@ async def game_websocket(websocket: WebSocket) -> None:
         websocket=websocket,
         avatar=avatar,
         rating=rating,
+        avatar_version=avatar_version,
+        achievements=tuple(achievements),
     )
     await conn.send(
         make_message(
@@ -163,6 +184,10 @@ async def game_websocket(websocket: WebSocket) -> None:
                     "id": user_id,
                     "username": username,
                     "avatar": avatar,
+                    "avatar_version": avatar_version,
+                    "achievements": achievements,
+                    "current_win_streak": current_streak,
+                    "best_win_streak": best_streak,
                     "rating": rating,
                     "rank_name": rank_for_rating(rating).name,
                 }

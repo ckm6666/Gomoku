@@ -148,6 +148,17 @@ QLabel#onlineRatingResult {
     font-weight: bold;
 }
 
+QLabel#onlineAchievementResult {
+    color: #7E2C22;
+    background-color: rgba(184, 147, 78, 0.16);
+    border: 1px solid #B8934E;
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-family: "Ma Shan Zheng";
+    font-size: 15px;
+    letter-spacing: 1px;
+}
+
 QLabel#onlineStatus {
     color: #756C5E;
     font-size: 12px;
@@ -1322,6 +1333,65 @@ QPushButton#avatarChoice[current="true"] {
 QLabel#avatarPickerHint {
     color: #756C5E;
     font-size: 12px;
+}
+
+/* ------------------------------ 成就与勋章 ------------------------------ */
+QLabel#achievementSummary {
+    color: #756C5E;
+    font-size: 12px;
+}
+
+QScrollArea#achievementScroll,
+QWidget#achievementBody {
+    background: transparent;
+    border: none;
+}
+
+QScrollArea#achievementScroll > QWidget > QWidget {
+    background: transparent;
+}
+
+QFrame#achievementTile {
+    background-color: rgba(251, 247, 238, 0.72);
+    border: 1px solid #DCCDB4;
+    border-radius: 9px;
+}
+
+QFrame#achievementTile[unlocked="true"] {
+    background-color: rgba(184, 147, 78, 0.10);
+    border: 1px solid #B8934E;
+}
+
+QLabel#achievementName {
+    font-family: "Ma Shan Zheng";
+    font-size: 17px;
+    color: #8C8377;
+    letter-spacing: 1px;
+}
+
+QLabel#achievementName[unlocked="true"] {
+    color: #7E2C22;
+}
+
+QLabel#achievementDesc {
+    color: #8C8377;
+    font-size: 10px;
+}
+
+QLabel#achievementProgress {
+    color: #A89C8B;
+    font-size: 10px;
+}
+
+QProgressBar#achievementProgressBar {
+    background-color: #E7DECF;
+    border: none;
+    border-radius: 2px;
+}
+
+QProgressBar#achievementProgressBar::chunk {
+    background-color: #B8934E;
+    border-radius: 2px;
 }
 
 QScrollArea#socialScroll,

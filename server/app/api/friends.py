@@ -17,6 +17,7 @@ from gomoku.shared.social import (
 )
 from server.app.api.social_helpers import (
     avatar_of,
+    avatar_version_of,
     friendship_between,
     is_online,
     ordered_pair,
@@ -43,6 +44,7 @@ def _friend_entry(
         user_id=user.id,
         username=user.username,
         avatar=avatar_of(user),
+        avatar_version=avatar_version_of(user),
         rating=user.rating,
         rank_name=rank_for_rating(user.rating).name,
         online=online,
@@ -58,6 +60,7 @@ def _request_entry(
         user_id=user.id,
         username=user.username,
         avatar=avatar_of(user),
+        avatar_version=avatar_version_of(user),
         rating=user.rating,
         rank_name=rank_for_rating(user.rating).name,
         created_at=friendship.created_at,

@@ -63,6 +63,7 @@ class DirectMessage:
     recipient_id: str
     content: str
     sent_at_ms: int
+    sender_avatar_version: int = 0
 
 
 def parse_direct_message(payload: Any) -> DirectMessage:
@@ -91,6 +92,13 @@ def parse_direct_message(payload: Any) -> DirectMessage:
         raise SocialError("私聊消息过长")
     if not isinstance(sent_at_ms, int) or isinstance(sent_at_ms, bool):
         sent_at_ms = 0
+    sender_avatar_version = payload.get("sender_avatar_version", 0)
+    if (
+        not isinstance(sender_avatar_version, int)
+        or isinstance(sender_avatar_version, bool)
+        or sender_avatar_version < 0
+    ):
+        sender_avatar_version = 0
 
     return DirectMessage(
         id=message_id,
@@ -100,6 +108,7 @@ def parse_direct_message(payload: Any) -> DirectMessage:
         recipient_id=recipient_id,
         content=content,
         sent_at_ms=sent_at_ms,
+        sender_avatar_version=sender_avatar_version,
     )
 
 
@@ -111,6 +120,7 @@ class FriendEvent:
     user_id: str
     username: str
     avatar: str
+    avatar_version: int = 0
     rating: int = 0
     rank_name: str = ""
     request_id: Optional[str] = None
@@ -147,12 +157,20 @@ def parse_friend_event(payload: Any) -> FriendEvent:
     online = payload.get("online")
     if online is not None and not isinstance(online, bool):
         online = None
+    avatar_version = user.get("avatar_version", 0)
+    if (
+        not isinstance(avatar_version, int)
+        or isinstance(avatar_version, bool)
+        or avatar_version < 0
+    ):
+        avatar_version = 0
 
     return FriendEvent(
         event=event,
         user_id=user_id,
         username=username[:32],
         avatar=normalize_avatar(user.get("avatar"), user_id),
+        avatar_version=avatar_version,
         rating=rating,
         rank_name=rank_name[:16],
         request_id=request_id,

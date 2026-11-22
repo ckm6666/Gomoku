@@ -18,6 +18,7 @@ from gomoku.shared.social import (
 )
 from server.app.api.social_helpers import (
     are_friends,
+    avatar_version_of,
     push_direct_message,
 )
 from server.app.db import utcnow_naive
@@ -110,6 +111,9 @@ def _entry(
         sender_avatar=normalize_avatar(
             sender.avatar if sender is not None else None,
             message.sender_id,
+        ),
+        sender_avatar_version=(
+            avatar_version_of(sender) if sender is not None else 0
         ),
         recipient_id=message.recipient_id,
         content=message.content,
