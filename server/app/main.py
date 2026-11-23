@@ -24,7 +24,6 @@ from server.app.api.messages import router as messages_router
 from server.app.api.ranked import router as ranked_router
 from server.app.api.reports import router as reports_router
 from server.app.api.seasons import router as seasons_router
-from server.app.api.updates import router as updates_router
 from server.app.api.users import router as users_router
 from server.app.config import Settings
 from server.app.db import (
@@ -158,7 +157,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.include_router(users_router, prefix="/api/v1")
     app.include_router(friends_router, prefix="/api/v1")
     app.include_router(messages_router, prefix="/api/v1")
-    app.include_router(updates_router, prefix="/api/v1")
     app.include_router(ws_router, prefix="/api/v1")
 
     async def _database_ready() -> bool:
