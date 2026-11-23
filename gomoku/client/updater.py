@@ -27,18 +27,31 @@ SERVER_UPDATE_PATH: str = "/api/v1/updates/latest"
 #: 计算摘要时的分块大小，避免把整个安装包一次性读入内存。
 _CHUNK_SIZE = 1024 * 1024
 
+#: 允许走明文 HTTP 的本机地址：更新功能在开发自测时经常连本机服务，
+#: 对回环地址不强制 HTTPS；其余地址一律要求 HTTPS。
+_LOOPBACK_HOSTS = frozenset(
+    {"localhost", "127.0.0.1", "::1", "0.0.0.0", "[::1]"}
+)
+
 __all__ = [
     "SERVER_UPDATE_PATH",
+    "InsecureUrlError",
     "UpdateInfo",
     "compare_versions",
     "default_manifest_url",
     "format_size",
+    "is_loopback_url",
     "is_newer_version",
+    "is_secure_url",
     "parse_manifest",
     "parse_version",
     "sha256_of_file",
     "verify_file",
 ]
+
+
+class InsecureUrlError(ValueError):
+    """更新地址不满足安全策略（必须是 HTTPS，或本机回环地址）。"""
 
 
 @dataclass(frozen=True)
@@ -198,6 +211,40 @@ def default_manifest_url(api_base_url: Optional[str]) -> Optional[str]:
     return base.rstrip("/") + SERVER_UPDATE_PATH
 
 
+def is_loopback_url(url: str) -> bool:
+    """判断 URL 是否指向本机回环地址。
+
+    只有本机地址才允许走明文 HTTP：开发自测常常连本机服务，而明文传输到
+    其它主机意味着清单和安装包都可能被中间人替换。
+    """
+    if not isinstance(url, str):
+        return False
+    parsed = urlparse(url.strip())
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return False
+    if host in _LOOPBACK_HOSTS:
+        return True
+    # 127.0.0.0/8 整个网段都是回环地址。
+    return host.startswith("127.")
+
+
+def is_secure_url(url: str) -> bool:
+    """判断 URL 是否可以安全地用于更新下载。
+
+    HTTPS 一律通过；HTTP 只有在本机回环地址时才通过（开发自测用）。
+    """
+    if not isinstance(url, str):
+        return False
+    parsed = urlparse(url.strip())
+    scheme = parsed.scheme.lower()
+    if scheme == "https":
+        return True
+    if scheme == "http":
+        return is_loopback_url(url)
+    return False
+
+
 def parse_manifest(payload: Any) -> UpdateInfo:
     """解析服务端下发的更新清单，返回 :class:`UpdateInfo`。
 
@@ -236,6 +283,12 @@ def parse_manifest(payload: Any) -> UpdateInfo:
     parsed = urlparse(info.url)
     if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
         raise ValueError(f"更新下载地址必须是 http/https URL：{info.url!r}")
+    if not is_secure_url(info.url):
+        # 明文 HTTP 下载安装包意味着中间人可以替换二进制；只有本机
+        # 回环地址（开发自测）才允许走 HTTP。
+        raise InsecureUrlError(
+            f"更新下载地址必须使用 HTTPS（本机回环地址除外）：{info.url!r}"
+        )
 
     return info
 

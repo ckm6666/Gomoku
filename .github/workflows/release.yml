@@ -13,6 +13,10 @@ on:
         description: "更新说明（写入 update.json 的 notes）；留空时回退到标签名"
         required: false
         default: ""
+      server-url:
+        description: "烘焙进 exe 的联机/服务地址（例如 https://gomoku.example.com）；留空时使用仓库变量 GOMOKU_SERVER_URL"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -44,7 +48,22 @@ jobs:
           pip install --require-hashes -r requirements-dev.lock
 
       - name: Build with PyInstaller
-        run: python build.py --fast
+        shell: pwsh
+        env:
+          INPUT_SERVER_URL: ${{ inputs.server-url }}
+          REPO_SERVER_URL: ${{ vars.GOMOKU_SERVER_URL }}
+        run: |
+          # 发布出来的 exe 必须知道去哪儿检查更新，否则"检查更新"永远是
+          # "未配置服务器地址"：地址取自 workflow_dispatch 输入，或仓库变量
+          # GOMOKU_SERVER_URL。两者都没有时给出告警，不静默产出无用产物。
+          $serverUrl = $env:INPUT_SERVER_URL
+          if (-not $serverUrl) { $serverUrl = $env:REPO_SERVER_URL }
+          if ($serverUrl) {
+            python build.py --fast --server-url $serverUrl
+          } else {
+            Write-Host "::warning::未配置服务地址（workflow 输入或仓库变量 GOMOKU_SERVER_URL），产出的 exe 不会自动检查更新"
+            python build.py --fast
+          }
 
       - name: Resolve release tag
         id: meta

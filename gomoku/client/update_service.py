@@ -31,8 +31,10 @@ from PySide6.QtNetwork import (
 
 from gomoku.client.update_installer import staged_download_path
 from gomoku.client.updater import (
+    InsecureUrlError,
     UpdateInfo,
     is_newer_version,
+    is_secure_url,
     parse_manifest,
     verify_file,
 )
@@ -123,6 +125,12 @@ class UpdateService(QObject):
             if url.scheme() not in ("http", "https") or not url.host():
                 self.check_failed.emit("更新地址无效")
                 return
+            if not is_secure_url(self._manifest_url):
+                # 明文 HTTP 的清单可以被中间人替换：它同时决定下载地址
+                # 与校验摘要，等于把安装包的控制权交给中间人。
+                logger.warning("更新清单地址不是 HTTPS，拒绝检查更新")
+                self.check_failed.emit("更新服务器必须使用 HTTPS")
+                return
 
             request = QNetworkRequest(url)
             request.setHeader(
@@ -184,6 +192,14 @@ class UpdateService(QObject):
 
             try:
                 info = parse_manifest(payload)
+            except InsecureUrlError as exc:
+                # 地址不安全要给出具体原因：多半是服务端没有正确终止 TLS，
+                # 或者反向代理没有透传协议头。
+                logger.warning("更新清单地址不安全：%s", exc)
+                self.check_failed.emit(
+                    "更新包下载地址必须使用 HTTPS（本机回环地址除外）"
+                )
+                return
             except Exception:
                 logger.exception("解析更新清单失败")
                 self.check_failed.emit("更新信息解析失败")
@@ -221,6 +237,11 @@ class UpdateService(QObject):
             url = QUrl(info.url)
             if url.scheme() not in ("http", "https") or not url.host():
                 self.download_failed.emit("下载地址无效")
+                return
+            if not is_secure_url(info.url):
+                # 明文下载安装包等于把可执行文件交给中间人。
+                logger.warning("更新包下载地址不是 HTTPS，拒绝下载")
+                self.download_failed.emit("更新包下载地址必须使用 HTTPS")
                 return
 
             request = QNetworkRequest(url)
@@ -315,13 +336,22 @@ class UpdateService(QObject):
                 self._remove_partial_file(path)
                 self.download_failed.emit("下载文件为空，请重试")
                 return
-            if info is not None and info.sha256:
-                if not verify_file(path, info.sha256):
-                    self._remove_partial_file(path)
-                    self.download_failed.emit("下载文件校验失败，请重试")
-                    return
             if info is None:
+                self._remove_partial_file(path)
                 self.download_failed.emit("下载更新失败，请重试")
+                return
+            if not info.sha256:
+                # 没有摘要就无法证明下载到的二进制就是服务端发布的那一个。
+                # 宁可不装，也不安装一个来源不明的可执行文件。
+                logger.warning("更新清单没有提供 SHA-256，拒绝安装")
+                self._remove_partial_file(path)
+                self.download_failed.emit(
+                    "更新包缺少校验摘要（SHA-256），已拒绝安装，请手动更新"
+                )
+                return
+            if not verify_file(path, info.sha256):
+                self._remove_partial_file(path)
+                self.download_failed.emit("下载文件校验失败，请重试")
                 return
             self.download_ready.emit(info, str(path))
         except Exception:

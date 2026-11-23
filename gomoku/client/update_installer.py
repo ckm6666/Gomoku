@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,15 @@ __all__ = [
 
 #: 模块级日志记录器（避免在库代码里直接调用 logging.basicConfig）。
 _LOGGER = logging.getLogger(__name__)
+
+#: 等待目标进程退出的最长轮数；每轮约 2 秒，默认上限约 2 分钟。
+#: 超时后仍然继续走复制流程——复制本身还有重试，实在不行会留下暂存包
+#: 让用户手动替换，而不会永远卡在这里。
+_MAX_WAIT_ROUNDS: int = 60
+
+#: 版本号里允许出现在文件名中的字符；其余字符一律替换成 "-"。
+#: Windows 文件名不允许 ``:`` ``\`` ``/`` 等字符，而版本号来自服务端清单。
+_UNSAFE_VERSION_CHARS = re.compile(r"[^A-Za-z0-9._-]")
 
 
 def current_executable_path() -> Optional[Path]:
@@ -55,6 +65,27 @@ def _quote_path(path: Path | str) -> str:
     if '"' in text:
         raise ValueError(f"路径不允许包含双引号：{text!r}")
     return f'"{text}"'
+
+
+def _batch_encoding() -> str:
+    """返回写出批处理脚本应使用的代码页。
+
+    cmd.exe 按 **OEM** 代码页解析批处理文件（简体中文系统是 936），
+    而 Python 的 ``mbcs`` 是 ANSI 代码页：两者在部分系统上并不一致，
+    含中文的路径会被解析成乱码导致替换失败。这里取真正的 OEM 代码页。
+    """
+    if os.name != "nt":
+        return "utf-8"
+    try:
+        import ctypes
+
+        oem_code_page = int(ctypes.windll.kernel32.GetOEMCP())
+    except Exception:  # pragma: no cover - 极少见的系统异常
+        _LOGGER.warning("读取 OEM 代码页失败，回退到 mbcs", exc_info=True)
+        return "mbcs"
+    if oem_code_page <= 0:
+        return "mbcs"
+    return f"cp{oem_code_page}"
 
 
 def build_update_script(
@@ -100,7 +131,10 @@ def build_update_script(
         "@echo off",
         "setlocal",
         "rem Wait for the running application to exit.",
+        "set /a WAIT_ROUNDS=0",
         ":WAIT_FOR_EXIT",
+        "set /a WAIT_ROUNDS+=1",
+        f"if %WAIT_ROUNDS% GEQ {_MAX_WAIT_ROUNDS} goto WAIT_DONE",
     ]
     for wait_pid in wait_pids:
         lines.extend(
@@ -112,6 +146,14 @@ def build_update_script(
                 ")",
             ]
         )
+    # 等待必须有上限：进程万一卡住不退出，不能永远停在这里。
+    # 超时后照样进入复制流程，由复制重试兜底。
+    lines.extend(
+        [
+            "rem All watched processes have exited.",
+            ":WAIT_DONE",
+        ]
+    )
 
     lines.extend(
         [
@@ -177,9 +219,9 @@ def schedule_install(
         )
 
         handle, script_path = tempfile.mkstemp(prefix="gomoku_update_", suffix=".bat")
-        # 路径可能包含中文：用系统 ANSI 代码页（mbcs）写出，
-        # 保证 cmd.exe 能按同样的代码页正确解析路径。
-        encoding = "mbcs" if os.name == "nt" else "utf-8"
+        # 路径可能包含中文：按 cmd.exe 的 OEM 代码页写出，保证路径被
+        # 正确解析（详见 _batch_encoding 的说明）。
+        encoding = _batch_encoding()
         with os.fdopen(handle, "w", encoding=encoding, newline="") as stream:
             stream.write(script_text)
 
@@ -206,7 +248,15 @@ def schedule_install(
 
 
 def staged_download_path(directory: Path, version: str) -> Path:
-    """返回暂存安装包的路径，并确保父目录存在。"""
+    """返回暂存安装包的路径，并确保父目录存在。
+
+    版本号来自服务端清单，必须先净化再拼进文件名：Windows 的文件名
+    不允许 ``:`` ``\\`` ``/`` 等字符，直接拼接会让下载以"无法创建文件"
+    失败，而用户看到的只是一句笼统的提示。
+    """
     target_dir = Path(directory)
     target_dir.mkdir(parents=True, exist_ok=True)
-    return target_dir / f"Gomoku-{version}-setup.exe"
+    safe_version = _UNSAFE_VERSION_CHARS.sub("-", str(version)).strip(".-_")
+    if not safe_version:
+        safe_version = "unknown"
+    return target_dir / f"Gomoku-{safe_version}-setup.exe"

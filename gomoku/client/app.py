@@ -89,14 +89,20 @@ def main() -> int:
     try:
         config = AppConfig.from_env()
     except ConfigurationError as exc:
-        config = AppConfig()
+        # 回退到默认离线配置，并保守地关掉启动自动检查：
+        # 配置写错时（例如 GOMOKU_AUTO_UPDATE_CHECK 写成了非法值），
+        # 不应该反过来把用户明确想关掉的网络行为打开。
+        config = AppConfig(auto_check_updates=False)
         config_error = exc
 
     log_path = initialize_logging(config)
     install_exception_hook()
     logger = logging.getLogger("gomoku.client.app")
     if config_error is not None:
-        logger.warning("网络配置无效，回退到默认离线配置：%s", config_error)
+        logger.warning(
+            "网络配置无效，回退到默认离线配置并关闭启动自动检查：%s",
+            config_error,
+        )
     logger.info(
         "应用启动 version=%s env=%s online_configured=%s log=%s",
         APP_VERSION,

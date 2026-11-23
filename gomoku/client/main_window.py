@@ -93,6 +93,7 @@ from gomoku.client.update_installer import (
     schedule_install,
 )
 from gomoku.client.update_service import UpdateService
+from gomoku.client.updater import verify_file
 from gomoku.client.ui_theme import (
     GAME_BACKDROP_SPEC,
     MENU_BACKDROP_SPEC,
@@ -285,8 +286,10 @@ class MainWindow(QMainWindow):
         self._download_dialog: Optional[DownloadProgressDialog] = None
         self._pending_download = None
         self._update_check_is_manual = False
+        self._update_check_in_flight = False
         self._download_canceled = False
         self._download_ready_path = ""
+        self._download_ready_sha256 = ""
         self._download_error_message = ""
         self._startup_check_timer: Optional[QTimer] = None
         self._settings: Optional[QSettings] = None
@@ -1672,6 +1675,24 @@ class MainWindow(QMainWindow):
     def _check_for_updates(self, manual: bool = False) -> None:
         """检查是否有新版本；手动检查总是执行，自动检查受节流限制。"""
         try:
+            if self._update_check_in_flight:
+                # 已有检查在进行：不要再覆盖"是否手动"标记，否则先发起的
+                # 手动检查会被后来的自动检查降级成静默提示。
+                logger.info("已有检查请求在进行中，忽略重复请求")
+                if manual:
+                    self._show_update_message(
+                        "检查更新", "正在检查更新，请稍候"
+                    )
+                return
+            if self._online_game_active():
+                # 联机对局中弹出更新遮罩会挡住棋盘输入，而服务器端的
+                # Fischer 时钟不会跟着暂停：玩家会因为无法落子而超时判负。
+                logger.info("联机对局进行中，跳过更新检查")
+                if manual:
+                    self._show_update_message(
+                        "检查更新", "对局进行中，请在对局结束后检查更新"
+                    )
+                return
             self._update_check_is_manual = manual
             service = self.update_service
             if service is None:
@@ -1697,20 +1718,35 @@ class MainWindow(QMainWindow):
                     logger.info("距上次自动检查不足 %s 小时，跳过",
                                 self._UPDATE_CHECK_INTERVAL_HOURS)
                     return
+            # 先置位再发请求：请求是异步的，结果回来之前必须一直算"进行中"。
+            self._update_check_in_flight = True
             service.check_for_update()
         except Exception:
             logger.exception("检查更新失败")
+            self._update_check_in_flight = False
             if manual:
                 self._show_update_message(
                     "检查更新",
                     f"检查更新失败（{self._update_address_text()}）：请稍后再试",
                 )
 
+    def _online_game_active(self) -> bool:
+        """当前是否有进行中的联机对局（服务器端时钟仍在走）。"""
+        panel = self._online_panel
+        if panel is None:
+            return False
+        try:
+            return bool(panel.in_room())
+        except Exception:
+            logger.warning("读取联机对局状态失败", exc_info=True)
+            return False
+
     # ------------------------------------------------------------------
     # 更新信号处理
     # ------------------------------------------------------------------
     def _on_update_available(self, info) -> None:
         """发现新版本：弹出更新提示框。"""
+        self._update_check_in_flight = False
         try:
             if not self._update_check_is_manual:
                 self._mark_checked()
@@ -1744,6 +1780,7 @@ class MainWindow(QMainWindow):
 
     def _on_update_up_to_date(self, version: str) -> None:
         """已是最新版本：手动检查时提示，自动检查只记录日志。"""
+        self._update_check_in_flight = False
         logger.info("当前已是最新版本 %s", version)
         if self._update_check_is_manual:
             self._show_update_message(
@@ -1754,6 +1791,7 @@ class MainWindow(QMainWindow):
 
     def _on_update_check_failed(self, message: str) -> None:
         """检查失败：手动检查时提示，自动检查只记录日志。"""
+        self._update_check_in_flight = False
         logger.warning("检查更新失败：%s", message)
         if self._update_check_is_manual:
             # 手动检查失败时把尝试过的地址一并显示，方便用户自查。
@@ -1825,11 +1863,13 @@ class MainWindow(QMainWindow):
 
         # 遮罩层收起后再提示，避免两层遮罩叠加。
         ready_path = self._download_ready_path
+        ready_sha256 = self._download_ready_sha256
         self._download_ready_path = ""
+        self._download_ready_sha256 = ""
         error_message = self._download_error_message
         self._download_error_message = ""
         if ready_path:
-            self._install_downloaded_update(ready_path)
+            self._install_downloaded_update(ready_path, ready_sha256)
         elif error_message and not self._download_canceled:
             self._show_update_message("下载更新失败", error_message)
 
@@ -1880,13 +1920,31 @@ class MainWindow(QMainWindow):
     def _on_update_download_ready(self, info, path: str) -> None:
         """下载完成：记录文件路径并结束进度遮罩层。"""
         self._download_ready_path = path
+        self._download_ready_sha256 = (
+            str(getattr(info, "sha256", "") or "") if info is not None else ""
+        )
         dialog = self._download_dialog
         if dialog is not None:
             dialog.accept()
 
-    def _install_downloaded_update(self, path: str) -> None:
-        """安装已下载的更新包：支持自更新时重启安装，否则提示手动替换。"""
+    def _install_downloaded_update(
+        self, path: str, expected_sha256: str = ""
+    ) -> None:
+        """安装已下载的更新包：支持自更新时重启安装，否则提示手动替换。
+
+        ``expected_sha256`` 是下载完成时服务端清单里给出的摘要；安装前
+        再校验一次，确保替换的确实是刚验过的那个文件。
+        """
         try:
+            if expected_sha256 and not verify_file(path, expected_sha256):
+                # 从"下载完成"到"执行替换"之间，暂存文件理论上可能被别的
+                # 进程换掉：安装前再校验一次，确保替换的确实是刚验过的文件。
+                logger.warning("安装前复验失败，放弃自动安装")
+                self._show_update_message(
+                    "更新已下载",
+                    "更新包校验失败，已放弃自动安装，请手动更新",
+                )
+                return
             executable = current_executable_path()
             if is_self_update_supported() and executable is not None:
                 scheduled = schedule_install(

@@ -49,6 +49,9 @@ _CHUNK_SIZE = 1024 * 1024
 #: 因此按文件内容特征缓存，文件被替换后会自动失效。
 _SHA256_CACHE: dict[tuple[str, int, int], str] = {}
 
+#: 摘要缓存的最大条目数；超出后丢弃最旧的条目，避免长期运行时无限增长。
+_SHA256_CACHE_MAX_ENTRIES = 64
+
 
 class UpdateManifestResponse(BaseModel):
     """更新清单内容。"""
@@ -146,6 +149,9 @@ def _sha256_of(path: Path) -> str:
             digest.update(chunk)
     value = digest.hexdigest()
     _SHA256_CACHE[key] = value
+    # 缓存不能无限增长：超出上限时丢弃最旧的条目。
+    while len(_SHA256_CACHE) > _SHA256_CACHE_MAX_ENTRIES:
+        _SHA256_CACHE.pop(next(iter(_SHA256_CACHE)))
     return value
 
 

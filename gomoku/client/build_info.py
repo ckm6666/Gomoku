@@ -35,6 +35,11 @@ def build_info_path() -> Path:
 
     打包后（PyInstaller onefile）文件位于解包目录根部；开发时位于本模块
     所在目录。返回值总是绝对路径。
+
+    开发时**不**去读仓库根目录的 ``build/``：那里正是 ``build.py`` 写盘的
+    位置，一旦开发者在本地打过包，测试与开发启动就会读到上一次的固化
+    配置，行为随工作区状态漂移。开发时用环境变量
+    ``GOMOKU_API_BASE_URL`` / ``GOMOKU_UPDATE_MANIFEST_URL`` 覆盖即可。
     """
     if getattr(sys, "frozen", False):
         base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))

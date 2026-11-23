@@ -28,7 +28,9 @@ from gomoku.client.updater import (
     compare_versions,
     default_manifest_url,
     format_size,
+    is_loopback_url,
     is_newer_version,
+    is_secure_url,
     parse_manifest,
     parse_version,
     sha256_of_file,
@@ -108,13 +110,13 @@ class ServerManifestTests(unittest.TestCase):
     def test_aliases(self) -> None:
         payload = {
             "version": "1.9.0",
-            "download_url": "http://example.com/app.exe",
+            "download_url": "https://example.com/app.exe",
             "size_bytes": 42,
             "release_notes": "别名说明",
         }
         info = parse_manifest(payload)
         self.assertEqual(info.version, "1.9.0")
-        self.assertEqual(info.url, "http://example.com/app.exe")
+        self.assertEqual(info.url, "https://example.com/app.exe")
         self.assertEqual(info.size_bytes, 42)
         self.assertEqual(info.notes, "别名说明")
 
@@ -206,6 +208,55 @@ class ManifestErrorTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     parse_manifest(payload)  # type: ignore[arg-type]
 
+    def test_plain_http_download_url_is_rejected(self) -> None:
+        """明文 HTTP 下载安装包等于把可执行文件交给中间人，必须拒绝。"""
+        with self.assertRaises(ValueError):
+            parse_manifest(
+                {"version": "1.0.0", "url": "http://example.com/app.exe"}
+            )
+
+    def test_loopback_http_download_url_is_allowed(self) -> None:
+        """本机回环地址允许明文 HTTP（开发自测连本机服务）。"""
+        for url in (
+            "http://127.0.0.1:8000/Gomoku-1.0.0.exe",
+            "http://localhost:8000/Gomoku-1.0.0.exe",
+        ):
+            with self.subTest(url=url):
+                info = parse_manifest({"version": "1.0.0", "url": url})
+                self.assertEqual(info.url, url)
+
+
+class SecureUrlTests(unittest.TestCase):
+    """更新地址的安全策略：HTTPS 或本机回环。"""
+
+    def test_loopback_detection(self) -> None:
+        for url in (
+            "http://127.0.0.1:8000/x",
+            "http://localhost/x",
+            "http://127.0.0.2/x",
+            "https://127.0.0.1/x",
+        ):
+            with self.subTest(url=url):
+                self.assertTrue(is_loopback_url(url))
+
+    def test_non_loopback_is_not_loopback(self) -> None:
+        for url in (
+            "https://example.com/x",
+            "http://example.com/x",
+            "http://192.168.1.10:8000/x",
+            "http://localhost.evil.com/x",
+            "not-a-url",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(is_loopback_url(url))
+
+    def test_secure_url_policy(self) -> None:
+        self.assertTrue(is_secure_url("https://example.com/x"))
+        self.assertTrue(is_secure_url("http://127.0.0.1:8000/x"))
+        self.assertFalse(is_secure_url("http://example.com/x"))
+        self.assertFalse(is_secure_url("ftp://example.com/x"))
+        self.assertFalse(is_secure_url(""))
+
 
 class DigestTests(unittest.TestCase):
     """文件摘要计算与校验。"""
@@ -289,6 +340,26 @@ class UpdateScriptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_update_script(self.new_exe, Path('C:\\bad"name.exe'), self.pid)
 
+    def test_wait_loop_is_bounded(self) -> None:
+        """等待目标进程退出必须有上限，否则进程卡住就会永远停在这里。"""
+        script = build_update_script(self.new_exe, self.target_exe, self.pid)
+        self.assertIn("set /a WAIT_ROUNDS=0", script)
+        self.assertIn("set /a WAIT_ROUNDS+=1", script)
+        self.assertIn("if %WAIT_ROUNDS% GEQ", script)
+        self.assertIn(":WAIT_DONE", script)
+
+    def test_wait_counter_increments_before_the_check(self) -> None:
+        """计数必须在检查之前自增，否则 goto 回去时永远达不到上限。"""
+        script = build_update_script(self.new_exe, self.target_exe, self.pid)
+        lines = [line.strip() for line in script.splitlines()]
+        increment = lines.index("set /a WAIT_ROUNDS+=1")
+        check = next(
+            index
+            for index, line in enumerate(lines)
+            if line.startswith("if %WAIT_ROUNDS% GEQ")
+        )
+        self.assertLess(increment, check)
+
 
 class StagedPathTests(unittest.TestCase):
     """暂存安装包路径。"""
@@ -299,6 +370,22 @@ class StagedPathTests(unittest.TestCase):
             result = staged_download_path(directory, "1.12.0")
             self.assertEqual(result, directory / "Gomoku-1.12.0-setup.exe")
             self.assertTrue(directory.is_dir())
+
+    def test_staged_path_sanitizes_unsafe_version(self) -> None:
+        """版本号来自服务端清单，必须净化后才能拼进 Windows 文件名。"""
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            for version, expected in (
+                ("2.0.0-beta:1", "Gomoku-2.0.0-beta-1-setup.exe"),
+                ("1.0/2", "Gomoku-1.0-2-setup.exe"),
+                ("..", "Gomoku-unknown-setup.exe"),
+                ("", "Gomoku-unknown-setup.exe"),
+            ):
+                with self.subTest(version=version):
+                    result = staged_download_path(directory, version)
+                    self.assertEqual(result.name, expected)
+                    # 净化后的名字必须是单个文件名，不能带目录分隔符。
+                    self.assertEqual(result.parent, directory)
 
 
 class DefaultManifestUrlTests(unittest.TestCase):

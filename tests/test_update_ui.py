@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal  # noqa: E402
+from PySide6.QtNetwork import QNetworkReply  # noqa: E402
 from PySide6.QtWidgets import QApplication, QDialog  # noqa: E402
 
 from gomoku.client.build_info import BuildInfo  # noqa: E402
@@ -89,6 +90,22 @@ class NoNetworkManager:
 
     def get(self, request):
         raise AssertionError("不应发起真实网络请求")
+
+
+class FakeReply:
+    """最小化的 QNetworkReply 替身：只实现下载收尾用到的方法。"""
+
+    def __init__(self, status: int = 200) -> None:
+        self._status = status
+
+    def attribute(self, _kind):
+        return self._status
+
+    def error(self):
+        return QNetworkReply.NetworkError.NoError
+
+    def deleteLater(self) -> None:
+        pass
 
 
 def make_info(version: str = "9.9.9") -> UpdateInfo:
@@ -418,6 +435,79 @@ class UpdateServiceOfflineTests(unittest.TestCase):
         finally:
             service.deleteLater()
 
+    def test_plain_http_manifest_url_is_rejected(self) -> None:
+        """明文 HTTP 的更新清单必须拒绝：中间人能同时替换清单与安装包。"""
+        service = UpdateService("http://example.invalid/update.json", "1.0.0")
+        messages = []
+        service.check_failed.connect(messages.append)
+        try:
+            service.check_for_update()
+            self.assertEqual(messages, ["更新服务器必须使用 HTTPS"])
+        finally:
+            service.deleteLater()
+
+    def test_loopback_manifest_url_is_not_rejected(self) -> None:
+        """本机回环地址允许明文 HTTP（开发自测连本机服务）。"""
+        service = UpdateService(
+            "http://127.0.0.1:8000/api/v1/updates/latest", "1.0.0"
+        )
+        service._manager = NoNetworkManager()
+        messages = []
+        service.check_failed.connect(messages.append)
+        try:
+            service.check_for_update()
+            self.assertNotIn("更新服务器必须使用 HTTPS", messages)
+        finally:
+            service.deleteLater()
+
+    def test_download_without_sha256_is_refused(self) -> None:
+        """清单没给摘要时拒绝安装：无法证明二进制就是服务端发布的那一个。"""
+        service = UpdateService("https://example.invalid/update.json", "1.0.0")
+        messages = []
+        service.download_failed.connect(messages.append)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "Gomoku-1.12.0.exe"
+            path.write_bytes(b"payload")
+            reply = FakeReply()
+            service._download_reply = reply
+            service._download_info = UpdateInfo(
+                version="1.12.0", url="https://example.invalid/app.exe"
+            )
+            service._download_path = path
+            try:
+                service._on_download_finished(reply)
+                self.assertEqual(len(messages), 1)
+                self.assertIn("SHA-256", messages[0])
+                # 校验不了的包不会留在磁盘上。
+                self.assertFalse(path.exists())
+            finally:
+                service.deleteLater()
+
+    def test_download_with_matching_sha256_is_accepted(self) -> None:
+        """摘要匹配时正常放行。"""
+        import hashlib
+
+        service = UpdateService("https://example.invalid/update.json", "1.0.0")
+        ready = []
+        service.download_ready.connect(lambda info, path: ready.append(path))
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "Gomoku-1.12.0.exe"
+            content = b"payload"
+            path.write_bytes(content)
+            reply = FakeReply()
+            service._download_reply = reply
+            service._download_info = UpdateInfo(
+                version="1.12.0",
+                url="https://example.invalid/app.exe",
+                sha256=hashlib.sha256(content).hexdigest(),
+            )
+            service._download_path = path
+            try:
+                service._on_download_finished(reply)
+                self.assertEqual(ready, [str(path)])
+            finally:
+                service.deleteLater()
+
 
 class MainWindowUpdateTests(unittest.TestCase):
     """主窗口里的更新入口与检查流程。"""
@@ -568,6 +658,67 @@ class MainWindowUpdateTests(unittest.TestCase):
         """下载完成后先记录路径，等进度遮罩收起再进入安装流程。"""
         self.window._on_update_download_ready(make_info("9.9.9"), "/tmp/x.exe")
         self.assertEqual(self.window._download_ready_path, "/tmp/x.exe")
+
+    def test_check_is_skipped_during_online_game(self) -> None:
+        """联机对局中不能弹更新遮罩：服务器时钟不会跟着停，会导致超时判负。"""
+        panel = mock.Mock()
+        panel.in_room.return_value = True
+        self.window._online_panel = panel
+        service = FakeUpdateService()
+        self._use_service(service)
+        self.window._check_for_updates(manual=True)
+        self.assertEqual(service.checks, 0)
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("对局进行中", self.notices[0][1])
+
+    def test_automatic_check_is_skipped_during_online_game(self) -> None:
+        """自动检查在联机对局中静默跳过，不打扰玩家。"""
+        panel = mock.Mock()
+        panel.in_room.return_value = True
+        self.window._online_panel = panel
+        service = FakeUpdateService()
+        self._use_service(service)
+        self.window._check_for_updates(manual=False)
+        self.assertEqual(service.checks, 0)
+        self.assertEqual(len(self.notices), 0)
+
+    def test_manual_check_is_not_downgraded_by_a_later_auto_check(self) -> None:
+        """先发起的手动检查不应被后来的自动检查降级成静默提示。"""
+
+        class SilentService(FakeUpdateService):
+            """只记录请求、不返回结果：模拟还在等待网络。"""
+
+            def check_for_update(self) -> None:
+                self.checks += 1
+                self.check_started.emit()
+
+        service = SilentService()
+        self._use_service(service)
+        self.window._check_for_updates(manual=True)
+        # 手动检查还在进行中（结果尚未返回）。
+        self.assertTrue(self.window._update_check_in_flight)
+        self.window._check_for_updates(manual=False)
+        self.assertEqual(service.checks, 1)
+        self.assertTrue(self.window._update_check_is_manual)
+
+    def test_install_reverifies_sha256_before_replacing_executable(self) -> None:
+        """安装前要再校验一次暂存文件，防止下载后被换成别的文件。"""
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "Gomoku-9.9.9-setup.exe"
+            path.write_bytes(b"payload")
+            with mock.patch(
+                "gomoku.client.main_window.schedule_install"
+            ) as schedule:
+                with mock.patch(
+                    "gomoku.client.main_window.is_self_update_supported",
+                    return_value=False,
+                ):
+                    self.window._install_downloaded_update(
+                        str(path), "b" * 64
+                    )
+            # 摘要不匹配：既不安排安装，也不该静默成功。
+            schedule.assert_not_called()
+            self.assertTrue(self.notices)
 
 
 if __name__ == "__main__":
