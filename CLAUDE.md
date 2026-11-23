@@ -1,74 +1,78 @@
 # Gomoku Project Conventions
 
 Gomoku is a desktop five-in-a-row game (Python + PySide6 client, FastAPI + WebSocket server).
-This file constrains Claude Code's behavior in this repository and intentionally keeps only the
-minimum required set of rules.
+This file constrains two things only: **commit and PR text is written in Chinese**, and
+**releases happen automatically**.
 
-## 1. Commit
+## 1. Commit (Chinese text)
 
-- Always use Conventional Commits: `feat|fix|docs|chore|ci|refactor|test(scope): summary`.
-- The summary is imperative, lowercase, and has no trailing period. Omit the scope when it adds no
-  value (`feat: ...`).
-- One commit does one thing. For breaking changes, append `!` to the summary and describe the
+- Follow Conventional Commits: `feat|fix|docs|chore|ci|refactor|test(scope): summary`.
+- The type and scope stay in English; the summary and body are written in Chinese. No trailing
+  period in the summary, and no space before the colon.
+- One commit does one thing. For breaking changes, append `!` to the type and describe the
   migration in the body.
-- Use the body for `Context / Changes / Impact` when useful; never restate the diff line by line.
+- Use the body for 背景 / 改动 / 影响 when useful; never restate the diff line by line.
 
 Example:
 
 ```
-feat(client): add check-for-updates entry to the main menu
+feat(client): 主菜单新增检查更新入口
 
-Fetch the latest version from GitHub Releases and link to the download page.
+从 GitHub Releases 检索最新版本并跳转下载页。
 ```
 
-## 2. Push
+## 2. Pull request (Chinese text)
 
-- Before pushing, make sure the working tree is clean and that the staged content matches the
-  intended change only. Never include unrelated files (build artifacts, caches, `.coverage`).
-- Before pushing, state the change summary in the conversation: what changed, what it affects, and
-  how it was verified.
-- Push only the current branch. No force pushes, no direct pushes to `main`. Rebase onto the remote
-  when it has moved ahead.
+- The PR title follows the commit format (English type/scope, Chinese summary).
+- The body is written in Chinese and contains these three sections:
 
-## 3. Create PR
+  ```markdown
+  ## 变更内容
+  （本次改动做了什么，1~3 条）
 
-- The PR title follows the same format as the commit title. The body must contain these three
-  sections:
+  ## 影响范围
+  （客户端 / 服务端 / 协议 / 部署配置；无则写「无」）
 
-```markdown
-## Changes
-(What this PR does, 1–3 bullets)
-
-## Impact
-(Client / server / protocol / deployment config; write "None" if not applicable)
-
-## Verification
-(Which tests or commands were run, plus manual steps to reproduce)
-```
+  ## 验证方式
+  （跑了哪些测试、命令，以及手工验证步骤）
+  ```
 
 - Reference issues at the end of the body with `Closes #123`.
 - Open PRs against `main`, and keep one PR scoped to a single problem.
 
-## 4. Release a New Version
+## 3. Push
 
-Releasing a new version must follow the full chain — bump the version, tag, and let CI publish the
-Release — and the resulting Release must be marked as latest.
+- Push only the current branch. No force pushes, no direct pushes to `main`. Rebase onto the remote
+  when it has moved ahead.
+- Before pushing, make sure the working tree is clean and the staged content matches the intended
+  change only (no build artifacts, caches, `.coverage`).
+- Before pushing, state the change summary in the conversation: what changed, what it affects, and
+  how it was verified.
 
-Steps:
+## 4. Automatic release
 
-1. Set `APP_VERSION` in `gomoku/client/constants.py` to the new version (`X.Y.Z`, no `v` prefix).
-2. Update the "当前版本" paragraph at the top of `README.md` with what the new version adds. The
-   release notes are generated from this paragraph.
-3. Commit and merge into `main`.
-4. Tag and push:
+**Trigger**: a PR that changes `APP_VERSION` in `gomoku/client/constants.py` is a release PR. Once
+that PR is merged into `main`, carry out the steps below without waiting for a separate
+instruction, and report the resulting Release URL. Pushing the release tag is pre-authorized by
+this rule.
+
+**Steps** (the version bump and the README update belong to that PR — do not repeat them here):
+
+1. Confirm `APP_VERSION` is `X.Y.Z` and the tag will be `vX.Y.Z`; the two must match.
+2. Confirm the README has a line starting with `当前版本：` that states what the new version adds —
+   the release notes are generated from that line.
+3. Tag and push:
 
    ```bash
    git tag vX.Y.Z
    git push origin vX.Y.Z
    ```
 
-5. `.github/workflows/release.yml` runs: it builds the Windows client, pushes the GHCR image, and
-   creates the Release with `gh release create --latest`, titled with the version number.
+4. `.github/workflows/release.yml` builds the Windows client, pushes the GHCR image, and creates
+   the Release with `--latest`.
+
+**If a PR does not change `APP_VERSION`**: ask the user whether to release. Do not bump the version
+yourself unless asked.
 
 Notes:
 
