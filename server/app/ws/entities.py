@@ -16,6 +16,7 @@ from starlette.websockets import WebSocket
 from gomoku.shared.avatar import DEFAULT_AVATAR, normalize_avatar
 from gomoku.shared.game_model import GameModel
 from gomoku.shared.rules import Player
+from gomoku.shared.time_control import TimeControl
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ class QueuedPlayer:
     conn: ClientConnection
     rating: int
     queued_at: float
+    time_control: TimeControl
 
 
 @dataclass
@@ -79,7 +81,7 @@ class Room:
     white_user_id: Optional[str]
     black_name: str
     white_name: str
-    turn_seconds: int
+    time_control: TimeControl
     black_avatar: str = DEFAULT_AVATAR
     white_avatar: str = DEFAULT_AVATAR
     black_avatar_version: int = 0
@@ -116,6 +118,11 @@ class Room:
     escape_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
     escape_tokens: dict[str, int] = field(default_factory=dict)
     turn_deadline_ms: Optional[int] = None
+    # 双方当前余量（毫秒）。per_move 模式只使用当前走子方的余量；
+    # Fischer 模式在每手落子后把本手耗时从余量中扣除，再加固定加秒。
+    clock_remaining_ms: dict[str, int] = field(default_factory=dict)
+    # 本手开始时刻（epoch 毫秒）；为 None 表示计时暂停/尚未开始。
+    clock_started_ms: Optional[int] = None
     timeout_task: Optional[asyncio.Task] = None
     turn_token: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)

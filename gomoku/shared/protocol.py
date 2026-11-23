@@ -20,6 +20,10 @@ from gomoku.shared.achievements import normalize_achievement_keys
 from gomoku.shared.avatar import normalize_avatar
 from gomoku.shared.errors import ProtocolError
 from gomoku.shared.rules import BOARD_SIZE, Cell, Move, Player
+from gomoku.shared.time_control import (
+    TimeControl,
+    time_control_from_snapshot,
+)
 
 PROTOCOL_VERSION = 1
 
@@ -187,6 +191,12 @@ class GameSnapshot:
     rating_delta: int | None = None
     # 观战标记：True 表示这条快照属于旁观者，没有执子颜色，也不能操作。
     is_spectator: bool = False
+    # 本局时限设置。旧服务端不设置时，客户端用 move_timeout_seconds 推导。
+    time_control: Optional[TimeControl] = None
+    # Fischer 时钟双方当前余量（毫秒，快照生成瞬间的值）。
+    # 每手模式不使用这两个字段，改用 turn_deadline_ms 显示本手倒计时。
+    black_remaining_ms: Optional[int] = None
+    white_remaining_ms: Optional[int] = None
 
 
 def _parse_player(value: Any, field: str) -> Player:
@@ -384,6 +394,17 @@ def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
 
     black_avatar_version = optional_int("black_avatar_version") or 0
     white_avatar_version = optional_int("white_avatar_version") or 0
+    move_timeout_seconds = optional_int("move_timeout_seconds")
+    time_control = time_control_from_snapshot(
+        payload.get("time_control"), move_timeout_seconds
+    )
+    if time_control is not None and time_control.mode == "per_move":
+        # 旧字段与 time_control 同时存在时以结构化字段为准。
+        move_timeout_seconds = time_control.turn_seconds
+    elif time_control is not None and time_control.is_fischer:
+        move_timeout_seconds = None
+    black_remaining_ms = optional_int("black_remaining_ms")
+    white_remaining_ms = optional_int("white_remaining_ms")
     black_achievements = normalize_achievement_keys(
         payload.get("black_achievements", ())
     )
@@ -426,7 +447,7 @@ def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
         your_new_achievements=your_new_achievements,
         turn_deadline_ms=optional_int("turn_deadline_ms"),
         server_now_ms=optional_int("server_now_ms"),
-        move_timeout_seconds=optional_int("move_timeout_seconds"),
+        move_timeout_seconds=move_timeout_seconds,
         opponent_online=opponent_online,
         rated=rated,
         your_rating_before=optional_rating("your_rating_before"),
@@ -435,6 +456,9 @@ def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
         opponent_rating_after=optional_rating("opponent_rating_after"),
         rating_delta=rating_delta,
         is_spectator=is_spectator,
+        time_control=time_control,
+        black_remaining_ms=black_remaining_ms,
+        white_remaining_ms=white_remaining_ms,
     )
 
 

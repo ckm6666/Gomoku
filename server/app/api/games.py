@@ -10,9 +10,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from server.app.audit import audit_game, audit_moves_from_rows
+from server.app.db import utcnow_naive
 from server.app.dependencies import get_current_user, get_db
 from server.app.models import Game, Move as MoveRow, RatingEvent, User
 from server.app.schemas import (
+    AuditFindingEntry,
+    GameAuditResponse,
     GameDetailResponse,
     GameMove,
     LiveGameEntry,
@@ -51,6 +55,16 @@ def _result_for(game: Game, user_id: str) -> str:
     if game.winner_user_id is None:
         return "draw"
     return "win" if game.winner_user_id == user_id else "loss"
+
+
+def _time_control_payload(game: Game) -> dict:
+    if game.time_mode == "fischer":
+        return {
+            "mode": "fischer",
+            "main_seconds": game.main_seconds,
+            "increment_seconds": game.increment_seconds,
+        }
+    return {"mode": "per_move", "turn_seconds": game.turn_seconds}
 
 
 @router.get("/games/recent", response_model=RecentGamesResponse)
@@ -212,6 +226,64 @@ async def game_detail(
             )
             for move in move_rows
         ],
+        time_control=_time_control_payload(game),
+    )
+
+
+@router.get("/games/{game_id}/audit", response_model=GameAuditResponse)
+async def game_audit(
+    game_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> GameAuditResponse:
+    """参与者或管理员查看一局棋谱的完整性/时间审计结果。"""
+    game = await session.get(Game, game_id)
+    is_admin = (
+        current_user.username_key.lower()
+        in request.app.state.settings.admin_usernames
+    )
+    if game is None or (
+        current_user.id
+        not in (game.black_user_id, game.white_user_id)
+        and not is_admin
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="对局不存在"
+        )
+    move_rows = (
+        await session.scalars(
+            select(MoveRow)
+            .where(MoveRow.game_id == game_id)
+            .order_by(MoveRow.move_no.asc())
+        )
+    ).all()
+    result = audit_game(
+        game_id=game.id,
+        black_user_id=game.black_user_id,
+        white_user_id=game.white_user_id,
+        status=game.status,
+        winner_user_id=game.winner_user_id,
+        result_reason=game.result_reason,
+        move_count=game.move_no,
+        moves=audit_moves_from_rows(move_rows),
+        started_at=game.started_at,
+        ended_at=game.ended_at,
+    )
+    return GameAuditResponse(
+        game_id=result.game_id,
+        ok=result.ok,
+        move_count=result.move_count,
+        findings=[
+            AuditFindingEntry(
+                code=item.code,
+                severity=item.severity,
+                message=item.message,
+            )
+            for item in result.findings
+        ],
+        summary=result.summary,
+        generated_at=utcnow_naive(),
     )
 
 

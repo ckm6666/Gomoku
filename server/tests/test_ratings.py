@@ -1,15 +1,22 @@
-"""Elo 积分与段位纯函数测试。"""
+"""Glicko-2 积分、段位与赛季软重置纯函数测试。"""
 
 from __future__ import annotations
 
 import unittest
 
+from server.app.glicko2 import (
+    MAX_RD,
+    RATING_CENTER,
+    START_RD,
+    START_VOLATILITY,
+    GlickoState,
+    calculate_pair as calculate_glicko_pair,
+    season_soft_reset,
+)
 from server.app.ratings import (
     MIN_RATING,
     START_RATING,
     calculate_pair,
-    expected_score,
-    k_factor,
     rank_for_rating,
     rank_progress_percent,
 )
@@ -36,43 +43,107 @@ class RankTierTests(unittest.TestCase):
         self.assertLess(rank_progress_percent(1275), 100)
 
 
-class EloTests(unittest.TestCase):
-    def test_expected_score_symmetry(self) -> None:
-        self.assertAlmostEqual(expected_score(1200, 1200), 0.5)
-        self.assertAlmostEqual(
-            expected_score(1400, 1200),
-            1.0 - expected_score(1200, 1400),
+class Glicko2Tests(unittest.TestCase):
+    def test_equal_rating_decisive_game_is_symmetric(self) -> None:
+        black, white = calculate_pair(
+            START_RATING,
+            START_RD,
+            START_VOLATILITY,
+            START_RATING,
+            START_RD,
+            START_VOLATILITY,
+            1.0,
         )
-        self.assertGreater(expected_score(1400, 1200), 0.5)
+        self.assertGreater(black.after, black.before)
+        self.assertLess(white.after, white.before)
+        self.assertEqual(black.delta, -white.delta)
+        self.assertLess(black.rd_after, black.rd_before)
+        self.assertLess(white.rd_after, white.rd_before)
 
-    def test_k_factor(self) -> None:
-        self.assertEqual(k_factor(1200, 0), 40)
-        self.assertEqual(k_factor(1200, 9), 40)
-        self.assertEqual(k_factor(1200, 10), 32)
-        self.assertEqual(k_factor(1700, 50), 24)
-        self.assertEqual(k_factor(2000, 50), 16)
-
-    def test_equal_rating_decisive_game(self) -> None:
-        black, white = calculate_pair(1200, 0, 1200, 0, 1.0)
-        self.assertEqual(black.after, 1220)
-        self.assertEqual(white.after, 1180)
-        self.assertEqual(black.delta, 20)
-        self.assertEqual(white.delta, -20)
-
-    def test_equal_rating_draw_stays_even(self) -> None:
-        black, white = calculate_pair(1200, 0, 1200, 0, 0.5)
+    def test_draw_keeps_rating_but_reduces_rd(self) -> None:
+        black, white = calculate_pair(
+            1200,
+            START_RD,
+            START_VOLATILITY,
+            1200,
+            START_RD,
+            START_VOLATILITY,
+            0.5,
+        )
         self.assertEqual(black.after, 1200)
         self.assertEqual(white.after, 1200)
+        self.assertLess(black.rd_after, START_RD)
 
-    def test_upset_gains_more_than_favorite(self) -> None:
-        underdog, favorite = calculate_pair(1200, 20, 1600, 20, 1.0)
+    def test_underdog_gains_more_than_favorite(self) -> None:
+        underdog, favorite = calculate_pair(
+            1200,
+            START_RD,
+            START_VOLATILITY,
+            1600,
+            START_RD,
+            START_VOLATILITY,
+            1.0,
+        )
         self.assertGreater(underdog.delta, 0)
         self.assertLess(favorite.delta, 0)
-        self.assertGreater(abs(underdog.delta), 10)
+        self.assertGreater(underdog.delta, favorite.delta)
 
-    def test_minimum_rating_clamp(self) -> None:
-        _, loser = calculate_pair(1200, 0, MIN_RATING, 0, 1.0)
+    def test_settled_player_moves_less(self) -> None:
+        newcomer, _ = calculate_pair(
+            1200, START_RD, START_VOLATILITY, 1200, START_RD,
+            START_VOLATILITY, 1.0,
+        )
+        settled, _ = calculate_pair(
+            1200, 40.0, START_VOLATILITY, 1200, 40.0,
+            START_VOLATILITY, 1.0,
+        )
+        self.assertGreater(newcomer.delta, settled.delta)
+        self.assertGreater(settled.delta, 0)
+
+    def test_validation_and_clamp(self) -> None:
+        with self.assertRaises(ValueError):
+            calculate_pair(
+                1200, START_RD, START_VOLATILITY,
+                1200, START_RD, START_VOLATILITY, 0.7,
+            )
+        _, loser = calculate_pair(
+            1200,
+            START_RD,
+            START_VOLATILITY,
+            MIN_RATING,
+            START_RD,
+            START_VOLATILITY,
+            1.0,
+        )
+        # 权威算法允许极端下克上，但展示积分不得低于下限。
         self.assertGreaterEqual(loser.after, MIN_RATING)
+
+    def test_rd_clamped_to_supported_range(self) -> None:
+        low = GlickoState.from_stored(1200, 1.0, 0.06)
+        high = GlickoState.from_stored(1200, 9999.0, 0.06)
+        self.assertEqual(low.rd, 30.0)
+        self.assertEqual(high.rd, MAX_RD)
+
+    def test_glicko_pair_does_not_drift_volatility(self) -> None:
+        black, _ = calculate_glicko_pair(
+            GlickoState.from_stored(1200, 80.0, 0.06),
+            GlickoState.from_stored(1200, 80.0, 0.06),
+            1.0,
+        )
+        self.assertLess(black.after.volatility, 0.5)
+        self.assertGreater(black.after.volatility, 0.0)
+
+
+class SeasonResetTests(unittest.TestCase):
+    def test_soft_reset_compresses_rating_and_raises_rd(self) -> None:
+        rating, rd = season_soft_reset(1600, 50.0)
+        self.assertEqual(rating, int(round(RATING_CENTER + 200.0)))
+        self.assertGreaterEqual(rd, 120.0)
+        self.assertLessEqual(rd, MAX_RD)
+
+    def test_soft_reset_never_below_floor(self) -> None:
+        rating, _ = season_soft_reset(100, 300.0)
+        self.assertGreaterEqual(rating, MIN_RATING)
 
 
 if __name__ == "__main__":

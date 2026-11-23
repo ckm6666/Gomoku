@@ -801,6 +801,23 @@ QWidget#replayMovesPanel {
     background: transparent;
 }
 
+QFrame#dailyPuzzleCard {
+    background-color: rgba(252, 248, 239, 232);
+    border: 1px solid #B8934E;
+    border-radius: 8px;
+}
+
+QLabel#dailyPuzzleTitle {
+    color: #26221C;
+    font-size: 16px;
+    font-weight: bold;
+}
+
+QLabel#dailyPuzzleStatus {
+    color: #756C5E;
+    font-size: 12px;
+}
+
 QLabel#puzzleProgress {
     color: #5A4A38;
     background-color: #F3EADA;
@@ -1484,5 +1501,18 @@ QPushButton#sandboxControlButton:disabled {
     color: #B3A898;
     background-color: #EEE8DF;
     border-color: #DCD0BC;
+}
+
+QPlainTextEdit#reportDescription {
+    background-color: #FBF7EE;
+    border: 1px solid #C9B99F;
+    border-radius: 8px;
+    padding: 6px 8px;
+    color: #26221C;
+    selection-background-color: #B8934E;
+}
+
+QPlainTextEdit#reportDescription:focus {
+    border-color: #B8934E;
 }
 """

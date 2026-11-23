@@ -12,6 +12,7 @@ from gomoku.shared.protocol import (
     CLIENT_REMATCH,
     CLIENT_RESIGN,
     SERVER_AUTHENTICATED,
+    SERVER_ERROR,
     SERVER_GAME_STATE,
     SERVER_MOVE_REJECTED,
     SERVER_OPPONENT_STATUS,
@@ -230,6 +231,49 @@ class WebSocketGameTests(ServerTestBase):
                 online = host.receive_json()
                 self.assertEqual(online["type"], SERVER_OPPONENT_STATUS)
                 self.assertTrue(online["payload"]["online"])
+
+
+    def test_custom_turn_seconds_for_friend_room(self) -> None:
+        host_token = self._register_access("times_host")
+        guest_token = self._register_access("times_guest")
+        with self.client.websocket_connect("/api/v1/ws") as host:
+            with self.client.websocket_connect("/api/v1/ws") as guest:
+                self._authenticate(host, host_token)
+                self._authenticate(guest, guest_token)
+
+                host.send_json(
+                    make_message(
+                        CLIENT_CREATE_ROOM,
+                        {"turn_seconds": 3},
+                        request_id="bad-time",
+                    )
+                )
+                error = host.receive_json()
+                self.assertEqual(error["type"], SERVER_ERROR)
+                self.assertEqual(error["request_id"], "bad-time")
+
+                host.send_json(
+                    make_message(
+                        CLIENT_CREATE_ROOM,
+                        {"turn_seconds": 15},
+                        request_id="good-time",
+                    )
+                )
+                created = host.receive_json()
+                self.assertEqual(created["type"], SERVER_ROOM_CREATED)
+                code = created["payload"]["room_code"]
+                guest.send_json(
+                    make_message(
+                        CLIENT_JOIN_ROOM, {"room_code": code}
+                    )
+                )
+                host_state = parse_game_state(
+                    host.receive_json()["payload"]
+                )
+                guest.receive_json()
+                self.assertEqual(
+                    host_state.move_timeout_seconds, 15
+                )
 
 
 if __name__ == "__main__":

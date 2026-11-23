@@ -46,6 +46,8 @@ from gomoku.client.profile_panel import (  # noqa: E402
     AvatarPickerPanel,
     ProfilePanel,
 )
+from gomoku.client.replay_panel import ReplayPanel  # noqa: E402
+from gomoku.client.report_panel import ReportPanel  # noqa: E402
 from gomoku.shared.achievements import (  # noqa: E402
     ACHIEVEMENTS,
     ACHIEVEMENT_TOTAL,
@@ -993,6 +995,34 @@ class OnlineResignConfirmationTests(unittest.TestCase):
             panel._on_resign()
         self.assertEqual(session.resigned, 1)
         panel.close()
+
+
+class ReportAndReviewPanelTests(unittest.TestCase):
+    def test_report_panel_submits_selected_category(self) -> None:
+        panel = ReportPanel("game-abcdefgh", "对手")
+        events: list[tuple[str, str]] = []
+        panel.submitted.connect(
+            lambda category, description: events.append(
+                (category, description)
+            )
+        )
+        panel.set_audit(2, ok=False, details="第 3 手重复落子")
+        self.assertIn("2 项异常", panel.audit_label.text())
+        panel.description_edit.setPlainText("说明文字")
+        panel._on_submit()
+        self.assertEqual(events, [("cheating", "说明文字")])
+        self.assertFalse(panel.submit_button.isEnabled())
+        panel.set_result("已提交", success=True)
+        self.assertIn("已提交", panel.status_label.text())
+        panel.deleteLater()
+
+    def test_replay_panel_has_review_entry(self) -> None:
+        panel = ReplayPanel([])
+        self.assertEqual(panel.review_button.text(), "AI 复盘")
+        panel._toggle_ai_review()
+        self.assertIn("没有可分析", panel.review_status_label.text())
+        panel.shutdown()
+        panel.deleteLater()
 
 
 if __name__ == "__main__":

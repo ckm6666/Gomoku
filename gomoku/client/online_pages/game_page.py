@@ -204,6 +204,12 @@ def build_game_page(panel: Any) -> QWidget:
     panel.resign_button.setObjectName("undoButton")
     panel.rematch_button = QPushButton("申请再战", page)
     panel.rematch_button.setObjectName("restartButton")
+    panel.report_button = QPushButton("举报对手", page)
+    panel.report_button.setObjectName("undoButton")
+    panel.report_button.setToolTip(
+        "对局结束后可提交举报，管理员会结合回放审计处理"
+    )
+    panel.report_button.setVisible(False)
     panel.leave_button = QPushButton("离开房间", page)
     panel.leave_button.setObjectName("undoButton")
     for button in (
@@ -212,6 +218,7 @@ def build_game_page(panel: Any) -> QWidget:
         panel.undo_reject_button,
         panel.resign_button,
         panel.rematch_button,
+        panel.report_button,
         panel.leave_button,
     ):
         button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -224,6 +231,7 @@ def build_game_page(panel: Any) -> QWidget:
     panel.undo_reject_button.clicked.connect(panel._on_undo_declined)
     panel.resign_button.clicked.connect(panel._on_resign)
     panel.rematch_button.clicked.connect(panel._on_rematch)
+    panel.report_button.clicked.connect(panel._on_report_clicked)
     panel.leave_button.clicked.connect(panel._on_leave_room)
     panel.invite_friend_button.clicked.connect(
         panel._on_invite_friend_clicked

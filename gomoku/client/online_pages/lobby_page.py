@@ -8,6 +8,7 @@ from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from gomoku.client.avatar_widgets import AvatarButton
+from gomoku.shared.time_control import time_control_presets
 
 
 def build_lobby_page(panel: Any) -> QWidget:
@@ -119,6 +121,17 @@ def build_lobby_page(panel: Any) -> QWidget:
     panel.match_status_label.setMinimumHeight(20)
     layout.addWidget(ranked_title)
     layout.addWidget(ranked_hint)
+    ranked_time_row = QHBoxLayout()
+    ranked_time_label = QLabel("时限", card)
+    ranked_time_label.setObjectName("formLabel")
+    panel.ranked_turn_combo = QComboBox(card)
+    for control in time_control_presets():
+        panel.ranked_turn_combo.addItem(control.label(), control)
+    panel.ranked_turn_combo.setCurrentIndex(1)
+    ranked_time_row.addWidget(ranked_time_label)
+    ranked_time_row.addWidget(panel.ranked_turn_combo)
+    ranked_time_row.addStretch(1)
+    layout.addLayout(ranked_time_row)
     layout.addWidget(panel.quick_match_button)
     layout.addWidget(panel.match_status_label)
 
@@ -139,12 +152,23 @@ def build_lobby_page(panel: Any) -> QWidget:
     )
     panel.allow_spectators_checkbox.setChecked(True)
     panel.allow_spectators_checkbox.setVisible(False)
+    time_row = QHBoxLayout()
+    time_label = QLabel("时限", card)
+    time_label.setObjectName("formLabel")
+    panel.turn_seconds_combo = QComboBox(card)
+    for control in time_control_presets():
+        panel.turn_seconds_combo.addItem(control.label(), control)
+    panel.turn_seconds_combo.setCurrentIndex(1)
+    time_row.addWidget(time_label)
+    time_row.addWidget(panel.turn_seconds_combo)
+    time_row.addStretch(1)
     panel.create_room_button = QPushButton("创建自建房", card)
     panel.create_room_button.setObjectName("undoButton")
     panel.create_room_button.setCursor(Qt.CursorShape.PointingHandCursor)
     layout.addWidget(friend_title)
     layout.addWidget(friend_hint)
     layout.addWidget(panel.allow_spectators_checkbox)
+    layout.addLayout(time_row)
     layout.addWidget(panel.create_room_button)
 
     layout.addSpacing(4)

@@ -16,6 +16,9 @@ CAP_LIVE_GAMES = "live_games"
 CAP_UNDO_REQUEST = "undo_request"
 CAP_UNDO_QUOTA = "undo_quota"
 CAP_ROOM_OPTIONS = "room_options"
+CAP_TIME_CONTROL = "time_control"
+CAP_SEASON = "season"
+CAP_REPORT = "report"
 
 MAX_CAPABILITIES = 32
 MAX_CAPABILITY_LENGTH = 64
@@ -28,6 +31,9 @@ SERVER_CAPABILITIES = frozenset(
         CAP_UNDO_REQUEST,
         CAP_UNDO_QUOTA,
         CAP_ROOM_OPTIONS,
+        CAP_TIME_CONTROL,
+        CAP_SEASON,
+        CAP_REPORT,
     }
 )
 
@@ -60,8 +66,11 @@ def normalize_capabilities(value: Any) -> tuple[str, ...]:
 
 __all__ = [
     "CAP_LIVE_GAMES",
+    "CAP_REPORT",
     "CAP_ROOM_OPTIONS",
+    "CAP_SEASON",
     "CAP_SPECTATE",
+    "CAP_TIME_CONTROL",
     "CAP_UNDO_QUOTA",
     "CAP_UNDO_REQUEST",
     "CLIENT_CAPABILITIES",

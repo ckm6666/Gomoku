@@ -50,6 +50,71 @@ class RankedMatchTests(ServerTestBase):
         self.fail(f"未收到期望消息 {expected}")
         return {}
 
+    def test_quick_match_matches_same_time_control_only(self) -> None:
+        first_token = self._register_access("time_a")
+        second_token = self._register_access("time_b")
+        third_token = self._register_access("time_c")
+
+        with self.client.websocket_connect("/api/v1/ws") as first:
+            with self.client.websocket_connect("/api/v1/ws") as second:
+                with self.client.websocket_connect("/api/v1/ws") as third:
+                    self._authenticate(first, first_token)
+                    self._authenticate(second, second_token)
+                    self._authenticate(third, third_token)
+
+                    first.send_json(
+                        make_message(
+                            CLIENT_QUICK_MATCH, {"turn_seconds": 15}
+                        )
+                    )
+                    first_queued = first.receive_json()
+                    self.assertEqual(
+                        first_queued["payload"]["state"], "queued"
+                    )
+
+                    second.send_json(
+                        make_message(
+                            CLIENT_QUICK_MATCH, {"turn_seconds": 30}
+                        )
+                    )
+                    second_queued = second.receive_json()
+                    self.assertEqual(
+                        second_queued["payload"]["state"], "queued"
+                    )
+
+                    third.send_json(
+                        make_message(
+                            CLIENT_QUICK_MATCH, {"turn_seconds": 15}
+                        )
+                    )
+                    first_state = parse_game_state(
+                        self._receive_type(
+                            first, SERVER_GAME_STATE
+                        )["payload"]
+                    )
+                    third_state = parse_game_state(
+                        self._receive_type(
+                            third, SERVER_GAME_STATE
+                        )["payload"]
+                    )
+                    self.assertIsNotNone(first_state)
+                    self.assertIsNotNone(third_state)
+                    self.assertEqual(
+                        first_state.move_timeout_seconds, 15
+                    )
+                    self.assertEqual(
+                        third_state.move_timeout_seconds, 15
+                    )
+
+                    # 时间设置不同的第二名玩家仍在队列中。
+                    second.send_json(
+                        make_message(CLIENT_CANCEL_MATCH, {})
+                    )
+                    idle = self._receive_type(
+                        second, SERVER_QUEUE_STATUS
+                    )
+                    self.assertEqual(idle["payload"]["state"], "idle")
+
     def test_match_resign_rating_profile_and_leaderboard(self) -> None:
         host_token = self._register_access("rank_host")
         guest_token = self._register_access("rank_guest")

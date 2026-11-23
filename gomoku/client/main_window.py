@@ -405,6 +405,7 @@ class MainWindow(QMainWindow):
             return
 
         self._puzzle_result = (success, reason)
+        self.puzzle_page.record_daily_result(session.puzzle.id, success)
         self._record_current_game()
         if success:
             get_audio_manager().play_win()
@@ -513,6 +514,7 @@ class MainWindow(QMainWindow):
         self.menu_page = self._build_menu_page()
         self.puzzle_page = PuzzlePage(self._puzzles, self.stack)
         self.puzzle_page.puzzle_selected.connect(self._start_puzzle)
+        self.puzzle_page.daily_selected.connect(self._start_puzzle)
         self.puzzle_page.back_requested.connect(
             self._return_to_menu_from_puzzle
         )
@@ -955,6 +957,7 @@ class MainWindow(QMainWindow):
         ):
             return
         self._session.pause()
+        self.puzzle_page.refresh_daily()
         self.stack.setCurrentWidget(self.puzzle_page)
         self._set_game_shortcuts_enabled(False)
         self.puzzle_page.back_button.setFocus()
@@ -1011,6 +1014,7 @@ class MainWindow(QMainWindow):
                 return
 
         self._game_generation += 1
+        self.puzzle_page.refresh_daily()
         self.stack.setCurrentWidget(self.puzzle_page)
         self._set_game_shortcuts_enabled(False)
         self.puzzle_page.back_button.setFocus()

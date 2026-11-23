@@ -77,6 +77,7 @@ class UserResponse(BaseModel):
     created_at: datetime
     rating: int = START_RATING
     peak_rating: int = START_RATING
+    rating_rd: float = 100.0
     rated_games: int = 0
     wins: int = 0
     losses: int = 0
@@ -163,9 +164,49 @@ class RecentRatingGame(BaseModel):
     created_at: datetime
 
 
+class SeasonInfoResponse(BaseModel):
+    id: str
+    number: int
+    name: str
+    starts_at: str
+    ends_at: str
+    days_remaining: int
+    ends_at_ms: int
+
+
+class SeasonCurrentResponse(BaseModel):
+    season: SeasonInfoResponse
+    your_rank: Optional[int] = None
+    your_rating: Optional[int] = None
+    your_rd: Optional[float] = None
+    rated_games: int = 0
+
+
+class SeasonArchiveEntry(BaseModel):
+    position: int
+    user_id: str
+    username: str
+    avatar: str = DEFAULT_AVATAR
+    avatar_version: int = 0
+    rating: int
+    peak_rating: int
+    rated_games: int
+    wins: int
+    losses: int
+    draws: int
+
+
+class SeasonArchiveResponse(BaseModel):
+    season: SeasonInfoResponse
+    entries: list[SeasonArchiveEntry]
+    total: int
+
+
 class ProfileResponse(BaseModel):
     user: UserResponse
     recent_games: list[RecentRatingGame]
+    season: Optional[SeasonInfoResponse] = None
+    season_rank: Optional[int] = None
 
 
 class GameMove(BaseModel):
@@ -334,6 +375,79 @@ class GameDetailResponse(BaseModel):
     ended_at: Optional[datetime] = None
     rating_delta: Optional[int] = None
     moves: list[GameMove]
+    time_control: dict = Field(default_factory=dict)
+
+
+class ReportCreateRequest(BaseModel):
+    game_id: Annotated[str, Field(min_length=1, max_length=36)]
+    category: Annotated[str, Field(min_length=1, max_length=24)]
+    description: Annotated[str, Field(default="", max_length=500)] = ""
+
+    @field_validator("category")
+    @classmethod
+    def _category_valid(cls, value: str) -> str:
+        allowed = {"cheating", "abuse", "stalling", "other"}
+        if value not in allowed:
+            raise ValueError("举报类别必须是 cheating/abuse/stalling/other")
+        return value
+
+
+class ReportEntry(BaseModel):
+    id: str
+    game_id: str
+    reporter_id: str
+    reported_user_id: str
+    category: str
+    description: str
+    status: str
+    created_at: datetime
+    reviewed_at: Optional[datetime] = None
+    resolution: str = ""
+
+
+class ReportListResponse(BaseModel):
+    reports: list[ReportEntry]
+
+
+class AdminReportEntry(ReportEntry):
+    reporter_username: str = ""
+    reported_username: str = ""
+    game_status: str = ""
+    game_rated: bool = False
+    audit_findings: int = 0
+
+
+class AdminReportListResponse(BaseModel):
+    reports: list[AdminReportEntry]
+    total: int
+
+
+class ReportReviewRequest(BaseModel):
+    action: Annotated[str, Field(min_length=1, max_length=16)]
+    note: Annotated[str, Field(default="", max_length=500)] = ""
+
+    @field_validator("action")
+    @classmethod
+    def _action_valid(cls, value: str) -> str:
+        allowed = {"dismiss", "warn", "uphold"}
+        if value not in allowed:
+            raise ValueError("处理动作必须是 dismiss/warn/uphold")
+        return value
+
+
+class AuditFindingEntry(BaseModel):
+    code: str
+    severity: str
+    message: str
+
+
+class GameAuditResponse(BaseModel):
+    game_id: str
+    ok: bool
+    move_count: int
+    findings: list[AuditFindingEntry]
+    summary: dict[str, int] = Field(default_factory=dict)
+    generated_at: datetime
 
 
 __all__ = [
@@ -347,6 +461,18 @@ __all__ = [
     "LeaderboardResponse",
     "RecentRatingGame",
     "ProfileResponse",
+    "SeasonInfoResponse",
+    "SeasonCurrentResponse",
+    "SeasonArchiveEntry",
+    "SeasonArchiveResponse",
+    "ReportCreateRequest",
+    "ReportEntry",
+    "ReportListResponse",
+    "AdminReportEntry",
+    "AdminReportListResponse",
+    "ReportReviewRequest",
+    "AuditFindingEntry",
+    "GameAuditResponse",
     "GameMove",
     "RecentGameEntry",
     "RecentGamesResponse",

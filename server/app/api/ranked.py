@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,8 +16,10 @@ from server.app.schemas import (
     LeaderboardResponse,
     ProfileResponse,
     RecentRatingGame,
+    SeasonInfoResponse,
     UserResponse,
 )
+from server.app.seasons import ensure_current_season
 
 router = APIRouter(tags=["ranked"])
 
@@ -69,10 +71,11 @@ async def leaderboard(
 
 @router.get("/profile/me", response_model=ProfileResponse)
 async def profile_me(
+    request: Request,
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> ProfileResponse:
-    """当前账号的积分资料与最近 10 场排位战绩。"""
+    """当前账号的积分资料、赛季信息与最近 10 场排位战绩。"""
     events = (
         await session.scalars(
             select(RatingEvent)
@@ -104,9 +107,34 @@ async def profile_me(
         )
         for event in events
     ]
+    manager = getattr(request.app.state, "room_manager", None)
+    season = (
+        await manager.current_season()
+        if manager is not None
+        else await ensure_current_season(
+            request.app.state.session_factory,
+            request.app.state.settings,
+        )
+    )
+    season_rank = None
+    if season is not None and current_user.rated_games > 0:
+        higher = await session.scalar(
+            select(func.count(User.id)).where(
+                User.is_active.is_(True),
+                User.rated_games > 0,
+                User.rating > current_user.rating,
+            )
+        )
+        season_rank = int(higher or 0) + 1
     return ProfileResponse(
         user=UserResponse.model_validate(current_user),
         recent_games=recent_games,
+        season=(
+            SeasonInfoResponse(**season.payload())
+            if season is not None
+            else None
+        ),
+        season_rank=season_rank,
     )
 
 

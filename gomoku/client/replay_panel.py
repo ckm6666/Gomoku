@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Sequence
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtGui import QBrush, QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -27,9 +29,20 @@ from PySide6.QtWidgets import (
 from gomoku.client.board_view import BoardView
 from gomoku.client.board_widget import BoardWidget
 from gomoku.client.replay import ReplayError, ReplayTimeline
+from gomoku.client.review import (
+    LABEL_BEST,
+    LABEL_BLUNDER,
+    LABEL_GOOD,
+    LABEL_INACCURATE,
+    LABEL_MISTAKE,
+    MoveReview,
+    ReviewResult,
+)
+from gomoku.client.review_worker import AIReviewWorker
 from gomoku.client.ui_theme import GAME_BACKDROP_SPEC, InkBackdrop
 from gomoku.shared.record import GameRecord
 from gomoku.shared.rules import BOARD_SIZE, Cell, Player
+from gomoku.shared.sgf import SgfError, record_from_sgf, record_to_sgf
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +56,18 @@ _MODE_LABELS = {
     "puzzle": "残局",
     "online": "联机",
 }
+
+_REVIEW_COLORS = {
+    LABEL_BEST: QColor("#2E7D4F"),
+    LABEL_GOOD: QColor("#2E7D4F"),
+    LABEL_INACCURATE: QColor("#8A6A1F"),
+    LABEL_MISTAKE: QColor("#C0621E"),
+    LABEL_BLUNDER: QColor("#B03A2E"),
+}
+
+
+def _coord(row: int, col: int) -> str:
+    return f"{chr(ord('A') + col)}{row + 1}"
 
 
 def _empty_view() -> BoardView:
@@ -98,10 +123,14 @@ class ReplayPanel(InkBackdrop):
         self.setObjectName("replayPanel")
         self._records = tuple(records)
         self._timeline: Optional[ReplayTimeline] = None
+        self._current_index = 0
         self._index = 0
         self._syncing = False
         self._closing = False
         self._shortcuts: list[QShortcut] = []
+        self._review_worker: Optional[AIReviewWorker] = None
+        self._review_result: Optional[ReviewResult] = None
+        self._reviews_by_move: dict[int, MoveReview] = {}
 
         self._play_timer = QTimer(self)
         self._play_timer.setInterval(700)
@@ -116,13 +145,15 @@ class ReplayPanel(InkBackdrop):
     # ------------------------------------------------------------------
     def set_records(self, records: Sequence[GameRecord]) -> None:
         """载入一组棋谱并复位到第一条。"""
+        self._stop_review()
         self._records = tuple(records)
         self._populate_records()
 
     def shutdown(self) -> None:
-        """停止自动播放等后台活动。"""
+        """停止自动播放与 AI 复盘等后台活动。"""
         self._closing = True
         self._stop_play()
+        self._stop_review(wait=True)
 
     # ------------------------------------------------------------------
     # 可见性
@@ -158,15 +189,43 @@ class ReplayPanel(InkBackdrop):
         self.meta_label = QLabel("选择一条棋谱开始复盘", self)
         self.meta_label.setObjectName("brandSubtitle")
         self.meta_label.setWordWrap(True)
+        self.review_status_label = QLabel("", self)
+        self.review_status_label.setObjectName("hintLabel")
+        self.review_status_label.setWordWrap(True)
         title_layout.addWidget(title)
         title_layout.addWidget(self.meta_label)
+        title_layout.addWidget(self.review_status_label)
         header.addLayout(title_layout)
         header.addStretch(1)
+        self.import_button = QPushButton("导入 SGF", self)
+        self.import_button.setObjectName("smallButton")
+        self.import_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.import_button.clicked.connect(self._import_sgf)
+        self.export_button = QPushButton("导出 SGF", self)
+        self.export_button.setObjectName("smallButton")
+        self.export_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.export_button.clicked.connect(self._export_sgf)
+        self.review_button = QPushButton("AI 复盘", self)
+        self.review_button.setObjectName("smallButton")
+        self.review_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.review_button.setToolTip(
+            "逐手分析：推荐着法、评分损失与准确率（本地运行）"
+        )
+        self.review_button.clicked.connect(self._toggle_ai_review)
         self.close_button = QPushButton("关闭", self)
         self.close_button.setObjectName("undoButton")
         self.close_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.close_button.clicked.connect(
             lambda _checked=False: self.closed.emit()
+        )
+        header.addWidget(
+            self.import_button, 0, Qt.AlignmentFlag.AlignVCenter
+        )
+        header.addWidget(
+            self.export_button, 0, Qt.AlignmentFlag.AlignVCenter
+        )
+        header.addWidget(
+            self.review_button, 0, Qt.AlignmentFlag.AlignVCenter
         )
         header.addWidget(self.close_button, 0, Qt.AlignmentFlag.AlignVCenter)
         root.addLayout(header)
@@ -327,6 +386,58 @@ class ReplayPanel(InkBackdrop):
             self._show_empty()
             self._set_controls_enabled(False)
 
+    def _current_record(self) -> Optional[GameRecord]:
+        if not self._records:
+            return None
+        index = self._current_index
+        if index < 0 or index >= len(self._records):
+            index = 0
+        return self._records[index]
+
+    def _export_sgf(self) -> None:
+        record = self._current_record()
+        if record is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出 SGF 棋谱",
+            f"{record.record_id}.sgf",
+            "SGF 棋谱 (*.sgf);;所有文件 (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".sgf"):
+            path += ".sgf"
+        try:
+            Path(path).write_text(
+                record_to_sgf(record), encoding="utf-8"
+            )
+        except (OSError, SgfError) as exc:
+            self.meta_label.setText(f"导出失败：{exc}")
+            return
+        self.meta_label.setText(f"已导出 SGF：{path}")
+
+    def _import_sgf(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "导入 SGF 棋谱",
+            "",
+            "SGF 棋谱 (*.sgf);;所有文件 (*)",
+        )
+        if not path:
+            return
+        try:
+            text = Path(path).read_text(
+                encoding="utf-8", errors="replace"
+            )
+            record = record_from_sgf(text)
+        except (OSError, SgfError) as exc:
+            self.meta_label.setText(f"导入失败：{exc}")
+            return
+        self._records = (record, *self._records)
+        self._populate_records()
+        self.meta_label.setText(f"已导入 SGF：{path}")
+
     def _on_record_selected(self, row: int) -> None:
         if row < 0 or row >= len(self._records):
             return
@@ -334,6 +445,12 @@ class ReplayPanel(InkBackdrop):
 
     def _load_record(self, index: int) -> None:
         self._stop_play()
+        self._stop_review()
+        self._review_result = None
+        self._reviews_by_move.clear()
+        self.review_status_label.setText("")
+        self.review_button.setText("AI 复盘")
+        self._current_index = index
         record = self._records[index]
         self.meta_label.setText(
             f"{_mode_label(record.mode)} · {_result_text(record)} · "
@@ -374,6 +491,9 @@ class ReplayPanel(InkBackdrop):
         self.move_info_label.setText(message)
         self.slider.setRange(0, 0)
         self.moves_list.clear()
+        self._review_result = None
+        self._reviews_by_move.clear()
+        self.review_status_label.setText("")
 
     # ------------------------------------------------------------------
     # 导航
@@ -404,16 +524,25 @@ class ReplayPanel(InkBackdrop):
             self._syncing = False
 
         self.index_label.setText(f"第 {bounded} / {self._last_index} 手")
-        description = self._timeline.move_description(bounded)
-        if bounded == self._last_index and self._last_index > 0:
-            description += f"　·　{_result_text(self._timeline.record)}"
-        self.move_info_label.setText(description)
+        self._update_move_info()
 
         self.first_button.setEnabled(bounded > 0)
         self.prev_button.setEnabled(bounded > 0)
         self.next_button.setEnabled(bounded < self._last_index)
         self.last_button.setEnabled(bounded < self._last_index)
         self.play_button.setEnabled(self._last_index > 0)
+
+    def _update_move_info(self) -> None:
+        if self._timeline is None:
+            return
+        bounded = self._index
+        description = self._timeline.move_description(bounded)
+        review = self._reviews_by_move.get(bounded)
+        if review is not None:
+            description += f"　·　{self._review_move_text(review)}"
+        if bounded == self._last_index and self._last_index > 0:
+            description += f"　·　{_result_text(self._timeline.record)}"
+        self.move_info_label.setText(description)
 
     def _on_slider_changed(self, value: int) -> None:
         if not self._syncing:
@@ -433,6 +562,11 @@ class ReplayPanel(InkBackdrop):
             self.slider,
         ):
             widget.setEnabled(enabled)
+        self.export_button.setEnabled(enabled and bool(self._records))
+        if self._review_worker is None:
+            self.review_button.setEnabled(
+                enabled and bool(self._records)
+            )
 
     # ------------------------------------------------------------------
     # 自动播放
@@ -458,6 +592,145 @@ class ReplayPanel(InkBackdrop):
         self._play_timer.stop()
         if hasattr(self, "play_button"):
             self.play_button.setText("播放")
+
+    # ------------------------------------------------------------------
+    # AI 复盘
+    # ------------------------------------------------------------------
+    def _toggle_ai_review(self) -> None:
+        worker = self._review_worker
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            self.review_button.setEnabled(False)
+            self.review_status_label.setText("正在取消 AI 复盘…")
+            return
+        record = self._current_record()
+        if record is None or not record.moves:
+            self.review_status_label.setText("这局棋谱没有可分析的落子")
+            return
+        self._stop_play()
+        self._stop_review()
+        self._review_result = None
+        self._reviews_by_move.clear()
+        self.review_button.setText("取消分析")
+        self.review_status_label.setText(
+            f"AI 复盘 0/{len(record.moves)}…"
+        )
+        worker = AIReviewWorker(record, parent=self)
+        worker.progress.connect(self._on_review_progress)
+        worker.move_ready.connect(self._on_review_move)
+        worker.review_finished.connect(self._on_review_finished)
+        worker.review_failed.connect(self._on_review_failed)
+        worker.review_cancelled.connect(self._on_review_cancelled)
+        worker.finished.connect(worker.deleteLater)
+        self._review_worker = worker
+        worker.start()
+
+    def _stop_review(self, *, wait: bool = False) -> None:
+        worker = self._review_worker
+        self._review_worker = None
+        if worker is None:
+            return
+        # 先断开回调：取消后的 cancelled/finished 不应再改新棋谱的界面。
+        for signal, slot in (
+            (worker.progress, self._on_review_progress),
+            (worker.move_ready, self._on_review_move),
+            (worker.review_finished, self._on_review_finished),
+            (worker.review_failed, self._on_review_failed),
+            (worker.review_cancelled, self._on_review_cancelled),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        worker.cancel()
+        if wait:
+            worker.wait(1500)
+
+    def _review_active_record(self) -> Optional[GameRecord]:
+        record = self._current_record()
+        worker = self._review_worker
+        if record is None or worker is None:
+            return None
+        if worker.record_id != record.record_id:
+            return None
+        return record
+
+    def _on_review_progress(self, done: int, total: int) -> None:
+        if self._review_active_record() is None:
+            return
+        self.review_status_label.setText(f"AI 复盘 {done}/{total}…")
+
+    def _on_review_move(self, move_no: int, review: object) -> None:
+        if not isinstance(review, MoveReview):
+            return
+        if self._review_active_record() is None:
+            return
+        self._reviews_by_move[move_no] = review
+        self._update_move_item(move_no)
+        if self._index == move_no:
+            self._update_move_info()
+
+    def _on_review_finished(self, result: object) -> None:
+        if not isinstance(result, ReviewResult):
+            return
+        record = self._current_record()
+        if record is None or result.record_id != record.record_id:
+            return
+        self._review_worker = None
+        self._review_result = result
+        self._reviews_by_move = {
+            item.move_no: item for item in result.reviews
+        }
+        self.review_button.setText("重新分析")
+        self.review_button.setEnabled(True)
+        self.review_status_label.setText(f"AI 复盘：{result.summary_text}")
+        self._apply_review_labels()
+        self._update_move_info()
+
+    def _on_review_failed(self, message: str) -> None:
+        self._review_worker = None
+        self.review_button.setText("AI 复盘")
+        self.review_button.setEnabled(True)
+        self.review_status_label.setText(message or "AI 复盘失败")
+
+    def _on_review_cancelled(self) -> None:
+        self._review_worker = None
+        self.review_button.setText("AI 复盘")
+        self.review_button.setEnabled(True)
+        self.review_status_label.setText("已取消 AI 复盘")
+
+    def _apply_review_labels(self) -> None:
+        for move_no in range(1, self._timeline.move_count + 1):
+            self._update_move_item(move_no)
+
+    def _update_move_item(self, move_no: int) -> None:
+        if self._timeline is None:
+            return
+        item = self.moves_list.item(move_no)
+        if item is None:
+            return
+        base = self._timeline.move_description(move_no)
+        review = self._reviews_by_move.get(move_no)
+        if review is None:
+            item.setText(base)
+            item.setForeground(QBrush())
+            return
+        item.setText(f"{base}　·　{review.label}")
+        item.setForeground(
+            QBrush(_REVIEW_COLORS.get(review.label, QColor("#3A3226")))
+        )
+
+    def _review_move_text(self, review: MoveReview) -> str:
+        if review.best_move is None:
+            return "AI 无法分析这一手"
+        best = _coord(review.best_move[0], review.best_move[1])
+        played = _coord(review.move[0], review.move[1])
+        before = int(round(review.win_rate_before * 100))
+        after = int(round(review.win_rate_after * 100))
+        return (
+            f"AI 推荐 {best}（胜率 {before}%），实战 {played}"
+            f"（{after}%），损失 {review.loss} · {review.label}"
+        )
 
     # ------------------------------------------------------------------
     # 关闭

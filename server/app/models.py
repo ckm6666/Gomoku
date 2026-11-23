@@ -9,6 +9,7 @@ from typing import Optional
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -22,6 +23,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from gomoku.shared.avatar import DEFAULT_AVATAR
 from server.app.db import Base, utcnow_naive
 from server.app.ratings import START_RATING
+from server.app.glicko2 import START_RD, START_VOLATILITY
 
 
 def new_id() -> str:
@@ -90,6 +92,19 @@ class User(Base):
         server_default=text(str(START_RATING)),
         nullable=False,
     )
+    # Glicko-2 的评分不确定度（RD）与波动率；对外只显示整数积分。
+    rating_rd: Mapped[float] = mapped_column(
+        Float,
+        default=START_RD,
+        server_default=text(str(START_RD)),
+        nullable=False,
+    )
+    rating_volatility: Mapped[float] = mapped_column(
+        Float,
+        default=START_VOLATILITY,
+        server_default=text(str(START_VOLATILITY)),
+        nullable=False,
+    )
     rated_games: Mapped[int] = mapped_column(
         Integer, default=0, server_default=text("0"), nullable=False
     )
@@ -155,6 +170,20 @@ class Game(Base):
     )
     move_no: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     turn_seconds: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
+    # 时限模式：per_move（每手倒计时）或 fischer（总时长 + 加秒）。
+    # turn_seconds 仍保存每手秒数，供旧客户端和审计读取。
+    time_mode: Mapped[str] = mapped_column(
+        String(16),
+        default="per_move",
+        server_default=text("'per_move'"),
+        nullable=False,
+    )
+    main_seconds: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+    increment_seconds: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
     rated: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
@@ -224,6 +253,22 @@ class RatingEvent(Base):
     rating_before: Mapped[int] = mapped_column(Integer, nullable=False)
     rating_after: Mapped[int] = mapped_column(Integer, nullable=False)
     delta: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Glicko-2 审计字段：RD/波动率变化与赛季归属。
+    rating_rd_before: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True
+    )
+    rating_rd_after: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True
+    )
+    rating_volatility_before: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True
+    )
+    rating_volatility_after: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True
+    )
+    season_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("seasons.id"), index=True, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=utcnow_naive, nullable=False
     )
@@ -301,6 +346,105 @@ class DirectMessage(Base):
     )
 
 
+class Season(Base):
+    """排位赛季：每个赛季有独立的起止时间与积分软重置。"""
+
+    __tablename__ = "seasons"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    number: Mapped[int] = mapped_column(
+        Integer, unique=True, index=True, nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    starts_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    ends_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow_naive, nullable=False
+    )
+
+
+class SeasonRating(Base):
+    """赛季结算存档：每个赛季每位参赛账号一行。"""
+
+    __tablename__ = "season_ratings"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    season_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("seasons.id"), index=True, nullable=False
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), index=True, nullable=False
+    )
+    rating: Mapped[int] = mapped_column(Integer, nullable=False)
+    peak_rating: Mapped[int] = mapped_column(Integer, nullable=False)
+    rating_rd: Mapped[float] = mapped_column(Float, nullable=False)
+    rating_volatility: Mapped[float] = mapped_column(Float, nullable=False)
+    rated_games: Mapped[int] = mapped_column(Integer, nullable=False)
+    wins: Mapped[int] = mapped_column(Integer, nullable=False)
+    losses: Mapped[int] = mapped_column(Integer, nullable=False)
+    draws: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow_naive, nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "season_id", "user_id", name="uq_season_ratings_season_user"
+        ),
+    )
+
+
+class GameReport(Base):
+    """玩家提交的对局举报；管理员复核时结合回放审计处理。"""
+
+    __tablename__ = "game_reports"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    game_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("games.id"), index=True, nullable=False
+    )
+    reporter_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), index=True, nullable=False
+    )
+    reported_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), index=True, nullable=False
+    )
+    category: Mapped[str] = mapped_column(String(24), nullable=False)
+    description: Mapped[str] = mapped_column(
+        String(500), default="", server_default=text("''"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default="pending",
+        server_default=text("'pending'"),
+        index=True,
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow_naive, nullable=False
+    )
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    reviewer_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=True
+    )
+    resolution: Mapped[str] = mapped_column(
+        String(500), default="", server_default=text("''"), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "game_id", "reporter_id", name="uq_game_reports_game_reporter"
+        ),
+        Index(
+            "ix_game_reports_status_created",
+            "status",
+            "created_at",
+        ),
+    )
+
+
 __all__ = [
     "User",
     "RefreshSession",
@@ -309,4 +453,7 @@ __all__ = [
     "RatingEvent",
     "Friendship",
     "DirectMessage",
+    "Season",
+    "SeasonRating",
+    "GameReport",
 ]
