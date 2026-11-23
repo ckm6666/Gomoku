@@ -71,6 +71,14 @@ class Settings:
     # 排位赛季长度（天）与管理员账号（可复核举报/查看回放审计）。
     season_length_days: int = 90
     admin_usernames: frozenset[str] = frozenset()
+    # 客户端更新清单文件路径；未配置时更新接口返回 503。
+    # 不在启动时校验文件是否存在——文件缺失应该在请求时返回 404，
+    # 而不是让服务直接起不来。
+    update_manifest_path: Optional[str] = None
+    # 客户端安装包目录；服务端可扫描其中的 `Gomoku-<版本号>.exe` 自行生成
+    # 更新清单并直接托管下载。同样不在启动时校验目录是否存在——目录缺失
+    # 应该在请求时返回 404，而不是让服务直接起不来。
+    update_artifacts_dir: Optional[str] = None
 
     @property
     def is_development(self) -> bool:
@@ -198,6 +206,13 @@ class Settings:
                 "GOMOKU_TRUST_PROXY_HEADERS 必须是 0/1/true/false"
             )
 
+        update_manifest_path = (
+            source.get("GOMOKU_UPDATE_MANIFEST_PATH", "").strip() or None
+        )
+        update_artifacts_dir = (
+            source.get("GOMOKU_UPDATE_ARTIFACTS_DIR", "").strip() or None
+        )
+
         return cls(
             environment=environment,
             database_url=database_url,
@@ -220,6 +235,8 @@ class Settings:
             trust_proxy_headers=trust_proxy_headers,
             season_length_days=season_days,
             admin_usernames=admin_usernames,
+            update_manifest_path=update_manifest_path,
+            update_artifacts_dir=update_artifacts_dir,
         )
 
 
