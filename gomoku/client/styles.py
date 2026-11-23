@@ -341,6 +341,28 @@ QLabel#menuVersion {
     font-size: 12px;
 }
 
+/* 主菜单底部的「检查更新」入口：轻量文字按钮，不抢主菜的视觉重心。 */
+QPushButton#menuLinkButton {
+    color: #8A6336;
+    background: transparent;
+    border: none;
+    padding: 2px 8px;
+    font-size: 12px;
+}
+
+QPushButton#menuLinkButton:hover {
+    color: #9E3B2E;
+    text-decoration: underline;
+}
+
+QPushButton#menuLinkButton:pressed {
+    color: #7E2C22;
+}
+
+QPushButton#menuLinkButton:disabled {
+    color: #A89C8B;
+}
+
 QPushButton#menuButton {
     color: #332C24;
     background-color: #F7EFE2;
@@ -796,6 +818,32 @@ QPushButton#resultSecondaryButton:hover {
 QPushButton#resultPrimaryButton:focus,
 QPushButton#resultSecondaryButton:focus {
     border: 1px solid #E3D1A9;
+}
+
+/* 更新弹窗：版本号与更新说明。 */
+QWidget#updateDialog {
+    background: transparent;
+}
+
+QScrollArea#updateNotesArea {
+    background: transparent;
+    border: none;
+}
+
+QScrollArea#updateNotesArea > QWidget#qt_scrollarea_viewport {
+    background: transparent;
+}
+
+QLabel#updateNotes {
+    color: #4C463C;
+    font-size: 12px;
+    background: transparent;
+}
+
+QLabel#updateAsset {
+    color: #8A6336;
+    font-size: 12px;
+    background: transparent;
 }
 
 /* ------------------------------ 残局与棋谱 ------------------------------ */

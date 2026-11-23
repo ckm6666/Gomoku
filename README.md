@@ -19,9 +19,11 @@
 - **AI 复盘**：复盘页逐手分析推荐着法、评分损失、失误/败着标注与整局准确率；
 - 预置印章头像与本地图片上传头像、个人信息窗口、好友申请/列表、好友私聊，以及直接邀请好友开局的休闲自建房；
 - 排位成就系统与十三枚勋章：胜场、连胜、段位里程碑；对局双方卡片直接展示勋章；
+- **检查更新**：主菜单底部的「检查更新」入口从 GitHub Releases 检索最新版本，
+  提示新版本号与更新说明，并跳转发布页下载——安装包不经游戏服务端分发；
 - 可打包为单个 `Gomoku.exe`。
 
-当前版本：**1.13.0**（“记住密码”后可用 DPAPI 加密保存的 refresh token 静默恢复登录；1.12.0 新增登录页“记住密码”与排位固定每手 30 秒，打包版默认连固定公网入口；1.11.0 加入 Fischer 总时长时钟、Glicko-2 与排位赛季、举报与回放审计、AI 复盘分析；1.10.0 加入对战广场与观战；1.9.0 加入自定义头像上传、成就/勋章系统与对局勋章展示）。
+当前版本：**1.13.0**（新增主菜单「检查更新」入口，从 GitHub Releases 检索最新版本并跳转下载页；“记住密码”后可用 DPAPI 加密保存的 refresh token 静默恢复登录；1.12.0 新增登录页“记住密码”与排位固定每手 30 秒，打包版默认连固定公网入口；1.11.0 加入 Fischer 总时长时钟、Glicko-2 与排位赛季、举报与回放审计、AI 复盘分析；1.10.0 加入对战广场与观战；1.9.0 加入自定义头像上传、成就/勋章系统与对局勋章展示）。
 
 > 联机功能需要同时运行本项目的服务端；离线双人/AI 模式不需要服务器。
 > 当前仍是内测定位，注册需要用户名与密码。
@@ -259,6 +261,7 @@ Gomoku/
 │   │   ├── avatar.py               # 预置印章、自定义头像尺寸/体积约束（双端共用）
 │   │   ├── achievements.py         # 成就目录、解锁条件与进度推导（双端共用）
 │   │   ├── chat.py                 # 表情/评论预设、校验与限流常量（双端共用）
+│   │   ├── update_check.py         # GitHub Release 版本模型与版本号比较规则
 │   │   └── errors.py               # 共享错误类型
 │   └── client/
 │       ├── app.py                  # QApplication、配置、日志、主题字体、入口
@@ -273,6 +276,7 @@ Gomoku/
 │       ├── modal_overlay.py        # 窗口内模态遮罩层（弹窗不再新建窗口）
 │       ├── result_dialog.py        # 胜利/惜败/和棋自绘弹窗
 │       ├── confirm_dialog.py       # 返回主菜单/重新开局等古风确认弹窗
+│       ├── update_dialog.py        # 发现新版本弹窗（版本号/更新说明/前往下载）
 │       ├── sound_control.py        # 静音开关与音量滑块按钮
 │       ├── constants.py            # 应用/窗口/绘制主题常量
 │       ├── styles.py               # 全局 QSS
@@ -321,6 +325,7 @@ Gomoku/
 │       │   ├── game_history_api.py # 最近对局/单局棋谱异步 GET
 │       │   ├── report_api.py       # 举报提交与对局审计异步 REST
 │       │   ├── social_api.py       # 资料/头像/好友/私聊异步 REST
+│       │   ├── update_api.py       # GitHub Releases 最新版本异步 GET
 │       │   └── websocket_transport.py  # QtWebSocket WSS/WS 传输
 │       ├── board_geometry.py       # 棋盘直线几何与邻域候选
 │       ├── zobrist.py              # 确定性 Zobrist 哈希
@@ -367,7 +372,7 @@ Gomoku/
 │   ├── requirements*.txt
 │   ├── manage.py                   # 管理员重置密码
 │   └── README.md                   # 服务端安装、部署、PostgreSQL、TLS 说明
-├── tests/                          # 客户端 386 项自动化测试
+├── tests/                          # 客户端 455 项自动化测试
 ├── requirements.txt                # 客户端运行依赖（人工维护的版本范围）
 ├── requirements.lock               # 客户端运行依赖锁定（含哈希）
 ├── requirements-tools.txt          # ruff / mypy / coverage 工具依赖
@@ -572,6 +577,31 @@ $env:GOMOKU_WS_BASE_URL  = "wss://your-domain.example"
   - 悔棋后不自动让 AI 重下。
 - 快捷键：`Ctrl+Z` 悔棋，`Ctrl+N` 重新开局（仅在进入对局后生效）。
 - “返回主菜单”在已有落子时会确认放弃当前棋局；确认后回到主菜单，再次进入任何模式均为新对局。
+
+## 检查更新
+
+主菜单底部版本号下方有「检查更新」入口，点击后：
+
+1. 客户端向 GitHub Releases API 请求最新版本：
+   `https://api.github.com/repos/ckm6666/Gomoku/releases/latest`
+   （匿名访问有频率限制，60 次/小时/IP）。
+2. 本地比较版本号（`v` 前缀可选，预发布版排在正式版之前），并在窗口内弹窗：
+   - 已是最新版本：提示当前版本号；
+   - 有新版本：展示最新版本号、Windows 客户端压缩包文件名与更新说明摘要。
+3. 点「前往下载」会用系统默认浏览器打开该版本的 GitHub Release 页面，
+   由用户自行下载 `Gomoku-<版本>-windows-x64.zip`。
+
+要点：
+
+- **安装包不从游戏服务端下载**：版本元数据与安装包都来自 GitHub Releases，
+  服务端不可用也不影响更新检查；客户端只负责「发现」与「指引」，不下载、
+  不校验、也不替换本地文件。
+- 客户端只允许打开本仓库的发布页地址（`https://github.com/ckm6666/Gomoku/releases…`），
+  主机与路径都要匹配，避免被 API 响应里的异常地址引到别的站点。
+- 可选环境变量 `GOMOKU_GITHUB_TOKEN`：填入个人访问令牌（PAT）后请求带上
+  `Authorization` 头，可把频率限制提高到 5000 次/小时；该令牌只用于更新检查，
+  不参与任何游戏逻辑，也不会写进日志。
+- 检查完全由用户手动触发，客户端不会在启动时自动联网。
 
 ## 声音与音频缓存
 

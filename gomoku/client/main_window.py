@@ -24,10 +24,11 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Callable, Optional, Sequence
 
-from PySide6.QtCore import QPointF, Qt, QTimer
+from PySide6.QtCore import QPointF, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QCloseEvent,
     QColor,
+    QDesktopServices,
     QKeySequence,
     QPainter,
     QPainterPath,
@@ -58,6 +59,8 @@ from gomoku.client.constants import (
     APP_NAME,
     APP_TITLE,
     APP_VERSION,
+    GITHUB_RELEASES_PAGE_URL,
+    GITHUB_RELEASE_API_URL,
     WINDOW_DEFAULT_HEIGHT,
     WINDOW_DEFAULT_WIDTH,
     WINDOW_MIN_HEIGHT,
@@ -65,6 +68,7 @@ from gomoku.client.constants import (
     WINDOW_SCREEN_MARGIN,
 )
 from gomoku.client.modal_overlay import ModalOverlay, NoticeOverlay
+from gomoku.client.net.update_api import UpdateHTTPClient
 from gomoku.client.online_panel import OnlinePanel
 from gomoku.client.puzzle_bank import load_puzzle_bank
 from gomoku.client.puzzle_page import PuzzlePage
@@ -85,10 +89,18 @@ from gomoku.client.ui_theme import (
     InkBackdrop,
     RicePaperCard,
 )
+from gomoku.client.update_dialog import UpdateAvailableDialog
 from gomoku.shared.game_model import GameModel
 from gomoku.shared.puzzle import Puzzle
 from gomoku.shared.record import GameRecord
 from gomoku.shared.rules import Player
+from gomoku.shared.update_check import (
+    ReleaseInfo,
+    is_newer_version,
+    parse_version,
+    select_windows_asset,
+    summarize_notes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +267,22 @@ class MainWindow(QMainWindow):
         self._replay_return_page: Optional[QWidget] = None
         # 当前正在显示的窗口内模态层（终局弹窗/确认框），供测试定位。
         self._active_modal: Optional[ModalOverlay] = None
+
+        # 更新检查：版本信息只从 GitHub Releases 检索，安装包也由用户从
+        # 发布页下载，客户端不经过游戏服务端分发新版本。
+        self._update_client = UpdateHTTPClient(
+            api_url=GITHUB_RELEASE_API_URL,
+            token=self.config.github_token,
+            parent=self,
+        )
+        self._update_client.release_ready.connect(self._on_release_ready)
+        self._update_client.failed.connect(self._on_update_failed)
+        # 忙状态以客户端信号为准：请求被 abort 或内部提前返回时，客户端
+        # 只会发 busy_changed(False)，按钮不会永远停在“检查中…”。
+        self._update_client.busy_changed.connect(self._set_update_busy)
+        # 用户在更新弹窗里点了「前往下载」；弹窗关闭后才真正打开浏览器，
+        # 避免两个模态层叠在一起。
+        self._pending_download_url: Optional[str] = None
 
         # 对局配置：默认保持本地双人，切到人机模式后默认中等难度。
         self._game_mode = GameMode.LOCAL
@@ -632,7 +660,25 @@ class MainWindow(QMainWindow):
         version_label = QLabel(f"版本 {APP_VERSION}", page)
         version_label.setObjectName("menuVersion")
         version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(version_label)
+
+        # 更新检查入口：只查版本号，真正的下载交给用户在 GitHub 发布页完成。
+        self.update_button = QPushButton("检查更新", page)
+        self.update_button.setObjectName("menuLinkButton")
+        self.update_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_button.setAutoDefault(False)
+        self.update_button.setToolTip("从 GitHub Releases 检查是否有新版本")
+        self.update_button.setAccessibleName("检查更新")
+        self.update_button.clicked.connect(self._check_for_update)
+
+        version_row = QHBoxLayout()
+        version_row.setContentsMargins(0, 0, 0, 0)
+        version_row.addStretch(1)
+        version_row.addWidget(version_label)
+        version_row.addStretch(1)
+        layout.addLayout(version_row)
+        layout.addWidget(
+            self.update_button, 0, Qt.AlignmentFlag.AlignHCenter
+        )
         return page
 
     def _make_menu_button(
@@ -1552,11 +1598,146 @@ class MainWindow(QMainWindow):
         """在窗口内显示一条提示（不创建原生消息框窗口）。"""
         notice = NoticeOverlay(title, message, parent=self._overlay_host())
         self._active_modal = notice
+        # 提示也是一层模态遮罩：置位后终局弹窗会推迟显示，避免两个模态层
+        # 叠在一起（两个嵌套事件循环会让窗口关不掉）。
+        previous_modal_state = self._modal_dialog_open
+        self._modal_dialog_open = True
         try:
             notice.exec()
         finally:
+            self._modal_dialog_open = previous_modal_state
             notice.deleteLater()
             self._active_modal = None
+
+    # ------------------------------------------------------------------
+    # 更新检查（版本信息只来自 GitHub Releases）
+    # ------------------------------------------------------------------
+    def _check_for_update(self) -> None:
+        """从 GitHub Releases 检索最新版本。
+
+        只读取版本信息；安装包始终由用户从发布页自行下载，客户端不经过
+        游戏服务端分发新版本。
+        """
+        if self._closing or self._update_client.busy:
+            return
+        self._set_update_busy(True)
+        try:
+            started = self._update_client.check()
+        except Exception:  # pragma: no cover - 兜底：按钮不能永久卡住
+            logger.exception("更新检查发起失败")
+            started = False
+        if not started:
+            # check() 自身会发出 failed 信号，这里只需要恢复按钮状态。
+            self._set_update_busy(False)
+
+    def _set_update_busy(self, busy: bool) -> None:
+        """更新「检查更新」按钮的忙碌状态。"""
+        self.update_button.setEnabled(not busy)
+        self.update_button.setText("检查中…" if busy else "检查更新")
+
+    def _on_release_ready(self, release: ReleaseInfo) -> None:
+        """收到 GitHub 最新发布信息：比较版本号并给出提示。"""
+        self._set_update_busy(False)
+        if self._closing:
+            return
+        if self._active_modal is not None:
+            # 已经有别的模态层（例如终局弹窗）开着：等它关掉再弹，
+            # 两个嵌套事件循环叠在一起会让窗口无法关闭。
+            QTimer.singleShot(100, lambda: self._on_release_ready(release))
+            return
+
+        version = release.version
+        notes = release.notes
+        url = release.url
+
+        if parse_version(version) is None:
+            self._show_notice(
+                "检查更新",
+                f"无法识别远端版本号（{version or '空'}），"
+                f"当前版本 {APP_VERSION}。",
+            )
+            return
+
+        if not is_newer_version(version, APP_VERSION):
+            self._show_notice(
+                "检查更新", f"当前已是最新版本 {APP_VERSION}。"
+            )
+            return
+
+        dialog = UpdateAvailableDialog(
+            version=version,
+            current_version=APP_VERSION,
+            notes=summarize_notes(notes),
+            download_url=self._safe_release_url(url),
+            asset_name=self._windows_asset_name(release),
+            parent=self._overlay_host(),
+        )
+        self._pending_download_url = None
+        dialog.download_requested.connect(self._note_download_requested)
+        self._active_modal = dialog
+        # 与终局弹窗/确认框一样，打开模态层期间置位该标志：AI 继续走棋，
+        # 终局弹窗也会推迟到本弹窗关闭之后再显示。
+        self._modal_dialog_open = True
+        try:
+            dialog.exec()
+        finally:
+            self._modal_dialog_open = False
+            dialog.deleteLater()
+            self._active_modal = None
+
+        # 弹窗已经关闭，此时再打开浏览器，避免两个模态层同时存在。
+        pending = self._pending_download_url
+        self._pending_download_url = None
+        if pending:
+            self._open_release_page(pending)
+
+    def _on_update_failed(self, message: str) -> None:
+        """更新检查失败：恢复按钮并提示原因。"""
+        self._set_update_busy(False)
+        if self._closing:
+            return
+        if self._active_modal is not None:
+            QTimer.singleShot(100, lambda: self._on_update_failed(message))
+            return
+        self._show_notice("检查更新失败", message)
+
+    def _note_download_requested(self, url: str) -> None:
+        """记录用户的下载意图，等弹窗关闭后再打开浏览器。"""
+        self._pending_download_url = url
+
+    @staticmethod
+    def _safe_release_url(url: str) -> str:
+        """只放行本仓库的 GitHub 发布页地址。
+
+        地址来自 GitHub API 的响应，理论上可被劫持改写；这里既校验主机，
+        也校验路径，避免被诱导到 ``github.com`` 下的任意钓鱼页面。
+        """
+        candidate = (url or "").strip()
+        if not candidate:
+            return GITHUB_RELEASES_PAGE_URL
+        parsed = QUrl(candidate)
+        if parsed.scheme().lower() != "https":
+            return GITHUB_RELEASES_PAGE_URL
+        if parsed.host().lower() != "github.com":
+            return GITHUB_RELEASES_PAGE_URL
+        if not parsed.path().startswith("/ckm6666/Gomoku/releases"):
+            return GITHUB_RELEASES_PAGE_URL
+        return candidate
+
+    @staticmethod
+    def _windows_asset_name(release: ReleaseInfo) -> str:
+        """取发布里的 Windows 客户端压缩包文件名。"""
+        asset = select_windows_asset(release)
+        return asset.name if asset is not None else ""
+
+    def _open_release_page(self, url: str) -> None:
+        """用系统默认浏览器打开 GitHub 发布页。"""
+        target = self._safe_release_url(url)
+        if not QDesktopServices.openUrl(QUrl(target)):
+            logger.warning("无法打开发布页：%s", target)
+            self._show_notice(
+                "无法打开下载页", f"请手动访问：{target}"
+            )
 
     def active_modal(self) -> Optional[ModalOverlay]:
         """当前正在显示的窗口内模态层（测试用）。"""
@@ -1735,6 +1916,12 @@ class MainWindow(QMainWindow):
         modal = self._active_modal
         if modal is not None:
             modal.reject()
+        # 取消在途的更新请求：窗口正在关闭，此时收到响应再弹窗会让
+        # 进程卡在嵌套事件循环里出不来。
+        try:
+            self._update_client.abort()
+        except RuntimeError:
+            pass
         if self._online_panel is not None:
             try:
                 self._online_panel.shutdown()
