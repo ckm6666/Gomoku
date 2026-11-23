@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gomoku.client.frozen import is_frozen
 from gomoku.client.styles import APP_STYLE
 from gomoku.client.theme_palette import (
     CINNABAR,
@@ -76,7 +77,7 @@ BODY_FONT_FAMILY = "ZCOOL XiaoWei"
 
 def assets_root() -> Path:
     """返回客户端素材根目录；兼容源码与 PyInstaller 单文件。"""
-    if getattr(sys, "frozen", False):
+    if is_frozen():
         base = Path(
             getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)
         )

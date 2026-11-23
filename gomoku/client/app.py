@@ -104,6 +104,13 @@ def main() -> int:
         config.online_configured,
         log_path,
     )
+    if config.online_configured:
+        # 记录实际连向的入口，便于排查「朋友拿到 exe 连不上」这类问题。
+        logger.info(
+            "联机入口 api=%s ws=%s",
+            config.api_base_url,
+            config.ws_base_url,
+        )
     logger.info(
         "主题字体 families=%s body_fonts=%s assets=%s",
         theme_families,

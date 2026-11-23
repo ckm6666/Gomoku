@@ -13,7 +13,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Mapping, Optional
 
-from PySide6.QtCore import QSettings, QUrl, Qt, QTimer, Signal
+from PySide6.QtCore import QSettings, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -43,7 +43,7 @@ from gomoku.client.private_chat_panel import PrivateChatPanel
 from gomoku.client.profile_panel import AvatarPickerPanel, ProfilePanel
 from gomoku.client.report_panel import ReportPanel
 from gomoku.client.ui_theme import ONLINE_BACKDROP_SPEC, InkBackdrop
-from gomoku.client.config import AppConfig
+from gomoku.client.config import AppConfig, resolve_endpoints
 from gomoku.client.modal_overlay import NoticeOverlay
 from gomoku.client.net.game_history_api import GameHistoryHTTPClient
 from gomoku.client.net.report_api import ReportHTTPClient
@@ -322,25 +322,7 @@ class OnlinePanel(InkBackdrop):
     # ------------------------------------------------------------------
     def _resolve_urls(self) -> tuple[str, str]:
         """解析 REST/WS 地址；开发环境默认本机 8000 端口。"""
-        api = (self.config.api_base_url or "").rstrip("/")
-        ws_base = (self.config.ws_base_url or "").rstrip("/")
-        is_dev = self.config.environment.lower() in {
-            "development",
-            "dev",
-            "test",
-            "local",
-        }
-        if not api and is_dev:
-            api = "http://127.0.0.1:8000"
-        if not ws_base and api:
-            parsed = QUrl(api)
-            ws_scheme = "wss" if parsed.scheme() == "https" else "ws"
-            ws_base = f"{ws_scheme}://{parsed.authority()}"
-        if not ws_base:
-            return api, ""
-        if ws_base.endswith("/api/v1/ws"):
-            return api, ws_base
-        return api, ws_base + "/api/v1/ws"
+        return resolve_endpoints(self.config)
 
     # ------------------------------------------------------------------
     # 页面构建

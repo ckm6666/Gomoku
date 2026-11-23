@@ -279,6 +279,14 @@ $env:GOMOKU_WS_BASE_URL  = "wss://your-domain.example"
 Start-Process C:\Users\a1325\Desktop\Gomoku\dist\Gomoku.exe
 ```
 
+打包版（`dist\Gomoku.exe`）默认已经连上固定公网入口
+`https://gomoku-host.taild407ad.ts.net`，上面两个变量用于把它改指向你自己的
+服务端；源码运行（`main.py`）则必须显式设置才会联机。
+
+两个变量只设置其中一个也可以，客户端会按同源推导另一个（`https`↔`wss`、
+`http`↔`ws`，只取 scheme + 主机）。一旦显式设置了其中一个，客户端就不会再连
+内置公网入口。
+
 生产必须使用 HTTPS/WSS。WebSocket 地址可写服务根地址（会自动追加
 `/api/v1/ws`），也可以直接写完整 `/api/v1/ws`。
 
