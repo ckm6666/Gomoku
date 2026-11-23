@@ -116,6 +116,22 @@ QLabel#onlineClock {
     font-size: 12px;
 }
 
+/* 倒计时数字：单独放大显示，一眼就能看到还剩几秒。 */
+QLabel#onlineCountdown {
+    color: #7A3B22;
+    font-size: 26px;
+    font-weight: bold;
+    padding: 0 4px;
+    min-width: 44px;
+}
+
+/* 最后 10 秒：数字转红并加重，提醒玩家赶紧落子。 */
+QLabel#onlineCountdown[urgent="true"] {
+    color: #C0392B;
+    font-size: 32px;
+    font-weight: bold;
+}
+
 QLabel#rankBadge {
     color: #6B4725;
     background-color: #F1E4CC;
@@ -1309,13 +1325,16 @@ QLabel#friendPresence[online="true"] {
     color: #4F7A5A;
 }
 
+/* 未读提示是状态标记，不能长成按钮的样子：
+   行内按钮是实心朱砂块，未读用描边的浅底标签区分开。 */
 QLabel#friendUnread {
-    background-color: #9E3B2E;
-    color: #FBF7EE;
-    border-radius: 8px;
-    font-size: 10px;
+    background-color: #F7E7E1;
+    color: #9E3B2E;
+    border: 1px dashed #C4736A;
+    border-radius: 9px;
+    font-size: 11px;
     font-weight: bold;
-    padding: 1px 7px;
+    padding: 1px 8px;
 }
 
 QPushButton#socialPrimaryButton {

@@ -61,7 +61,7 @@ except ImportError:  # pragma: no cover - 仅在缺少 QtMultimedia 的裁剪环
 
 logger = logging.getLogger(__name__)
 
-SoundKind = Literal["move", "start", "win", "lose", "draw", "bgm"]
+SoundKind = Literal["move", "start", "win", "lose", "draw", "tick", "bgm"]
 
 SAMPLE_RATE: Final[int] = 22050
 SAMPLE_WIDTH: Final[int] = 2  # 16-bit PCM
@@ -76,7 +76,14 @@ SETTINGS_MUTED: Final[str] = "audio/muted"
 SETTINGS_BGM_VOLUME: Final[str] = "audio/bgm_volume"
 SETTINGS_SFX_VOLUME: Final[str] = "audio/sfx_volume"
 
-SFX_KINDS: Final[tuple[str, ...]] = ("move", "start", "win", "lose", "draw")
+SFX_KINDS: Final[tuple[str, ...]] = (
+    "move",
+    "start",
+    "win",
+    "lose",
+    "draw",
+    "tick",
+)
 
 # 用户提供的 MP3 素材；缺失时自动回退到程序化合成音效。
 ASSET_BGM: Final[str] = "bgm.mp3"
@@ -384,6 +391,32 @@ def _render_lose() -> bytes:
     return _to_wav_bytes(buffer, peak=0.5)
 
 
+def _render_tick() -> bytes:
+    """倒计时提示音：短促的“咚”（低频鼓点）。"""
+    duration = 0.24
+    buffer = [0.0] * int(duration * SAMPLE_RATE)
+    _add_sine_tone(
+        buffer,
+        start_sample=0,
+        freq_hz=196.0,
+        duration=duration,
+        amplitude=0.55,
+        partials=((1.0, 1.0), (1.58, 0.22)),
+        decay=15.0,
+        attack=0.002,
+        release=0.02,
+    )
+    # 敲击瞬间的噪声：让“咚”有明显的击打感而不是纯音提示。
+    noise = random.Random(6421)
+    burst_samples = int(0.012 * SAMPLE_RATE)
+    for index in range(burst_samples):
+        time_s = index / SAMPLE_RATE
+        buffer[index] += (
+            noise.uniform(-1.0, 1.0) * math.exp(-time_s / 0.0035) * 0.32
+        )
+    return _to_wav_bytes(buffer, peak=0.6)
+
+
 def _render_draw() -> bytes:
     """平局：中性、安静的两音提示。"""
     duration = 1.1
@@ -465,6 +498,8 @@ def synthesize_sound(
         return _render_lose()
     if kind == "draw":
         return _render_draw()
+    if kind == "tick":
+        return _render_tick()
     if kind == "bgm":
         return _render_bgm(
             duration_seconds if duration_seconds is not None else BGM_DURATION_SECONDS
@@ -913,6 +948,10 @@ class AudioManager(QObject):
     def play_draw(self) -> None:
         self._play_effect("draw")
 
+    def play_tick(self) -> None:
+        """倒计时“咚”提示音：最后几秒每秒一次。"""
+        self._play_effect("tick")
+
     def play_button(self) -> None:
         """UI 按钮点击音效（任意 QAbstractButton 按下时由事件过滤器调用）。"""
         self._play_effect("button")
@@ -1020,7 +1059,7 @@ class AudioManager(QObject):
             if button_path is not None:
                 effect_paths["button"] = button_path
 
-        for kind in ("start", "win", "lose", "draw"):
+        for kind in ("start", "win", "lose", "draw", "tick"):
             try:
                 effect_paths[kind] = ensure_cached_wav(kind, self._cache_dir)
             except Exception:

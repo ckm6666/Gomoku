@@ -306,6 +306,8 @@ class FriendsPanel(PaperPanel):
         )
         if online is not None:
             avatar.set_online(online)
+        # 未读条数挂在头像右上角的红点上，一眼就能看到还有多少条没读。
+        avatar.set_unread(unread)
         layout.addWidget(avatar)
 
         text_layout = QVBoxLayout()
@@ -324,8 +326,11 @@ class FriendsPanel(PaperPanel):
         layout.addLayout(text_layout, 1)
 
         if unread > 0:
+            # 未读提示是“状态”，不是操作按钮：样式与行内按钮明显区分开，
+            # 免得被当成可点的按钮。
             badge = QLabel(f"{unread} 条未读", frame)
             badge.setObjectName("friendUnread")
+            badge.setToolTip(f"有 {unread} 条未读消息，点击“聊天”查看")
             layout.addWidget(badge)
 
         for text, object_name, callback, lock_row in buttons:
