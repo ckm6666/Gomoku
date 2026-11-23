@@ -376,6 +376,7 @@ Gomoku/
 ├── requirements-dev.lock           # 开发/打包依赖锁定（含哈希）
 ├── pyproject.toml                  # ruff / mypy / coverage 配置
 ├── .github/workflows/ci.yml        # CI：lint、类型检查、双端测试、exe/镜像构建
+├── .github/workflows/release.yml   # 发布：打标签触发 exe 打包、镜像推送与 GitHub Release
 ├── docker-compose.yml              # 服务端 + PostgreSQL 生产取向编排
 ├── server/Dockerfile               # 服务端生产镜像
 ├── README.md                       # 本文件
@@ -658,9 +659,32 @@ server\.venv\Scripts\python.exe -m mypy gomoku/shared server/app
 ```
 
 GitHub Actions 会在 push/PR 时自动执行 ruff、mypy（shared + server）、
-Windows 客户端测试（Python 3.13/3.14）和 Linux 服务端测试（Python 3.13/3.14），
+Windows 客户端测试（Python 3.14）和 Linux 服务端测试（Python 3.14），
 并输出覆盖率、`dist/Gomoku.exe` 构建产物，以及 Docker 镜像启动/readiness
 smoke test；当前覆盖率基线约为客户端 71%、服务端 78%。
+
+### 发布流程
+
+`.github/workflows/release.yml` 在推送 `v*` 标签时自动发布：
+
+```bash
+# 1. 先把 gomoku/client/constants.py 的 APP_VERSION 改成目标版本号（如 1.13.0）
+# 2. 打标签并推送，标签会触发发布流水线
+git tag v1.13.0 && git push origin v1.13.0
+```
+
+流水线会依次：校验标签与 `APP_VERSION` 一致 → 跑 ruff/mypy 与双端测试 →
+PyInstaller 打包并冒烟校验版本号 → 生成 `Gomoku-<版本>-windows-x64.zip` →
+构建并推送服务端镜像到 GHCR → 创建 GitHub Release。
+
+镜像地址（GHCR 路径强制全小写）：
+
+```bash
+docker pull ghcr.io/ckm6666/gomoku/gomoku-server:1.13.0
+```
+
+也可以在 Actions 页面手动触发 `Release` 工作流；勾选 `dry_run` 时只构建与校验，
+不会推送镜像、也不会创建 Release。
 
 CI 安装依赖时使用带哈希的锁文件，避免同一提交在不同时间装出不同版本。修改
 `requirements*.txt` 或 `server/requirements.txt` 后，需要重新生成锁文件：
