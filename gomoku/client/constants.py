@@ -14,7 +14,7 @@ from typing import Final
 # ---------------------------------------------------------------------------
 APP_NAME: Final[str] = "五子棋"
 APP_TITLE: Final[str] = "五子棋 · 本地对弈与联机排位"
-APP_VERSION: Final[str] = "1.12.0"
+APP_VERSION: Final[str] = "1.13.0"
 APP_ORGANIZATION: Final[str] = "Gomoku"
 APP_STORAGE_NAME: Final[str] = "Gomoku"
 

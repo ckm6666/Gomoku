@@ -1,8 +1,8 @@
 """登录页“记住密码”的本地凭据保存。
 
-密码不会以明文写入磁盘：Windows 上使用 DPAPI（``CryptProtectData``）
-按当前 Windows 用户加密，密文复制到其他账户/机器无法解密。非 Windows
-平台不保存密码，只记住用户名。
+密码与 refresh token 都不会以明文写入磁盘：Windows 上使用 DPAPI
+（``CryptProtectData``）按当前 Windows 用户加密，密文复制到其他账户/
+机器无法解密。非 Windows 平台不保存密码或 token，只记住用户名。
 """
 
 from __future__ import annotations
@@ -22,9 +22,11 @@ logger = logging.getLogger(__name__)
 KEY_REMEMBER = "online/remember_password"
 KEY_USERNAME = "online/saved_username"
 KEY_PASSWORD = "online/saved_password"
+KEY_REFRESH_TOKEN = "online/refresh_token"
 
 _PREFIX = "dpapi:"
 _ENTROPY = b"gomoku-online-login-v1"
+_TOKEN_ENTROPY = b"gomoku-online-session-v1"
 _CRYPTPROTECT_UI_FORBIDDEN = 0x01
 
 
@@ -51,7 +53,9 @@ def _blob(data: bytes) -> Tuple[_DataBlob, ctypes.Array]:
     return blob, buffer
 
 
-def _dpapi(data: bytes, *, protect: bool) -> bytes:
+def _dpapi(
+    data: bytes, *, protect: bool, entropy: bytes = _ENTROPY
+) -> bytes:
     """调用 Windows DPAPI 加密/解密；失败时抛 ``OSError``。"""
     crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -79,7 +83,7 @@ def _dpapi(data: bytes, *, protect: bool) -> bytes:
     kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
 
     in_blob, in_buffer = _blob(data)
-    entropy_blob, entropy_buffer = _blob(_ENTROPY)
+    entropy_blob, entropy_buffer = _blob(entropy)
     out_blob = _DataBlob()
     # 保留缓冲区引用，直到 DPAPI 调用返回。
     _ = (in_buffer, entropy_buffer)
@@ -139,6 +143,67 @@ def unprotect_password(token: str) -> Optional[str]:
         return None
 
 
+def protect_refresh_token(token: str) -> Optional[str]:
+    """把 refresh token 加密成可写入 QSettings 的字符串。"""
+    if not token or sys.platform != "win32":
+        return None
+    try:
+        encrypted = _dpapi(
+            token.encode("utf-8"), protect=True, entropy=_TOKEN_ENTROPY
+        )
+    except OSError:
+        logger.exception("DPAPI 加密 refresh token 失败")
+        return None
+    return _PREFIX + base64.b64encode(encrypted).decode("ascii")
+
+
+def unprotect_refresh_token(value: str) -> Optional[str]:
+    """解密保存的 refresh token；数据损坏或平台不支持时返回 None。"""
+    if sys.platform != "win32" or not value.startswith(_PREFIX):
+        return None
+    try:
+        encrypted = base64.b64decode(
+            value[len(_PREFIX) :], validate=True
+        )
+        return _dpapi(
+            encrypted, protect=False, entropy=_TOKEN_ENTROPY
+        ).decode("utf-8")
+    except (OSError, ValueError, UnicodeDecodeError):
+        logger.warning("已保存的 refresh token 无法解密，已忽略。")
+        return None
+
+
+def save_refresh_token(settings: QSettings, token: str) -> bool:
+    """保存 refresh token；返回是否已安全加密保存。"""
+    protected = protect_refresh_token(token)
+    if protected is None:
+        settings.remove(KEY_REFRESH_TOKEN)
+        settings.sync()
+        return False
+    settings.setValue(KEY_REFRESH_TOKEN, protected)
+    settings.sync()
+    return True
+
+
+def load_refresh_token(settings: QSettings) -> str:
+    """读取 refresh token；密文失效时删除并返回空串。"""
+    protected = settings.value(KEY_REFRESH_TOKEN, "", type=str) or ""
+    if not protected:
+        return ""
+    token = unprotect_refresh_token(protected)
+    if token is None:
+        settings.remove(KEY_REFRESH_TOKEN)
+        settings.sync()
+        return ""
+    return token
+
+
+def clear_refresh_token(settings: QSettings) -> None:
+    """删除已保存的 refresh token。"""
+    settings.remove(KEY_REFRESH_TOKEN)
+    settings.sync()
+
+
 def save_login(
     settings: QSettings, username: str, password: str
 ) -> bool:
@@ -178,19 +243,30 @@ def load_login(settings: QSettings) -> Tuple[bool, str, str]:
 
 
 def clear_login(settings: QSettings) -> None:
-    """删除已保存的登录信息。"""
-    for key in (KEY_REMEMBER, KEY_USERNAME, KEY_PASSWORD):
+    """删除已保存的登录信息与 refresh token。"""
+    for key in (
+        KEY_REMEMBER,
+        KEY_USERNAME,
+        KEY_PASSWORD,
+        KEY_REFRESH_TOKEN,
+    ):
         settings.remove(key)
     settings.sync()
 
 
 __all__ = [
     "KEY_PASSWORD",
+    "KEY_REFRESH_TOKEN",
     "KEY_REMEMBER",
     "KEY_USERNAME",
     "clear_login",
+    "clear_refresh_token",
     "load_login",
+    "load_refresh_token",
     "protect_password",
+    "protect_refresh_token",
     "save_login",
+    "save_refresh_token",
     "unprotect_password",
+    "unprotect_refresh_token",
 ]

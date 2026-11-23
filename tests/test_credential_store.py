@@ -20,10 +20,15 @@ from PySide6.QtCore import QSettings  # noqa: E402
 
 from gomoku.client.credential_store import (  # noqa: E402
     clear_login,
+    clear_refresh_token,
     load_login,
+    load_refresh_token,
     protect_password,
+    protect_refresh_token,
     save_login,
+    save_refresh_token,
     unprotect_password,
+    unprotect_refresh_token,
 )
 
 
@@ -64,6 +69,47 @@ class CredentialStoreTests(unittest.TestCase):
         else:
             self.assertFalse(saved)
             self.assertEqual(password, "")
+
+    @unittest.skipUnless(
+        sys.platform == "win32", "DPAPI 仅在 Windows 上可用"
+    )
+    def test_refresh_token_roundtrip_is_encrypted(self) -> None:
+        token = protect_refresh_token("refresh-token-value")
+        self.assertIsNotNone(token)
+        assert token is not None
+        self.assertTrue(token.startswith("dpapi:"))
+        self.assertNotIn("refresh-token-value", token)
+        self.assertEqual(
+            unprotect_refresh_token(token), "refresh-token-value"
+        )
+
+    def test_save_and_load_refresh_token(self) -> None:
+        saved = save_refresh_token(self.settings, "refresh-pass")
+        loaded = load_refresh_token(self.settings)
+        if sys.platform == "win32":
+            self.assertTrue(saved)
+            self.assertEqual(loaded, "refresh-pass")
+        else:
+            self.assertFalse(saved)
+            self.assertEqual(loaded, "")
+
+    def test_clear_refresh_token_removes_value(self) -> None:
+        save_refresh_token(self.settings, "refresh-pass")
+        clear_refresh_token(self.settings)
+        self.assertEqual(load_refresh_token(self.settings), "")
+
+    def test_undecryptable_refresh_token_is_cleared(self) -> None:
+        self.settings.setValue("online/refresh_token", "dpapi:bm90LWRwYXBp")
+        self.settings.sync()
+        self.assertEqual(load_refresh_token(self.settings), "")
+        self.assertEqual(
+            self.settings.value("online/refresh_token", "", type=str), ""
+        )
+
+    def test_clear_login_removes_saved_refresh_token(self) -> None:
+        save_refresh_token(self.settings, "refresh-pass")
+        clear_login(self.settings)
+        self.assertEqual(load_refresh_token(self.settings), "")
 
     def test_clear_removes_saved_login(self) -> None:
         save_login(self.settings, "alice", "s3cret-pass")

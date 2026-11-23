@@ -61,8 +61,11 @@ from gomoku.client.online_pages.common import (
 )
 from gomoku.client.credential_store import (
     clear_login,
+    clear_refresh_token,
     load_login,
+    load_refresh_token,
     save_login,
+    save_refresh_token,
 )
 from gomoku.client.online_player_card import OnlinePlayerCard
 from gomoku.client.online_pages.plaza_page import PlazaPage
@@ -154,6 +157,7 @@ class OnlinePanel(InkBackdrop):
         self.config = config or AppConfig()
         self._closing = False
         self._logging_out = False
+        self._restoring_session = False
         self._auth_session: Optional[AuthSession] = None
         self._transport: Optional[QtWebSocketTransport] = None
         self._session: Optional[OnlineGameSession] = None
@@ -316,6 +320,8 @@ class OnlinePanel(InkBackdrop):
         self._load_saved_login()
         self._show_auth_page()
         self._refresh_auth_availability()
+        # 等界面构建完成后再尝试静默恢复登录，避免阻塞构造过程。
+        QTimer.singleShot(0, self._try_restore_session)
 
     # ------------------------------------------------------------------
     # 地址
@@ -1764,6 +1770,39 @@ class OnlinePanel(InkBackdrop):
             self.password_edit.setText(password)
         self.remember_password_checkbox.setChecked(remember)
 
+    def _try_restore_session(self) -> None:
+        """启动时用已保存的 refresh token 静默恢复登录。"""
+        if (
+            self._closing
+            or self._restoring_session
+            or self._auth_session is not None
+            or not self.config.online_configured
+            or not self.remember_password_checkbox.isChecked()
+        ):
+            return
+        token = load_refresh_token(self._settings)
+        if not token:
+            return
+        self._restoring_session = True
+        self._set_auth_status("正在恢复登录…")
+        self._set_auth_form_busy(True)
+        if not self._auth_client.refresh(token):
+            if self._restoring_session:
+                self._restoring_session = False
+                self._set_auth_form_busy(False)
+                self._set_auth_status("")
+
+    def _save_refresh_token(self, token: str) -> None:
+        """按“记住密码”状态保存或清除 refresh token。"""
+        if not self.remember_password_checkbox.isChecked():
+            clear_refresh_token(self._settings)
+            return
+        if not save_refresh_token(self._settings, token):
+            logger.warning(
+                "refresh token 无法通过 DPAPI 安全保存，"
+                "下次启动需要重新登录"
+            )
+
     def _restore_saved_login(self) -> None:
         """回到登录页时重新填入已保存的密码。
 
@@ -1818,15 +1857,22 @@ class OnlinePanel(InkBackdrop):
         elif self.stack.currentWidget() is self.auth_page:
             self._set_auth_form_busy(False)
 
-    def _on_auth_session_ready(self, session: AuthSession) -> None:
+    def _on_auth_session_ready(
+        self, session: AuthSession, *, restored: bool = False
+    ) -> None:
         self._auth_session = session
         self._logging_out = False
         self._reconnect_attempts = 0
         # 密码编辑框马上就要清空；先按用户的选择保存凭据。
         warning = self._save_saved_login(session.user.username)
+        self._save_refresh_token(session.refresh_token)
         self.password_edit.clear()
         self._clear_profile_ui()
-        status = "登录成功，正在连接游戏服务器…"
+        status = (
+            "已恢复登录，正在连接游戏服务器…"
+            if restored
+            else "登录成功，正在连接游戏服务器…"
+        )
         if warning:
             status = f"{status}（{warning}）"
         self._set_auth_status(status)
@@ -1835,6 +1881,13 @@ class OnlinePanel(InkBackdrop):
 
     def _on_auth_session_refreshed(self, session: AuthSession) -> None:
         self._auth_session = session
+        if self._restoring_session:
+            self._restoring_session = False
+            # _on_auth_session_ready 会保存凭据与轮换后的 token。
+            self._on_auth_session_ready(session, restored=True)
+            return
+        # 服务端每次刷新都会轮换 refresh token，必须同步保存新值。
+        self._save_refresh_token(session.refresh_token)
         if self._reconnect_after_refresh:
             self._reconnect_after_refresh = False
             self._open_transport(reset_status=False)
@@ -1844,6 +1897,21 @@ class OnlinePanel(InkBackdrop):
         self._update_rating_summary()
 
     def _on_http_failed(self, message: str) -> None:
+        if self._restoring_session:
+            self._restoring_session = False
+            status = self._auth_client.last_error_status
+            if status in (401, 403):
+                clear_refresh_token(self._settings)
+                self._set_auth_status(
+                    "自动登录已失效，请重新登录", error=True
+                )
+            else:
+                # 网络暂时不可用时保留 token，下次启动还能再试。
+                self._set_auth_status(
+                    "无法自动恢复登录，请手动登录", error=True
+                )
+            self._set_auth_form_busy(False)
+            return
         if self._reconnect_after_refresh:
             self._reconnect_after_refresh = False
             self._force_relogin(message)
@@ -1880,6 +1948,7 @@ class OnlinePanel(InkBackdrop):
         self._social_client.abort_all()
         self._auth_client.logout()
         self._auth_session = None
+        clear_refresh_token(self._settings)
         self._close_social_windows()
         self._clear_profile_ui()
         self._show_auth_page()
@@ -1888,6 +1957,7 @@ class OnlinePanel(InkBackdrop):
     def _on_logged_out(self) -> None:
         self._logging_out = False
         self._auth_session = None
+        clear_refresh_token(self._settings)
         self._profile_client.abort_all()
         self._history_client.abort_all()
         self._live_client.abort_all()
@@ -2058,6 +2128,7 @@ class OnlinePanel(InkBackdrop):
         self._live_client.abort_all()
         self._social_client.abort_all()
         self._auth_session = None
+        clear_refresh_token(self._settings)
         self._close_social_windows()
         self._clear_profile_ui()
         self._show_auth_page()
