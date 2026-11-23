@@ -6,7 +6,8 @@
 1. 版本号解析与比较（支持 ``v`` 前缀与 ``-beta.1`` 之类的预发布后缀）；
 2. 解析自家服务端下发的更新清单 JSON；
 3. 计算 / 校验文件的 SHA-256 摘要；
-4. 把字节数格式化成中文用户熟悉的体积字符串。
+4. 把字节数格式化成中文用户熟悉的体积字符串；
+5. 更新地址的安全策略：只放行 HTTPS（本机回环地址除外）。
 
 真正的网络下载与替换安装逻辑分别由调用方与
 :mod:`gomoku.client.update_installer` 负责。
@@ -257,7 +258,9 @@ def parse_manifest(payload: Any) -> UpdateInfo:
     * 体积：``size`` 或 ``size_bytes``；
     * 更新说明：``notes`` 或 ``release_notes``。
 
-    无法解析时抛出 ``ValueError``。
+    下载地址必须满足安全策略：HTTPS，或本机回环地址（开发自测）。
+    不满足时抛出 :class:`InsecureUrlError`；其余无法解析的情况抛出
+    ``ValueError``。
     """
     if not isinstance(payload, Mapping):
         raise ValueError("更新清单必须是 JSON 对象")
