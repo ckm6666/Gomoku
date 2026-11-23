@@ -23,22 +23,7 @@ feat(client): 主菜单新增检查更新入口
 
 ## 2. Pull request (Chinese text)
 
-- The PR title follows the commit format (English type/scope, Chinese summary).
-- The body is written in Chinese and contains these three sections:
-
-  ```markdown
-  ## 变更内容
-  （本次改动做了什么，1~3 条）
-
-  ## 影响范围
-  （客户端 / 服务端 / 协议 / 部署配置；无则写「无」）
-
-  ## 验证方式
-  （跑了哪些测试、命令，以及手工验证步骤）
-  ```
-
-- Reference issues at the end of the body with `Closes #123`.
-- Open PRs against `main`, and keep one PR scoped to a single problem.
+- PR titles and bodies are written in Chinese; their content and structure are unconstrained.
 
 ## 3. Push
 
