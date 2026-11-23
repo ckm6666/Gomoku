@@ -19,6 +19,7 @@ from PySide6.QtCore import QObject, Signal
 
 from gomoku.client.board_view import BoardView
 from gomoku.client.sessions.base import GameSession
+from gomoku.client.sessions.online_state import OnlineSessionPhase
 from gomoku.client.transport import Transport
 from gomoku.shared.achievements import normalize_achievement_keys
 from gomoku.shared.chat import (
@@ -27,6 +28,10 @@ from gomoku.shared.chat import (
     CHAT_KIND_TEXT,
     build_chat_payload,
     parse_chat_message,
+)
+from gomoku.shared.capabilities import (
+    CLIENT_CAPABILITIES,
+    normalize_capabilities,
 )
 from gomoku.shared.errors import ProtocolError, TransportError
 from gomoku.shared.protocol import (
@@ -147,6 +152,7 @@ class OnlineGameSession(GameSession):
         self._view = _empty_view()
         self._snapshot: Optional[GameSnapshot] = None
         self._authenticated = False
+        self._server_capabilities: frozenset[str] = frozenset()
         self._user_id = ""
         self._username = ""
         self._room_code = ""
@@ -168,6 +174,10 @@ class OnlineGameSession(GameSession):
         self._undo_requester_id = ""
         self._undo_requester_name = ""
         self._pending_undo_request_id: Optional[str] = None
+        self._undo_remaining = 0
+        self._undo_limit = 0
+        self._undo_cooldown_seconds = 0
+        self._undo_cooldown_deadline: Optional[float] = None
         self._last_state_version = 0
         self._queued = False
         self._queue_size = 0
@@ -193,6 +203,38 @@ class OnlineGameSession(GameSession):
     @property
     def is_authenticated(self) -> bool:
         return self._authenticated
+
+    @property
+    def is_connected(self) -> bool:
+        return (
+            self._authenticated
+            and not self._disconnected
+            and not self._closed
+        )
+
+    @property
+    def phase(self) -> OnlineSessionPhase:
+        """当前界面阶段；连接断开由 :attr:`is_connected` 单独表达。"""
+        if self._closed:
+            return OnlineSessionPhase.CLOSED
+        if not self._authenticated:
+            return OnlineSessionPhase.CONNECTING
+        if self._spectating:
+            return OnlineSessionPhase.SPECTATING
+        if self._active:
+            return OnlineSessionPhase.PLAYING
+        if self._waiting:
+            return OnlineSessionPhase.WAITING
+        if self._queued:
+            return OnlineSessionPhase.QUEUED
+        return OnlineSessionPhase.LOBBY
+
+    @property
+    def server_capabilities(self) -> frozenset[str]:
+        return self._server_capabilities
+
+    def supports(self, capability: str) -> bool:
+        return capability in self._server_capabilities
 
     @property
     def user_id(self) -> str:
@@ -287,6 +329,29 @@ class OnlineGameSession(GameSession):
     @property
     def undo_requester_name(self) -> str:
         return self._undo_requester_name
+
+    @property
+    def undo_remaining(self) -> int:
+        return max(0, self._undo_remaining)
+
+    @property
+    def undo_limit(self) -> int:
+        return max(0, self._undo_limit)
+
+    @property
+    def undo_cooldown_seconds(self) -> int:
+        return max(0, self._undo_cooldown_seconds)
+
+    @property
+    def undo_cooldown_remaining(self) -> int:
+        """距离下次可请求悔棋的剩余秒数（向上取整）。"""
+        deadline = self._undo_cooldown_deadline
+        if deadline is None:
+            return 0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return 0
+        return int(remaining + 0.999)
 
     @property
     def queued(self) -> bool:
@@ -386,6 +451,9 @@ class OnlineGameSession(GameSession):
             self.accepts_human_input
             and self._opponent_online
             and self._has_your_stone()
+            and self._undo_limit > 0
+            and self._undo_remaining > 0
+            and self.undo_cooldown_remaining == 0
         )
 
     def _has_your_stone(self) -> bool:
@@ -411,13 +479,24 @@ class OnlineGameSession(GameSession):
         if self._closed:
             return False
         return self._send(
-            make_message(CLIENT_AUTH, {"access_token": access_token})
+            make_message(
+                CLIENT_AUTH,
+                {
+                    "access_token": access_token,
+                    "capabilities": sorted(CLIENT_CAPABILITIES),
+                },
+            )
         )
 
-    def create_room(self) -> bool:
+    def create_room(self, allow_spectators: bool = True) -> bool:
         if not self._authenticated or self._closed:
             return False
-        return self._send(make_message(CLIENT_CREATE_ROOM, {}))
+        return self._send(
+            make_message(
+                CLIENT_CREATE_ROOM,
+                {"allow_spectators": bool(allow_spectators)},
+            )
+        )
 
     def join_room(self, code: str) -> bool:
         if not self._authenticated or self._closed:
@@ -700,6 +779,10 @@ class OnlineGameSession(GameSession):
         self._undo_requester_id = ""
         self._undo_requester_name = ""
         self._pending_undo_request_id = None
+        self._undo_remaining = 0
+        self._undo_limit = 0
+        self._undo_cooldown_seconds = 0
+        self._undo_cooldown_deadline = None
         self._last_state_version = 0
         self._queued = False
         self._queue_size = 0
@@ -788,6 +871,14 @@ class OnlineGameSession(GameSession):
         self._disconnected = False
         self._user_id = user_id
         self._username = username
+        try:
+            server_capabilities = frozenset(
+                normalize_capabilities(payload.get("capabilities", ()))
+            )
+        except ProtocolError as exc:
+            logger.warning("服务器能力声明非法：%s", exc)
+            server_capabilities = frozenset()
+        self._server_capabilities = server_capabilities
         self._reset_room_state()
         rating = user.get("rating")
         avatar_version = user.get("avatar_version", 0)
@@ -812,6 +903,7 @@ class OnlineGameSession(GameSession):
                     rating if isinstance(rating, int) else None
                 ),
                 "rank_name": user.get("rank_name", ""),
+                "capabilities": sorted(server_capabilities),
             }
         )
         self.state_changed.emit()
@@ -837,6 +929,10 @@ class OnlineGameSession(GameSession):
         self._undo_requester_id = ""
         self._undo_requester_name = ""
         self._pending_undo_request_id = None
+        self._undo_remaining = 0
+        self._undo_limit = 0
+        self._undo_cooldown_seconds = 0
+        self._undo_cooldown_deadline = None
         self._last_state_version = 0
         self._queued = False
         self._queue_size = 0
@@ -917,6 +1013,21 @@ class OnlineGameSession(GameSession):
         else:
             self._undo_requester_name = ""
             self._pending_undo_request_id = None
+        self._undo_remaining = snapshot.undo_remaining
+        self._undo_limit = snapshot.undo_limit
+        self._undo_cooldown_seconds = snapshot.undo_cooldown_seconds
+        if (
+            snapshot.undo_cooldown_until_ms is not None
+            and snapshot.server_now_ms is not None
+        ):
+            remaining = max(
+                0,
+                snapshot.undo_cooldown_until_ms
+                - snapshot.server_now_ms,
+            ) / 1000.0
+            self._undo_cooldown_deadline = time.monotonic() + remaining
+        else:
+            self._undo_cooldown_deadline = None
         self._opponent_online = (
             snapshot.opponent_online
             if snapshot.opponent_online is not None
@@ -1085,6 +1196,10 @@ class OnlineGameSession(GameSession):
         self._undo_requester_id = ""
         self._undo_requester_name = ""
         self._pending_undo_request_id = None
+        self._undo_remaining = 0
+        self._undo_limit = 0
+        self._undo_cooldown_seconds = 0
+        self._undo_cooldown_deadline = None
         self._last_state_version = 0
         self._opponent_username = (
             opponent_name if isinstance(opponent_name, str) else ""

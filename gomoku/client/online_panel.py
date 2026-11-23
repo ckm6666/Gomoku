@@ -13,20 +13,12 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Mapping, Optional
 
-from PySide6.QtCore import QSettings, QSize, QUrl, Qt, QTimer, Signal
+from PySide6.QtCore import QSettings, QUrl, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView,
-    QFrame,
-    QGridLayout,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
-    QLineEdit,
     QPushButton,
-    QScrollArea,
-    QSizePolicy,
     QStackedWidget,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -35,7 +27,6 @@ from PySide6.QtWidgets import (
 from gomoku.client.achievement_widgets import (
     AchievementPanel,
     achievement_names,
-    achievement_pixmap,
 )
 from gomoku.client.audio import get_audio_manager
 from gomoku.client.auth import AuthSession
@@ -43,42 +34,40 @@ from gomoku.client.avatar_images import (
     avatar_image_cache,
     configure_avatar_images,
 )
-from gomoku.client.avatar_widgets import AvatarButton, avatar_icon
-from gomoku.client.board_view import BoardView
-from gomoku.client.chat_widgets import (
-    ChatLogPanel,
-    EmojiPickerButton,
-    PresetCommentButton,
-)
+from gomoku.client.avatar_widgets import avatar_icon
 from gomoku.client.confirm_dialog import ConfirmDialog
 from gomoku.client.friends_panel import FriendsPanel
 from gomoku.client.history_records import record_from_game_detail
 from gomoku.client.net.social_api import SocialHTTPClient
 from gomoku.client.private_chat_panel import PrivateChatPanel
 from gomoku.client.profile_panel import AvatarPickerPanel, ProfilePanel
-from gomoku.client.sandbox_panel import SandboxPanel
 from gomoku.client.ui_theme import ONLINE_BACKDROP_SPEC, InkBackdrop
-from gomoku.client.board_widget import BoardWidget
 from gomoku.client.config import AppConfig
-from gomoku.client.danmaku import DanmakuOverlay
 from gomoku.client.modal_overlay import NoticeOverlay
 from gomoku.client.net.game_history_api import GameHistoryHTTPClient
 from gomoku.client.net.http_api import AuthHTTPClient
 from gomoku.client.net.profile_api import ProfileHTTPClient
 from gomoku.client.net.websocket_transport import QtWebSocketTransport
-from gomoku.client.sessions.online import OnlineGameSession
-from gomoku.client.sound_control import SoundButton
-from gomoku.shared.achievements import (
-    ACHIEVEMENT_BY_KEY,
-    MATCH_MEDAL_LIMIT,
-    normalize_achievement_keys,
-    top_achievement_keys,
+from gomoku.client.online_pages import (
+    build_auth_page,
+    build_game_page,
+    build_lobby_page,
 )
+from gomoku.client.online_pages.common import (
+    CHAT_INPUT_HINT,
+    online_victory_notice,
+)
+from gomoku.client.online_player_card import OnlinePlayerCard
+from gomoku.client.online_pages.plaza_page import PlazaPage
+from gomoku.client.sessions.online import OnlineGameSession
+from gomoku.client.sessions.online_state import OnlineSessionPhase
+from gomoku.client.sound_control import SoundButton
+from gomoku.shared.achievements import normalize_achievement_keys
 from gomoku.shared.avatar import normalize_avatar
+from gomoku.shared.capabilities import CAP_ROOM_OPTIONS
 from gomoku.shared.chat import (
     CHAT_KIND_EMOJI,
     CHAT_KIND_TEXT,
-    MAX_COMMENT_LENGTH,
     ChatMessage,
 )
 from gomoku.shared.errors import TransportError
@@ -89,47 +78,12 @@ from gomoku.shared.social import DirectMessage, FriendEvent
 
 logger = logging.getLogger(__name__)
 
-#: 输入框的常规占位提示。
-CHAT_INPUT_HINT = "说点什么…（回车发送）"
 #: 对话日志展开状态在 QSettings 里的键名。
 SETTINGS_CHAT_LOG_VISIBLE = "chat_log_visible"
-#: 观战列表最多展示的对局条数，避免大厅页面被拉得过长。
-MAX_LIVE_GAME_ROWS = 10
 
 _EMPTY_BOARD: tuple[tuple[Cell, ...], ...] = tuple(
     tuple(None for _ in range(BOARD_SIZE)) for _ in range(BOARD_SIZE)
 )
-
-
-def _empty_view() -> BoardView:
-    return BoardView(
-        board=_EMPTY_BOARD,
-        current_player=Player.BLACK,
-        last_move=None,
-        winner=None,
-        winning_line=(),
-        is_draw=False,
-        is_game_over=False,
-        move_count=0,
-    )
-
-
-def online_victory_notice(
-    snapshot: Optional[GameSnapshot],
-) -> Optional[tuple[str, str]]:
-    """对手认输或逃跑且己方获胜时，返回胜利弹窗的标题与正文。"""
-    if snapshot is None or not snapshot.is_game_over:
-        return None
-    if snapshot.is_spectator:
-        # 观战者不是对局双方，不能收到“你获胜”的弹窗。
-        return None
-    if snapshot.winner is None or snapshot.winner is not snapshot.your_color:
-        return None
-    if snapshot.result_reason == "resign":
-        return ("对手认输", "对方认输，你获胜！")
-    if snapshot.result_reason == "escape":
-        return ("对手逃跑", "对方逃跑，你获胜！")
-    return None
 
 
 def _format_game_time(value: object) -> str:
@@ -160,124 +114,6 @@ def _entry_avatar_version(entry: Mapping) -> int:
     if isinstance(value, int) and not isinstance(value, bool) and value > 0:
         return value
     return 0
-
-
-class OnlinePlayerCard(QFrame):
-    """在线对局身份卡，可随再战交换黑白更新颜色。"""
-
-    profile_requested = Signal(str)
-
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.setObjectName("playerCard")
-        self.setProperty("active", "false")
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setMinimumHeight(58)
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(12)
-
-        self.avatar_button = AvatarButton("", "", 36, self)
-        self.avatar_button.clicked_id.connect(self.profile_requested)
-
-        self._stone = QLabel(self)
-        self._stone.setObjectName("stoneBadgeBlack")
-        self._stone.setFixedSize(26, 26)
-        self._stone.setAttribute(
-            Qt.WidgetAttribute.WA_StyledBackground, True
-        )
-        self._stone.setAccessibleName("棋子颜色")
-
-        text_layout = QVBoxLayout()
-        text_layout.setContentsMargins(0, 0, 0, 0)
-        text_layout.setSpacing(0)
-        name_row = QHBoxLayout()
-        name_row.setContentsMargins(0, 0, 0, 0)
-        name_row.setSpacing(4)
-        self._name = QLabel("玩家", self)
-        self._name.setObjectName("playerName")
-        self._medal_row = QHBoxLayout()
-        self._medal_row.setContentsMargins(0, 0, 0, 0)
-        self._medal_row.setSpacing(3)
-        name_row.addWidget(self._name)
-        name_row.addLayout(self._medal_row)
-        name_row.addStretch(1)
-        self._caption = QLabel("等待", self)
-        self._caption.setObjectName("playerCaption")
-        text_layout.addLayout(name_row)
-        text_layout.addWidget(self._caption)
-        self._achievement_keys: tuple[str, ...] = ()
-
-        layout.addWidget(
-            self.avatar_button, 0, Qt.AlignmentFlag.AlignVCenter
-        )
-        layout.addWidget(self._stone, 0, Qt.AlignmentFlag.AlignVCenter)
-        layout.addLayout(text_layout, 1)
-
-    def set_content(
-        self,
-        name: str,
-        color: Player,
-        active: bool,
-        status: str,
-        rating: Optional[int] = None,
-        avatar: str = "",
-        user_id: str = "",
-        avatar_version: int = 0,
-        achievements: tuple[str, ...] = (),
-    ) -> None:
-        self.avatar_button.set_avatar(
-            avatar, user_id, max(0, int(avatar_version))
-        )
-        self._set_achievements(achievements)
-        badge_name = (
-            "stoneBadgeBlack" if color is Player.BLACK else "stoneBadgeWhite"
-        )
-        if self._stone.objectName() != badge_name:
-            self._stone.setObjectName(badge_name)
-            self._stone.style().unpolish(self._stone)
-            self._stone.style().polish(self._stone)
-
-        self._name.setText(name or "玩家")
-        color_text = "执黑，先手" if color is Player.BLACK else "执白，后手"
-        rating_text = f"积分 {rating}，" if rating is not None else ""
-        self._caption.setText(f"{color_text}，{rating_text}{status}")
-
-        active_value = "true" if active else "false"
-        if self.property("active") != active_value:
-            self.setProperty("active", active_value)
-            for widget in (self, self._name, self._caption):
-                widget.style().unpolish(widget)
-                widget.style().polish(widget)
-            self.update()
-
-    def _set_achievements(self, achievements: object) -> None:
-        """在名字右侧显示最稀有的几枚成就勋章。"""
-        keys = top_achievement_keys(
-            normalize_achievement_keys(achievements),
-            MATCH_MEDAL_LIMIT,
-        )
-        if keys == self._achievement_keys:
-            return
-        self._achievement_keys = keys
-        while self._medal_row.count():
-            item = self._medal_row.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
-        for key in keys:
-            spec = ACHIEVEMENT_BY_KEY.get(key)
-            if spec is None:
-                continue
-            badge = QLabel(self)
-            badge.setPixmap(
-                achievement_pixmap(spec, 20, self.devicePixelRatioF())
-            )
-            badge.setFixedSize(20, 20)
-            badge.setToolTip(f"{spec.name} · {spec.description}")
-            self._medal_row.addWidget(badge)
 
 
 class OnlinePanel(InkBackdrop):
@@ -496,15 +332,26 @@ class OnlinePanel(InkBackdrop):
 
         self.stack = QStackedWidget(self)
         self.stack.setObjectName("onlineStack")
-        self.auth_page = self._build_auth_page()
-        self.lobby_page = self._build_lobby_page()
-        self.plaza_page = self._build_plaza_page()
-        self.game_page = self._build_game_page()
+        self.auth_page = build_auth_page(self)
+        self.lobby_page = build_lobby_page(self)
+        self.plaza_page = PlazaPage(self)
+        self.game_page = build_game_page(self)
         self.stack.addWidget(self.auth_page)
         self.stack.addWidget(self.lobby_page)
         self.stack.addWidget(self.plaza_page)
         self.stack.addWidget(self.game_page)
         root.addWidget(self.stack)
+
+        # 兼容既有测试/调用方：广场页内部控件仍可从面板访问。
+        self.refresh_live_button = self.plaza_page.refresh_live_button
+        self.live_games_container = self.plaza_page.live_games_container
+        self.live_games_layout = self.plaza_page.live_games_layout
+        self.live_status_label = self.plaza_page.live_status_label
+        self.plaza_status_label = self.plaza_page.plaza_status_label
+        self.plaza_back_button = self.plaza_page.plaza_back_button
+        self.plaza_page.refresh_requested.connect(self._on_refresh_live)
+        self.plaza_page.back_requested.connect(self._on_plaza_back)
+        self.plaza_page.watch_requested.connect(self._on_watch_game)
 
     def _on_back_clicked(self) -> None:
         """“返回主菜单”按钮：交由主窗口切页。"""
@@ -517,708 +364,6 @@ class OnlinePanel(InkBackdrop):
             return False
         return bool(session.room_code) or session.queued
 
-    def _make_centered_card_page(self, card: QFrame) -> QWidget:
-        page = QWidget(self)
-        page.setObjectName("onlinePage")
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.addStretch(1)
-        layout.addWidget(card, 0, Qt.AlignmentFlag.AlignHCenter)
-        layout.addStretch(1)
-        return page
-
-    def _build_auth_page(self) -> QWidget:
-        card = QFrame(self)
-        card.setObjectName("onlineCard")
-        card.setMaximumWidth(470)
-        card.setSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
-        )
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(28, 24, 28, 24)
-        card_layout.setSpacing(9)
-
-        title = QLabel("五子棋 - 联机对战", card)
-        title.setObjectName("onlineTitle")
-        subtitle = QLabel(
-            "登录后可参加排位匹配、查看排行榜，也可创建自建房邀请好友。",
-            card,
-        )
-        subtitle.setObjectName("onlineSubtitle")
-        subtitle.setWordWrap(True)
-        self.server_label = QLabel(card)
-        self.server_label.setObjectName("hintLabel")
-        self.server_label.setWordWrap(True)
-        self.server_label.setText(
-            f"服务器：{self._api_base_url or '未配置'}"
-        )
-
-        self.username_edit = QLineEdit(card)
-        self.username_edit.setObjectName("onlineInput")
-        self.username_edit.setPlaceholderText("用户名")
-        self.password_edit = QLineEdit(card)
-        self.password_edit.setObjectName("onlineInput")
-        self.password_edit.setPlaceholderText("密码（至少 8 位）")
-        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
-
-        card_layout.addWidget(title)
-        card_layout.addWidget(subtitle)
-        card_layout.addWidget(self.server_label)
-        for label_text, widget in (
-            ("用户名", self.username_edit),
-            ("密码", self.password_edit),
-        ):
-            label = QLabel(label_text, card)
-            label.setObjectName("formLabel")
-            label.setBuddy(widget)
-            card_layout.addWidget(label)
-            card_layout.addWidget(widget)
-
-        buttons = QHBoxLayout()
-        buttons.setSpacing(10)
-        self.login_button = QPushButton("登录", card)
-        self.login_button.setObjectName("restartButton")
-        self.login_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.register_button = QPushButton("注册", card)
-        self.register_button.setObjectName("undoButton")
-        self.register_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        buttons.addWidget(self.login_button)
-        buttons.addWidget(self.register_button)
-        card_layout.addLayout(buttons)
-
-        self.auth_status_label = QLabel(card)
-        self.auth_status_label.setObjectName("onlineStatus")
-        self.auth_status_label.setWordWrap(True)
-        self.auth_status_label.setMinimumHeight(22)
-        card_layout.addWidget(self.auth_status_label)
-
-        self.login_button.clicked.connect(self._on_login_clicked)
-        self.register_button.clicked.connect(self._on_register_clicked)
-        self.password_edit.returnPressed.connect(self._on_login_clicked)
-
-        return self._make_centered_card_page(card)
-
-    def _build_lobby_page(self) -> QWidget:
-        page = QWidget(self)
-        page.setObjectName("onlinePage")
-        page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(0, 0, 0, 0)
-
-        scroll = QScrollArea(page)
-        scroll.setObjectName("onlineScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        viewport = scroll.viewport()
-        viewport.setAutoFillBackground(False)
-        viewport.setAttribute(
-            Qt.WidgetAttribute.WA_TranslucentBackground, True
-        )
-
-        container = QWidget(scroll)
-        container.setObjectName("onlineScrollBody")
-        container.setAutoFillBackground(False)
-        outer = QVBoxLayout(container)
-        outer.setContentsMargins(18, 10, 18, 10)
-        outer.setSpacing(12)
-        outer.addStretch(1)
-
-        card = QFrame(container)
-        card.setObjectName("onlineCard")
-        card.setMaximumWidth(660)
-        card.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Preferred,
-        )
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(26, 22, 26, 22)
-        layout.setSpacing(9)
-
-        header = QHBoxLayout()
-        self.self_avatar = AvatarButton("", "", 42, card)
-        self.self_avatar.clicked_id.connect(self._open_user_profile)
-        self.self_avatar.setVisible(False)
-        title = QLabel("对战大厅", card)
-        title.setObjectName("onlineTitle")
-        self.rating_badge_label = QLabel("未定级", card)
-        self.rating_badge_label.setObjectName("rankBadge")
-        self.rating_badge_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.rating_badge_label.setMinimumWidth(64)
-        self.friends_button = QPushButton("好友", card)
-        self.friends_button.setObjectName("smallButton")
-        self.friends_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.friends_button.setAutoDefault(False)
-        # 对战广场：进行中对局的观战入口，单独占一页，不占大厅。
-        self.plaza_button = QPushButton("对战广场", card)
-        self.plaza_button.setObjectName("smallButton")
-        self.plaza_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.plaza_button.setAutoDefault(False)
-        header.addWidget(self.self_avatar)
-        header.addWidget(title)
-        header.addStretch(1)
-        header.addWidget(self.plaza_button)
-        header.addWidget(self.friends_button)
-        header.addWidget(self.rating_badge_label)
-        layout.addLayout(header)
-
-        self.lobby_welcome_label = QLabel("已登录", card)
-        self.lobby_welcome_label.setObjectName("onlineSubtitle")
-        self.rating_summary_label = QLabel(
-            "积分 1200，尚未完成排位赛", card
-        )
-        self.rating_summary_label.setObjectName("rankSummary")
-        layout.addWidget(self.lobby_welcome_label)
-        layout.addWidget(self.rating_summary_label)
-
-        layout.addSpacing(4)
-        ranked_title = QLabel("排位匹配，计入段位积分", card)
-        ranked_title.setObjectName("sectionTitle")
-        ranked_hint = QLabel(
-            "按积分匹配对手；胜者加分、负者扣分，自建房不计分。", card
-        )
-        ranked_hint.setObjectName("hintLabel")
-        ranked_hint.setWordWrap(True)
-
-        self.quick_match_button = QPushButton("开始排位匹配", card)
-        self.quick_match_button.setObjectName("restartButton")
-        self.quick_match_button.setCursor(
-            Qt.CursorShape.PointingHandCursor
-        )
-        self.quick_match_button.setMinimumHeight(40)
-        self.match_status_label = QLabel(card)
-        self.match_status_label.setObjectName("onlineStatus")
-        self.match_status_label.setWordWrap(True)
-        self.match_status_label.setMinimumHeight(20)
-        layout.addWidget(ranked_title)
-        layout.addWidget(ranked_hint)
-        layout.addWidget(self.quick_match_button)
-        layout.addWidget(self.match_status_label)
-
-        layout.addSpacing(4)
-        friend_title = QLabel("自建房，休闲对局（不计分）", card)
-        friend_title.setObjectName("sectionTitle")
-        friend_hint = QLabel(
-            "创建后直接从好友列表邀请在线好友加入，无需房间码。", card
-        )
-        friend_hint.setObjectName("hintLabel")
-        friend_hint.setWordWrap(True)
-
-        self.create_room_button = QPushButton("创建自建房", card)
-        self.create_room_button.setObjectName("undoButton")
-        self.create_room_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        layout.addWidget(friend_title)
-        layout.addWidget(friend_hint)
-        layout.addWidget(self.create_room_button)
-
-        layout.addSpacing(4)
-        leaderboard_header = QHBoxLayout()
-        leaderboard_title = QLabel("排行榜，前 50 名", card)
-        leaderboard_title.setObjectName("sectionTitle")
-        self.refresh_leaderboard_button = QPushButton("刷新", card)
-        self.refresh_leaderboard_button.setObjectName("smallButton")
-        self.refresh_leaderboard_button.setCursor(
-            Qt.CursorShape.PointingHandCursor
-        )
-        leaderboard_header.addWidget(leaderboard_title)
-        leaderboard_header.addStretch(1)
-        leaderboard_header.addWidget(self.refresh_leaderboard_button)
-        layout.addLayout(leaderboard_header)
-
-        self.leaderboard_table = QTableWidget(0, 5, card)
-        self.leaderboard_table.setObjectName("leaderboardTable")
-        self.leaderboard_table.setHorizontalHeaderLabels(
-            ["排名", "玩家", "段位", "积分", "战绩"]
-        )
-        self.leaderboard_table.verticalHeader().setVisible(False)
-        self.leaderboard_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers
-        )
-        self.leaderboard_table.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection
-        )
-        self.leaderboard_table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows
-        )
-        self.leaderboard_table.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        self.leaderboard_table.setIconSize(QSize(20, 20))
-        self.leaderboard_table.setShowGrid(False)
-        self.leaderboard_table.setAlternatingRowColors(True)
-        self.leaderboard_table.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        self.leaderboard_table.verticalHeader().setDefaultSectionSize(30)
-        self.leaderboard_table.setFixedHeight(228)
-        header_view = self.leaderboard_table.horizontalHeader()
-        header_view.setHighlightSections(False)
-        header_view.setStretchLastSection(False)
-        header_view.setMinimumSectionSize(42)
-        header_view.setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Fixed
-        )
-        header_view.setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch
-        )
-        header_view.setSectionResizeMode(
-            2, QHeaderView.ResizeMode.Fixed
-        )
-        header_view.setSectionResizeMode(
-            3, QHeaderView.ResizeMode.Fixed
-        )
-        header_view.setSectionResizeMode(
-            4, QHeaderView.ResizeMode.Fixed
-        )
-        self.leaderboard_table.setColumnWidth(0, 46)
-        self.leaderboard_table.setColumnWidth(2, 58)
-        self.leaderboard_table.setColumnWidth(3, 58)
-        self.leaderboard_table.setColumnWidth(4, 96)
-        header_item = self.leaderboard_table.horizontalHeaderItem(4)
-        if header_item is not None:
-            header_item.setToolTip("胜-负-平")
-        layout.addWidget(self.leaderboard_table)
-
-        self.leaderboard_status_label = QLabel(
-            "登录后自动加载排行榜", card
-        )
-        self.leaderboard_status_label.setObjectName("hintLabel")
-        self.leaderboard_status_label.setWordWrap(True)
-        layout.addWidget(self.leaderboard_status_label)
-
-        layout.addSpacing(4)
-        recent_header = QHBoxLayout()
-        recent_title = QLabel("最近对局", card)
-        recent_title.setObjectName("sectionTitle")
-        self.replay_history_button = QPushButton("复盘选中对局", card)
-        self.replay_history_button.setObjectName("undoButton")
-        self.replay_history_button.setCursor(
-            Qt.CursorShape.PointingHandCursor
-        )
-        self.replay_history_button.setEnabled(False)
-        self.refresh_history_button = QPushButton("刷新", card)
-        self.refresh_history_button.setObjectName("smallButton")
-        self.refresh_history_button.setCursor(
-            Qt.CursorShape.PointingHandCursor
-        )
-        recent_header.addWidget(recent_title)
-        recent_header.addStretch(1)
-        recent_header.addWidget(self.replay_history_button)
-        recent_header.addWidget(self.refresh_history_button)
-        layout.addLayout(recent_header)
-
-        self.recent_games_table = QTableWidget(0, 5, card)
-        self.recent_games_table.setObjectName("leaderboardTable")
-        self.recent_games_table.setHorizontalHeaderLabels(
-            ["时间", "对手", "结果", "模式", "手数"]
-        )
-        self.recent_games_table.verticalHeader().setVisible(False)
-        self.recent_games_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers
-        )
-        self.recent_games_table.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection
-        )
-        self.recent_games_table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows
-        )
-        self.recent_games_table.setShowGrid(False)
-        self.recent_games_table.setAlternatingRowColors(True)
-        self.recent_games_table.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        self.recent_games_table.verticalHeader().setDefaultSectionSize(30)
-        self.recent_games_table.setFixedHeight(198)
-        recent_header_view = self.recent_games_table.horizontalHeader()
-        recent_header_view.setHighlightSections(False)
-        recent_header_view.setStretchLastSection(False)
-        recent_header_view.setMinimumSectionSize(42)
-        for column, width in ((0, 92), (2, 48), (3, 64), (4, 48)):
-            recent_header_view.setSectionResizeMode(
-                column, QHeaderView.ResizeMode.Fixed
-            )
-            self.recent_games_table.setColumnWidth(column, width)
-        recent_header_view.setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch
-        )
-        layout.addWidget(self.recent_games_table)
-
-        self.history_status_label = QLabel(
-            "登录后自动加载最近对局", card
-        )
-        self.history_status_label.setObjectName("hintLabel")
-        self.history_status_label.setWordWrap(True)
-        layout.addWidget(self.history_status_label)
-
-        footer = QHBoxLayout()
-        self.lobby_status_label = QLabel(card)
-        self.lobby_status_label.setObjectName("onlineStatus")
-        self.lobby_status_label.setWordWrap(True)
-        self.lobby_status_label.setMinimumHeight(22)
-        self.logout_button = QPushButton("退出登录", card)
-        self.logout_button.setObjectName("undoButton")
-        self.logout_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        footer.addWidget(self.lobby_status_label, 1)
-        footer.addWidget(self.logout_button)
-        layout.addSpacing(2)
-        layout.addLayout(footer)
-
-        card_row = QHBoxLayout()
-        card_row.setContentsMargins(0, 0, 0, 0)
-        card_row.addStretch(1)
-        card_row.addWidget(card, 20)
-        card_row.addStretch(1)
-        outer.addLayout(card_row)
-        outer.addStretch(1)
-        scroll.setWidget(container)
-        page_layout.addWidget(scroll)
-
-        self.quick_match_button.clicked.connect(self._on_quick_match)
-        self.create_room_button.clicked.connect(self._on_create_room)
-        self.friends_button.clicked.connect(self._open_friends_panel)
-        self.plaza_button.clicked.connect(self._on_plaza_clicked)
-        self.leaderboard_table.cellClicked.connect(
-            self._on_leaderboard_cell_clicked
-        )
-        self.refresh_leaderboard_button.clicked.connect(
-            self._on_refresh_leaderboard
-        )
-        self.refresh_history_button.clicked.connect(
-            self._on_refresh_history
-        )
-        self.replay_history_button.clicked.connect(
-            self._on_replay_history
-        )
-        self.recent_games_table.itemSelectionChanged.connect(
-            self._on_recent_selection_changed
-        )
-        self.recent_games_table.cellDoubleClicked.connect(
-            self._on_recent_double_clicked
-        )
-        self.logout_button.clicked.connect(self._logout)
-
-        return page
-
-    def _build_plaza_page(self) -> QWidget:
-        """对战广场：集中管理所有进行中的对局，并提供观战入口。
-
-        这一页单独存在，不占用大厅：大厅只留一个“对战广场”入口按钮。
-        """
-        page = QWidget(self)
-        page.setObjectName("onlinePage")
-        page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(0, 0, 0, 0)
-
-        scroll = QScrollArea(page)
-        scroll.setObjectName("onlineScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        viewport = scroll.viewport()
-        viewport.setAutoFillBackground(False)
-        viewport.setAttribute(
-            Qt.WidgetAttribute.WA_TranslucentBackground, True
-        )
-
-        container = QWidget(scroll)
-        container.setObjectName("onlineScrollBody")
-        container.setAutoFillBackground(False)
-        outer = QVBoxLayout(container)
-        outer.setContentsMargins(18, 10, 18, 10)
-        outer.setSpacing(12)
-        outer.addStretch(1)
-
-        card = QFrame(container)
-        card.setObjectName("onlineCard")
-        card.setMaximumWidth(660)
-        card.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Preferred,
-        )
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(26, 22, 26, 22)
-        layout.setSpacing(9)
-
-        header = QHBoxLayout()
-        title = QLabel("对战广场", card)
-        title.setObjectName("onlineTitle")
-        self.refresh_live_button = QPushButton("刷新", card)
-        self.refresh_live_button.setObjectName("smallButton")
-        self.refresh_live_button.setCursor(
-            Qt.CursorShape.PointingHandCursor
-        )
-        self.refresh_live_button.setAutoDefault(False)
-        header.addWidget(title)
-        header.addStretch(1)
-        header.addWidget(self.refresh_live_button)
-        layout.addLayout(header)
-
-        hint = QLabel(
-            "这里列出所有正在进行的对局，点“观战”即可进去旁观；"
-            "观战者只能看，不能落子或发言。对局开始会自动出现，结束会自动消失。",
-            card,
-        )
-        hint.setObjectName("hintLabel")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        # 每行一局：一个说明标签 + 一个“观战”按钮。
-        self.live_games_container = QWidget(card)
-        self.live_games_layout = QVBoxLayout(self.live_games_container)
-        self.live_games_layout.setContentsMargins(0, 0, 0, 0)
-        self.live_games_layout.setSpacing(6)
-        layout.addWidget(self.live_games_container)
-
-        self.live_status_label = QLabel(
-            "正在加载进行中的对局…", card
-        )
-        self.live_status_label.setObjectName("hintLabel")
-        self.live_status_label.setWordWrap(True)
-        layout.addWidget(self.live_status_label)
-
-        footer = QHBoxLayout()
-        self.plaza_status_label = QLabel(card)
-        self.plaza_status_label.setObjectName("onlineStatus")
-        self.plaza_status_label.setWordWrap(True)
-        self.plaza_status_label.setMinimumHeight(22)
-        self.plaza_back_button = QPushButton("返回大厅", card)
-        self.plaza_back_button.setObjectName("undoButton")
-        self.plaza_back_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        footer.addWidget(self.plaza_status_label, 1)
-        footer.addWidget(self.plaza_back_button)
-        layout.addSpacing(2)
-        layout.addLayout(footer)
-
-        card_row = QHBoxLayout()
-        card_row.setContentsMargins(0, 0, 0, 0)
-        card_row.addStretch(1)
-        card_row.addWidget(card, 20)
-        card_row.addStretch(1)
-        outer.addLayout(card_row)
-        outer.addStretch(1)
-        scroll.setWidget(container)
-        page_layout.addWidget(scroll)
-
-        self.refresh_live_button.clicked.connect(self._on_refresh_live)
-        self.plaza_back_button.clicked.connect(self._on_plaza_back)
-        return page
-
-    def _build_game_page(self) -> QWidget:
-        page = QWidget(self)
-        page.setObjectName("onlinePage")
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(6, 12, 6, 12)
-        layout.setSpacing(8)
-
-        top = QHBoxLayout()
-        self.room_title_label = QLabel("自建房", page)
-        self.room_title_label.setObjectName("onlineRoomTitle")
-        self.invite_friend_button = QPushButton("邀请好友", page)
-        self.invite_friend_button.setObjectName("smallButton")
-        self.invite_friend_button.setCursor(
-            Qt.CursorShape.PointingHandCursor
-        )
-        self.invite_friend_button.setAutoDefault(False)
-        self.invite_friend_button.setVisible(False)
-        self.connection_label = QLabel("未连接", page)
-        self.connection_label.setObjectName("onlineStatus")
-        self.connection_label.setAlignment(Qt.AlignmentFlag.AlignRight)
-        top.addWidget(self.room_title_label)
-        top.addWidget(self.invite_friend_button)
-        top.addStretch(1)
-        top.addWidget(self.connection_label)
-        layout.addLayout(top)
-
-        cards = QHBoxLayout()
-        cards.setSpacing(12)
-        self.you_card = OnlinePlayerCard(page)
-        self.opponent_card = OnlinePlayerCard(page)
-        self.you_card.profile_requested.connect(self._open_user_profile)
-        self.opponent_card.profile_requested.connect(
-            self._open_user_profile
-        )
-        cards.addWidget(self.you_card, 1)
-        cards.addWidget(self.opponent_card, 1)
-        layout.addLayout(cards)
-
-        # 棋盘与对话日志并排：左侧棋盘，右侧只读对话日志。
-        play_area = QHBoxLayout()
-        play_area.setSpacing(6)
-
-        left_column = QVBoxLayout()
-        left_column.setSpacing(8)
-
-        # 棋盘容器：弹幕覆盖层与棋盘叠放在同一个网格单元格中。
-        self.board_container = QWidget(page)
-        self.board_container.setObjectName("boardContainer")
-        board_grid = QGridLayout(self.board_container)
-        board_grid.setContentsMargins(0, 0, 0, 0)
-        board_grid.setSpacing(0)
-
-        self.board_widget = BoardWidget(_empty_view(), self.board_container)
-        self.board_widget.set_interaction_enabled(False)
-        self.board_widget.cell_clicked.connect(self._on_board_clicked)
-        board_grid.addWidget(self.board_widget, 0, 0)
-
-        self.danmaku_overlay = DanmakuOverlay(self.board_container)
-        board_grid.addWidget(self.danmaku_overlay, 0, 0)
-        # 让弹幕以棋面（居中的正方形）为活动范围，而不是控件留白。
-        self.danmaku_overlay.set_board_widget(self.board_widget)
-
-        # 沙盘面板最后加入：与真实棋盘、弹幕叠放在同一个网格单元格中，
-        # 打开时盖住真实棋盘。隐藏状态下不占布局空间。
-        self.sandbox_panel = SandboxPanel(self.board_container)
-        board_grid.addWidget(self.sandbox_panel, 0, 0)
-        self.sandbox_panel.setVisible(False)
-
-        left_column.addWidget(self.board_container, 1)
-
-        info = QHBoxLayout()
-        info.setSpacing(10)
-        self.game_status_pill = QLabel("等待连接", page)
-        self.game_status_pill.setObjectName("turnPill")
-        self.game_status_pill.setProperty("result", "false")
-        self.game_status_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.game_status_pill.setMinimumWidth(112)
-        self.clock_label = QLabel("—", page)
-        self.clock_label.setObjectName("onlineClock")
-        self.undo_status_label = QLabel("", page)
-        self.undo_status_label.setObjectName("onlineUndoStatus")
-        self.undo_status_label.setWordWrap(True)
-        self.undo_status_label.setVisible(False)
-        self.move_label = QLabel("第 0 手", page)
-        self.move_label.setObjectName("moveInfo")
-        info.addWidget(self.game_status_pill)
-        info.addWidget(self.clock_label)
-        info.addWidget(self.undo_status_label)
-        info.addStretch(1)
-        info.addWidget(self.move_label)
-        left_column.addLayout(info)
-
-        self.chat_log = ChatLogPanel(page)
-        self.chat_log.setObjectName("chatLogPanel")
-        self.chat_log.setMinimumWidth(210)
-        self.chat_log.setMaximumWidth(300)
-        self.chat_log.setSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding
-        )
-
-        play_area.addLayout(left_column, 1)
-        play_area.addWidget(self.chat_log, 0)
-        layout.addLayout(play_area, 1)
-
-        # 聊天输入栏：表情、快捷评论与手动输入。
-        chat_bar = QHBoxLayout()
-        chat_bar.setSpacing(8)
-        self.emoji_button = EmojiPickerButton(page)
-        self.preset_comment_button = PresetCommentButton(page)
-        self.chat_log_toggle_button = QPushButton("对话日志", page)
-        self.chat_log_toggle_button.setObjectName("chatLogToggleButton")
-        self.chat_log_toggle_button.setCheckable(True)
-        self.chat_input = QLineEdit(page)
-        self.chat_input.setObjectName("chatInput")
-        self.chat_input.setMaxLength(MAX_COMMENT_LENGTH)
-        self.chat_input.setPlaceholderText(CHAT_INPUT_HINT)
-        self.chat_send_button = QPushButton("发送", page)
-        self.chat_send_button.setObjectName("chatSendButton")
-        for button in (
-            self.emoji_button,
-            self.preset_comment_button,
-            self.chat_log_toggle_button,
-            self.chat_send_button,
-        ):
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.setAutoDefault(False)
-        chat_bar.addWidget(self.emoji_button)
-        chat_bar.addWidget(self.preset_comment_button)
-        chat_bar.addWidget(self.chat_input, 1)
-        chat_bar.addWidget(self.chat_send_button)
-        chat_bar.addWidget(self.chat_log_toggle_button)
-        layout.addLayout(chat_bar)
-
-        self.game_rating_label = QLabel(page)
-        self.game_rating_label.setObjectName("onlineRatingResult")
-        self.game_rating_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.game_rating_label.setWordWrap(True)
-        self.game_rating_label.setVisible(False)
-        layout.addWidget(self.game_rating_label)
-
-        self.game_achievement_label = QLabel(page)
-        self.game_achievement_label.setObjectName("onlineAchievementResult")
-        self.game_achievement_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.game_achievement_label.setWordWrap(True)
-        self.game_achievement_label.setVisible(False)
-        layout.addWidget(self.game_achievement_label)
-
-        self.game_error_label = QLabel(page)
-        self.game_error_label.setObjectName("onlineError")
-        self.game_error_label.setWordWrap(True)
-        self.game_error_label.setMinimumHeight(20)
-        layout.addWidget(self.game_error_label)
-
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
-        actions.addStretch(1)
-        self.undo_button = QPushButton("请求悔棋", page)
-        self.undo_button.setObjectName("undoButton")
-        self.undo_reject_button = QPushButton("拒绝悔棋", page)
-        self.undo_reject_button.setObjectName("undoButton")
-        self.undo_reject_button.setVisible(False)
-        self.resign_button = QPushButton("认输", page)
-        self.resign_button.setObjectName("undoButton")
-        self.rematch_button = QPushButton("申请再战", page)
-        self.rematch_button.setObjectName("restartButton")
-        self.leave_button = QPushButton("离开房间", page)
-        self.leave_button.setObjectName("undoButton")
-        # 沙盘推演放在底部操作栏：它是与对局并列的一种玩法，和悔棋、
-        # 认输这些操作按钮排在一起最容易找到。
-        self.sandbox_button = QPushButton("沙盘推演", page)
-        self.sandbox_button.setObjectName("undoButton")
-        self.sandbox_button.setToolTip(
-            "在本地沙盘上自行推演，不影响真实对局"
-        )
-        # 还没有对局时按钮不可用（可见但禁用）。
-        self.sandbox_button.setEnabled(False)
-        for button in (
-            self.sandbox_button,
-            self.undo_button,
-            self.undo_reject_button,
-            self.resign_button,
-            self.rematch_button,
-            self.leave_button,
-        ):
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.setAutoDefault(False)
-            actions.addWidget(button)
-        layout.addLayout(actions)
-
-        self.undo_button.clicked.connect(self._on_undo_clicked)
-        self.undo_reject_button.clicked.connect(self._on_undo_declined)
-        self.resign_button.clicked.connect(self._on_resign)
-        self.rematch_button.clicked.connect(self._on_rematch)
-        self.leave_button.clicked.connect(self._on_leave_room)
-        self.invite_friend_button.clicked.connect(
-            self._on_invite_friend_clicked
-        )
-        self.sandbox_button.clicked.connect(self._on_sandbox_toggled)
-        self.emoji_button.emoji_picked.connect(self._on_emoji_picked)
-        self.preset_comment_button.comment_picked.connect(
-            self._on_preset_comment_picked
-        )
-        self.chat_send_button.clicked.connect(self._on_send_comment)
-        self.chat_input.returnPressed.connect(self._on_send_comment)
-        self.chat_log_toggle_button.toggled.connect(
-            self._on_chat_log_toggled
-        )
-        # 对话日志默认收起：棋盘可以占满整行，需要时再点开。
-        self._apply_chat_log_visibility(self._load_chat_log_visible())
-        self._refresh_chat_controls()
-        return page
-
-    # ------------------------------------------------------------------
-    # 页面/状态辅助
-    # ------------------------------------------------------------------
     def _show_auth_page(self) -> None:
         self.stack.setCurrentWidget(self.auth_page)
         # 回到登录页就不该再刷新对战广场了。
@@ -1303,6 +448,10 @@ class OnlinePanel(InkBackdrop):
         )
         friend_enabled = connected and not pending and not queued
         self.create_room_button.setEnabled(friend_enabled)
+        self.allow_spectators_checkbox.setVisible(
+            self._session is not None
+            and self._session.supports(CAP_ROOM_OPTIONS)
+        )
         self.refresh_leaderboard_button.setEnabled(
             connected and not self._profile_client.busy
         )
@@ -2467,62 +1616,8 @@ class OnlinePanel(InkBackdrop):
         self._refresh_plaza_controls()
 
     def _fill_live_games(self, entries: list, total: int) -> None:
-        """重建进行中对局列表；最多展示前若干条，避免页面无限变长。"""
-        while self.live_games_layout.count():
-            item = self.live_games_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
-        shown = entries[:MAX_LIVE_GAME_ROWS]
-        for entry in shown:
-            self.live_games_layout.addWidget(
-                self._make_live_game_row(entry)
-            )
-        if not entries:
-            self.live_status_label.setText("当前没有进行中的对局")
-            return
-        if len(shown) < total:
-            self.live_status_label.setText(
-                f"共 {total} 局进行中，最多显示前 {len(shown)} 局"
-            )
-        else:
-            self.live_status_label.setText(f"共 {total} 局进行中")
-
-    def _make_live_game_row(self, entry: Mapping) -> QWidget:
-        """构造一行“进行中对局”的说明与观战按钮。"""
-        row = QWidget(self.live_games_container)
-        row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(8)
-        label = QLabel(self._format_live_entry(entry), row)
-        label.setObjectName("rankSummary")
-        label.setWordWrap(True)
-        row_layout.addWidget(label, 1)
-        button = QPushButton("观战", row)
-        button.setObjectName("undoButton")
-        button.setCursor(Qt.CursorShape.PointingHandCursor)
-        button.setAutoDefault(False)
-        game_id = entry.get("game_id")
-        if isinstance(game_id, str) and game_id:
-            button.clicked.connect(
-                lambda _checked=False, gid=game_id: self._on_watch_game(gid)
-            )
-        else:
-            button.setEnabled(False)
-        row_layout.addWidget(button, 0)
-        return row
-
-    @staticmethod
-    def _format_live_entry(entry: Mapping) -> str:
-        """把一条进行中的对局格式化成一行中文说明。"""
-        black = str(entry.get("black_username") or "黑方")
-        white = str(entry.get("white_username") or "白方")
-        mode = "排位" if entry.get("rated") else "自建房"
-        move_no = entry.get("move_no", 0)
-        if not isinstance(move_no, int) or isinstance(move_no, bool):
-            move_no = 0
-        return f"{black}（黑）对 {white}（白）· {mode} · 第 {move_no} 手"
+        """把进行中对局列表交给广场页渲染。"""
+        self.plaza_page.set_entries(entries, total)
 
     def _on_watch_game(self, game_id: str) -> None:
         """开始观战指定的进行中对局。"""
@@ -2870,7 +1965,9 @@ class OnlinePanel(InkBackdrop):
         self._room_action_pending = True
         self._set_lobby_status("正在创建自建房…")
         self._refresh_lobby_controls()
-        if not self._session.create_room():
+        if not self._session.create_room(
+            self.allow_spectators_checkbox.isChecked()
+        ):
             self._room_action_pending = False
             self._set_lobby_status("无法创建房间，请检查连接", error=True)
             self._refresh_lobby_controls()
@@ -3184,8 +2281,74 @@ class OnlinePanel(InkBackdrop):
         self.undo_status_label.setText("")
         self.undo_status_label.setVisible(False)
 
+    def _set_undo_text(self, text: str) -> None:
+        if self.undo_button.text() != text:
+            self.undo_button.setText(text)
+
+    def _refresh_undo_controls(self) -> None:
+        """刷新悔棋按钮的次数/冷却/待回应状态。"""
+        session = self._session
+        if session is None:
+            return
+        if session.undo_pending:
+            if session.undo_requested_by_you:
+                self._set_undo_text("等待对方同意")
+                enabled = False
+            else:
+                self._set_undo_text("同意悔棋")
+                enabled = self._ws_connected
+            self.undo_button.setEnabled(enabled)
+            self.undo_button.setToolTip("")
+            return
+
+        remaining = session.undo_remaining
+        cooldown = session.undo_cooldown_remaining
+        if session.undo_limit <= 0:
+            self._set_undo_text("本局未开启悔棋")
+            enabled = False
+        elif remaining <= 0:
+            self._set_undo_text("本局悔棋已用完")
+            enabled = False
+        elif cooldown > 0:
+            self._set_undo_text(f"悔棋冷却 {cooldown}s")
+            enabled = False
+        else:
+            self._set_undo_text("请求悔棋")
+            enabled = self._ws_connected and session.can_undo
+        self.undo_button.setEnabled(enabled)
+        if session.undo_limit > 0:
+            tooltip = (
+                f"本局剩余 {remaining}/{session.undo_limit} 次；"
+                f"每 {session.undo_cooldown_seconds} 秒最多请求一次"
+            )
+        else:
+            tooltip = ""
+        if self.undo_button.toolTip() != tooltip:
+            self.undo_button.setToolTip(tooltip)
+
     def _on_resign(self) -> None:
-        if self._session is not None:
+        if self._session is None or self._closing:
+            return
+        snapshot = self._session.snapshot
+        if snapshot is None or snapshot.is_game_over:
+            return
+        dialog = ConfirmDialog(
+            "确认认输",
+            "认输后本局直接判负，确定要认输吗？",
+            confirm_text="认输",
+            cancel_text="继续对局",
+            seal_text="负",
+            parent=self,
+        )
+        try:
+            dialog.exec()
+            confirmed = dialog.confirm_requested
+        finally:
+            dialog.deleteLater()
+        if not confirmed or self._session is None:
+            return
+        snapshot = self._session.snapshot
+        if snapshot is not None and not snapshot.is_game_over:
             self._session.resign()
 
     def _on_rematch(self) -> None:
@@ -3302,7 +2465,11 @@ class OnlinePanel(InkBackdrop):
         session = self._session
         if not session.is_authenticated:
             return
-        if session.waiting_for_opponent or session.snapshot is not None:
+        if session.phase in {
+            OnlineSessionPhase.WAITING,
+            OnlineSessionPhase.PLAYING,
+            OnlineSessionPhase.SPECTATING,
+        }:
             self._show_game_page()
             self._sync_game_page()
         elif self.stack.currentWidget() is self.game_page:
@@ -3680,18 +2847,7 @@ class OnlinePanel(InkBackdrop):
         self.leave_button.setEnabled(over and self._ws_connected)
         self.undo_reject_button.setEnabled(reject_undo and self._ws_connected)
         if not over:
-            if undo_pending:
-                self.undo_button.setText(
-                    "等待对方同意" if undo_mine else "同意悔棋"
-                )
-                self.undo_button.setEnabled(
-                    self._ws_connected and not undo_mine
-                )
-            else:
-                self.undo_button.setText("请求悔棋")
-                self.undo_button.setEnabled(
-                    self._ws_connected and session.can_undo
-                )
+            self._refresh_undo_controls()
             self.leave_button.setText("离开房间")
             return
         if rated:
@@ -3901,6 +3057,8 @@ class OnlinePanel(InkBackdrop):
         ):
             return
         snapshot = self._session.snapshot
+        if not self._session.is_spectator:
+            self._refresh_undo_controls()
         if snapshot.is_game_over:
             self.clock_label.setText("对局结束")
             return

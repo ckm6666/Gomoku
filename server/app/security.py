@@ -10,7 +10,6 @@ import unicodedata
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
 
 import jwt
 from argon2 import PasswordHasher

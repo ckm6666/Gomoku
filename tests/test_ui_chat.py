@@ -470,10 +470,7 @@ class ChatLogToggleTests(unittest.TestCase):
 
         from PySide6.QtCore import QSettings
 
-        from gomoku.client.online_panel import (
-            OnlinePanel,
-            SETTINGS_CHAT_LOG_VISIBLE,
-        )
+        from gomoku.client.online_panel import OnlinePanel
 
         # 把 QSettings 指向临时目录里的 INI 文件：不依赖应用元信息，
         # 也不会往用户的注册表里写东西。

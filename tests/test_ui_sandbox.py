@@ -26,7 +26,11 @@ from gomoku.client.online_panel import OnlinePanel  # noqa: E402
 from gomoku.client.sessions.online import OnlineGameSession  # noqa: E402
 from gomoku.shared.rules import Player  # noqa: E402
 from tests.fakes import FakeTransport  # noqa: E402
-from tests.test_spectate import authenticate, blank_board, state_message
+from tests.test_spectate import (  # noqa: E402
+    authenticate,
+    blank_board,
+    state_message,
+)
 
 # 保持 QApplication 单例；若 UI 测试先创建则复用同一个实例。
 QT_APP = QApplication.instance() or QApplication([])

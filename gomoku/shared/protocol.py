@@ -154,6 +154,11 @@ class GameSnapshot:
     result_reason: str = ""
     # 当前待回应的悔棋请求发起者；空字符串表示没有请求。
     undo_requester_id: str = ""
+    # 本局悔棋配额与冷却（由服务端按当前用户计算）。
+    undo_remaining: int = 0
+    undo_limit: int = 0
+    undo_cooldown_until_ms: int | None = None
+    undo_cooldown_seconds: int = 0
     # 联机房间 UI 的可选元数据（Stage 1 服务端会提供）。
     room_code: str = ""
     black_name: str = ""
@@ -372,6 +377,10 @@ def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
         undo_requester_id, str
     ):
         raise ProtocolError("result_reason/undo_requester_id 必须是字符串")
+    undo_remaining = optional_int("undo_remaining") or 0
+    undo_limit = optional_int("undo_limit") or 0
+    undo_cooldown_seconds = optional_int("undo_cooldown_seconds") or 0
+    undo_cooldown_until_ms = optional_int("undo_cooldown_until_ms")
 
     black_avatar_version = optional_int("black_avatar_version") or 0
     white_avatar_version = optional_int("white_avatar_version") or 0
@@ -399,6 +408,10 @@ def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
         state_version=state_version,
         result_reason=result_reason.strip(),
         undo_requester_id=undo_requester_id,
+        undo_remaining=undo_remaining,
+        undo_limit=undo_limit,
+        undo_cooldown_until_ms=undo_cooldown_until_ms,
+        undo_cooldown_seconds=undo_cooldown_seconds,
         room_code=room_code,
         black_name=black_name,
         white_name=white_name,

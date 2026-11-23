@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import time
@@ -17,6 +18,10 @@ from gomoku.shared.achievements import (
     unlocked_achievement_keys,
 )
 from gomoku.shared.avatar import normalize_avatar
+from gomoku.shared.capabilities import (
+    SERVER_CAPABILITIES,
+    normalize_capabilities,
+)
 from gomoku.shared.errors import ProtocolError
 from gomoku.shared.protocol import (
     CLIENT_AUTH,
@@ -44,7 +49,8 @@ from gomoku.shared.protocol import (
 from server.app.models import User
 from server.app.ratings import rank_for_rating
 from server.app.security import decode_access_token
-from server.app.ws.rooms import ClientConnection
+from server.app.ws.entities import ClientConnection
+from server.app.ws.limits import CommandRateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +102,27 @@ async def _safe_close(websocket: WebSocket, code: int, reason: str) -> None:
         pass
 
 
+def _client_ip(websocket: WebSocket, settings: Any) -> str:
+    """解析客户端 IP；只有明确信任代理时才读取 X-Forwarded-For。"""
+    direct = websocket.client.host if websocket.client else ""
+    if not settings.trust_proxy_headers:
+        return direct or "unknown"
+
+    candidates = []
+    forwarded = websocket.headers.get("x-forwarded-for", "")
+    if forwarded:
+        candidates.append(forwarded.split(",")[0].strip())
+    real_ip = websocket.headers.get("x-real-ip", "").strip()
+    if real_ip:
+        candidates.append(real_ip)
+    for candidate in candidates:
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            continue
+    return direct or "unknown"
+
+
 @router.websocket("/ws")
 async def game_websocket(websocket: WebSocket) -> None:
     """认证后进入好友房/排位匹配/对局事件循环。
@@ -135,6 +162,13 @@ async def game_websocket(websocket: WebSocket) -> None:
     if not isinstance(token, str) or not token:
         await _safe_close(websocket, 1008, "缺少访问令牌")
         return
+    try:
+        client_capabilities = normalize_capabilities(
+            payload.get("capabilities", ())
+        )
+    except ProtocolError:
+        await _safe_close(websocket, 1008, "能力声明非法")
+        return
 
     try:
         user_id = decode_access_token(token, settings)
@@ -169,17 +203,45 @@ async def game_websocket(websocket: WebSocket) -> None:
         current_streak = user.current_win_streak
         best_streak = user.best_win_streak
 
+    client_ip = _client_ip(websocket, settings)
     conn = ClientConnection(
         connection_id=uuid.uuid4().hex,
         user_id=user_id,
         username=username,
         websocket=websocket,
+        client_ip=client_ip,
+        capabilities=client_capabilities,
         avatar=avatar,
         rating=rating,
         avatar_version=avatar_version,
         achievements=tuple(achievements),
     )
-    await conn.send(
+    if not await room_manager.reserve_connection(conn):
+        metrics = getattr(app.state, "metrics", None)
+        if metrics is not None:
+            metrics.connection_limited.inc()
+        logger.warning(
+            "ws_connection_limited",
+            extra={
+                "event": "ws_connection_limited",
+                "user_id": user_id,
+                "client_ip": client_ip,
+            },
+        )
+        await _safe_close(websocket, 4009, "连接数过多")
+        return
+
+    connected_at = time.monotonic()
+    logger.info(
+        "ws_connected",
+        extra={
+            "event": "ws_connected",
+            "user_id": user_id,
+            "client_ip": client_ip,
+            "connection_id": conn.connection_id,
+        },
+    )
+    authenticated = await conn.send(
         make_message(
             SERVER_AUTHENTICATED,
             {
@@ -193,10 +255,14 @@ async def game_websocket(websocket: WebSocket) -> None:
                     "best_win_streak": best_streak,
                     "rating": rating,
                     "rank_name": rank_for_rating(rating).name,
-                }
+                },
+                "capabilities": sorted(SERVER_CAPABILITIES),
             },
         )
     )
+    if not authenticated:
+        await room_manager.release_connection(conn.connection_id)
+        return
 
     try:
         await room_manager.attach(conn)
@@ -209,6 +275,10 @@ async def game_websocket(websocket: WebSocket) -> None:
     # ------------------------------------------------------------------
     # 命令循环
     # ------------------------------------------------------------------
+    command_limiter = CommandRateLimiter(
+        settings.ws_command_burst,
+        settings.ws_command_window_seconds,
+    )
     try:
         while True:
             try:
@@ -234,6 +304,30 @@ async def game_websocket(websocket: WebSocket) -> None:
             request_id = message.get("request_id")
             payload = message.get("payload", {})
 
+            if message_type != CLIENT_PING and not command_limiter.allow(
+                time.monotonic()
+            ):
+                metrics = getattr(app.state, "metrics", None)
+                if metrics is not None:
+                    metrics.ws_rate_limited.inc()
+                logger.warning(
+                    "ws_rate_limited",
+                    extra={
+                        "event": "ws_rate_limited",
+                        "user_id": user_id,
+                        "message_type": message_type,
+                        "request_id": request_id,
+                    },
+                )
+                await conn.send(
+                    make_message(
+                        SERVER_ERROR,
+                        {"reason": "操作过于频繁，请稍后再试"},
+                        request_id=request_id,
+                    )
+                )
+                continue
+
             try:
                 if message_type == CLIENT_PING:
                     await conn.send(
@@ -243,7 +337,21 @@ async def game_websocket(websocket: WebSocket) -> None:
                         )
                     )
                 elif message_type == CLIENT_CREATE_ROOM:
-                    await room_manager.create_room(conn, request_id)
+                    allow_spectators = payload.get(
+                        "allow_spectators", True
+                    )
+                    if not isinstance(allow_spectators, bool):
+                        await conn.send(
+                            make_message(
+                                SERVER_ERROR,
+                                {"reason": "观战设置格式非法"},
+                                request_id=request_id,
+                            )
+                        )
+                    else:
+                        await room_manager.create_room(
+                            conn, request_id, allow_spectators
+                        )
                 elif message_type == CLIENT_JOIN_ROOM:
                     code = payload.get("room_code")
                     if not isinstance(code, str) or not code.strip():
@@ -384,7 +492,19 @@ async def game_websocket(websocket: WebSocket) -> None:
                         )
                     )
             except Exception:
-                logger.exception("处理 WebSocket 消息失败 type=%s", message_type)
+                metrics = getattr(app.state, "metrics", None)
+                if metrics is not None:
+                    metrics.ws_errors.inc()
+                logger.exception(
+                    "处理 WebSocket 消息失败 type=%s",
+                    message_type,
+                    extra={
+                        "event": "ws_message_error",
+                        "user_id": user_id,
+                        "message_type": message_type,
+                        "request_id": request_id,
+                    },
+                )
                 await conn.send(
                     make_message(
                         SERVER_ERROR,
@@ -403,6 +523,17 @@ async def game_websocket(websocket: WebSocket) -> None:
         except Exception:
             logger.exception("WebSocket 清理房间失败 user=%s", user_id)
         await _safe_close(websocket, 1000, "")
+        logger.info(
+            "ws_disconnected",
+            extra={
+                "event": "ws_disconnected",
+                "user_id": user_id,
+                "connection_id": conn.connection_id,
+                "duration_ms": round(
+                    (time.monotonic() - connected_at) * 1000, 2
+                ),
+            },
+        )
 
 
 __all__ = ["router"]

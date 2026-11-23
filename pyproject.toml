@@ -1,0 +1,27 @@
+# 开发工具配置：ruff / mypy / coverage。
+# 项目本身不是可安装的 Python 包，因此不声明 [project]。
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+extend-exclude = ["server/.venv", ".venv", "build", "dist"]
+
+[tool.ruff.lint]
+# 先启用低争议的基础规则，后续再逐步加入 I/B/UP 等规则集。
+select = ["E4", "E7", "E9", "F"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+# Pydantic v2 的 computed_field 会把装饰器叠在 @property 上，mypy 会误报。
+disable_error_code = ["prop-decorator"]
+exclude = ["^tests/", "^server/tests/"]
+
+[tool.coverage.run]
+branch = true
+source = ["gomoku", "server"]
+omit = ["tests/*", "server/tests/*", "gomoku/client/assets/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

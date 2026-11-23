@@ -17,12 +17,10 @@ import asyncio
 import logging
 import secrets
 import time
-from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, cast
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy import delete, or_, select, update
-from starlette.websockets import WebSocket
 
 from gomoku.shared.achievements import new_achievement_keys
 from gomoku.shared.avatar import DEFAULT_AVATAR, normalize_avatar
@@ -59,6 +57,7 @@ from gomoku.shared.social import (
 from server.app.achievement_service import achievement_keys_for_user
 from server.app.config import Settings
 from server.app.db import utcnow_naive
+from server.app.metrics import ServerMetrics
 from server.app.models import (
     Friendship,
     Game,
@@ -68,6 +67,13 @@ from server.app.models import (
     new_id,
 )
 from server.app.ratings import calculate_pair, rank_for_rating
+from server.app.ws.entities import (
+    ClientConnection,
+    QueuedPlayer,
+    Room,
+    RoomInvite,
+)
+from server.app.ws.limits import IpConnectionLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -95,170 +101,6 @@ def _status_for_game(game: GameModel) -> str:
     return "playing"
 
 
-@dataclass
-class ClientConnection:
-    """一条已认证的 WebSocket 连接及其发送锁。"""
-
-    connection_id: str
-    user_id: str
-    username: str
-    websocket: WebSocket
-    avatar: str = DEFAULT_AVATAR
-    avatar_version: int = 0
-    achievements: tuple[str, ...] = ()
-    rating: int = 0
-    connected: bool = True
-    _send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
-    async def send(self, message: dict) -> bool:
-        if not self.connected:
-            return False
-        try:
-            async with self._send_lock:
-                await self.websocket.send_json(message)
-            return True
-        except Exception:
-            logger.warning("WebSocket 发送失败 user=%s", self.user_id)
-            self.connected = False
-            return False
-
-    async def close(self, code: int = 1000, reason: str = "") -> None:
-        if not self.connected:
-            return
-        self.connected = False
-        try:
-            await self.websocket.close(code=code, reason=reason)
-        except Exception:
-            pass
-
-
-@dataclass
-class QueuedPlayer:
-    """匹配队列中的一名玩家（内存状态）。"""
-
-    conn: ClientConnection
-    rating: int
-    queued_at: float
-
-
-@dataclass
-class Room:
-    """一个好友房或排位房的服务器权威状态。"""
-
-    code: str
-    game_id: str
-    black_user_id: str
-    white_user_id: Optional[str]
-    black_name: str
-    white_name: str
-    turn_seconds: int
-    black_avatar: str = DEFAULT_AVATAR
-    white_avatar: str = DEFAULT_AVATAR
-    black_avatar_version: int = 0
-    white_avatar_version: int = 0
-    black_achievements: tuple[str, ...] = ()
-    white_achievements: tuple[str, ...] = ()
-    # 排位结算后本局新解锁的成就；按用户 id 保存，供终局快照提示。
-    new_achievements: dict[str, tuple[str, ...]] = field(
-        default_factory=dict
-    )
-    game: GameModel = field(default_factory=GameModel)
-    status: str = "waiting"  # waiting/playing/black_won/white_won/draw
-    winner_user_id: Optional[str] = None
-    result_reason: Optional[str] = None
-    connections: dict[str, ClientConnection] = field(default_factory=dict)
-    # 观战者：不是本局玩家，只接收权威快照，不能进行任何操作。
-    # 刻意不放进 connections——那个字典会被聊天广播、房间关闭广播和再战
-    # 投票逻辑遍历，放进去等于悄悄给观战者发了玩家权限。
-    spectators: dict[str, ClientConnection] = field(default_factory=dict)
-    rematch_votes: set[str] = field(default_factory=set)
-    processed_moves: dict[str, int] = field(default_factory=dict)
-    # 服务端局面版本。悔棋会让手数变小，客户端用版本号识别回滚快照。
-    state_version: int = 0
-    # 待回应的悔棋请求发起者；为空表示没有请求。
-    undo_requester_id: Optional[str] = None
-    undo_task: Optional[asyncio.Task] = None
-    undo_token: int = 0
-    # 掉线宽限：按用户保存计时任务，重连时取消对应的逃跑判负。
-    escape_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
-    escape_tokens: dict[str, int] = field(default_factory=dict)
-    turn_deadline_ms: Optional[int] = None
-    timeout_task: Optional[asyncio.Task] = None
-    turn_token: int = 0
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    # 表情/评论专用锁：只用于串行化发言广播，绝不占用 lock，
-    # 否则聊天会拖慢落子写库和超时判定，可能造成误判超时负。
-    chat_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    # 每个用户最近若干次发言的时间戳（time.monotonic），用于限流。
-    chat_sent_times: dict[str, list[float]] = field(default_factory=dict)
-    rated: bool = False
-    matchmade: bool = False
-    rating_before: dict[str, int] = field(default_factory=dict)
-    rating_after: dict[str, int] = field(default_factory=dict)
-    rating_delta: dict[str, int] = field(default_factory=dict)
-    rating_applied: bool = False
-
-    def color_for(self, user_id: str) -> Optional[Player]:
-        if user_id == self.black_user_id:
-            return Player.BLACK
-        if user_id == self.white_user_id:
-            return Player.WHITE
-        return None
-
-    def opponent_id(self, user_id: str) -> Optional[str]:
-        if user_id == self.black_user_id:
-            return self.white_user_id
-        if user_id == self.white_user_id:
-            return self.black_user_id
-        return None
-
-    def username_for(self, user_id: str) -> str:
-        if user_id == self.black_user_id:
-            return self.black_name
-        if user_id == self.white_user_id:
-            return self.white_name
-        return "对手"
-
-    def avatar_for(self, user_id: str) -> str:
-        if user_id == self.black_user_id:
-            return normalize_avatar(self.black_avatar, user_id)
-        if user_id == self.white_user_id:
-            return normalize_avatar(self.white_avatar, user_id)
-        return DEFAULT_AVATAR
-
-    def avatar_version_for(self, user_id: str) -> int:
-        if user_id == self.black_user_id:
-            return max(0, self.black_avatar_version)
-        if user_id == self.white_user_id:
-            return max(0, self.white_avatar_version)
-        return 0
-
-    def achievements_for(self, user_id: str) -> tuple[str, ...]:
-        if user_id == self.black_user_id:
-            return self.black_achievements
-        if user_id == self.white_user_id:
-            return self.white_achievements
-        return ()
-
-    def participant_ids(self) -> list[str]:
-        return [
-            uid
-            for uid in (self.black_user_id, self.white_user_id)
-            if uid
-        ]
-
-
-@dataclass
-class RoomInvite:
-    """房主向在线好友发出的对局邀请（单进程内存状态）。"""
-
-    invite_id: str
-    room: Room
-    inviter_id: str
-    invitee_id: str
-    created_at: float
-
-
 class RoomManager:
     """单进程内所有连接、房间与计时器的管理者。"""
 
@@ -266,11 +108,16 @@ class RoomManager:
         self,
         settings: Settings,
         session_factory: async_sessionmaker[AsyncSession],
+        metrics: ServerMetrics,
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
+        self._metrics = metrics
         self._rooms_by_code: dict[str, Room] = {}
         self._room_by_user: dict[str, Room] = {}
+        self._connection_limiter = IpConnectionLimiter(
+            settings.max_connections_per_ip
+        )
         # 观战者 → 正在观战的房间。观战者绝不进 _room_by_user：
         # 那张表表示“这个人是本局玩家”，混进去会让离开房间/断线/重连
         # 逻辑把观战者当成对局参与者处理。
@@ -292,6 +139,27 @@ class RoomManager:
         """用户当前是否有一条活动连接。"""
         conn = self._connections.get(user_id)
         return conn is not None and conn.connected
+
+    def _release_connection_locked(self, connection_id: str) -> None:
+        """调用方必须持有 ``_state_lock``。"""
+        self._connection_limiter.release(connection_id)
+
+    async def reserve_connection(self, conn: ClientConnection) -> bool:
+        """认证后登记 IP 配额；同一 connection_id 重复调用是幂等的。"""
+        async with self._state_lock:
+            existing = self._connections.get(conn.user_id)
+            replacing_id = (
+                existing.connection_id
+                if existing is not None and existing is not conn
+                else None
+            )
+            return self._connection_limiter.reserve(
+                conn.client_ip, conn.connection_id, replacing_id
+            )
+
+    async def release_connection(self, connection_id: str) -> None:
+        async with self._state_lock:
+            self._release_connection_locked(connection_id)
 
     async def update_connection_avatar(
         self, user_id: str, avatar: str, avatar_version: int
@@ -476,6 +344,22 @@ class RoomManager:
         opponent_id = room.opponent_id(user_id)
         last_move = room.game.last_move
         status = room.status
+        undo_limit = self._settings.undo_limit_per_game if color else 0
+        used_undos = room.undo_counts.get(user_id, 0) if color else 0
+        undo_remaining = max(0, undo_limit - used_undos)
+        undo_cooldown_seconds = (
+            int(self._settings.undo_cooldown_seconds + 0.999)
+            if color and self._settings.undo_cooldown_seconds > 0
+            else 0
+        )
+        undo_cooldown_until_ms: Optional[int] = None
+        if color and self._settings.undo_cooldown_seconds > 0:
+            last_undo = room.undo_last_request.get(user_id)
+            if last_undo is not None:
+                undo_cooldown_until_ms = int(
+                    (last_undo + self._settings.undo_cooldown_seconds)
+                    * 1000
+                )
         return {
             "game_id": room.game_id,
             "board": [
@@ -493,6 +377,10 @@ class RoomManager:
             "state_version": room.state_version,
             "result_reason": room.result_reason or "",
             "undo_requester_id": room.undo_requester_id or "",
+            "undo_remaining": undo_remaining,
+            "undo_limit": undo_limit,
+            "undo_cooldown_until_ms": undo_cooldown_until_ms,
+            "undo_cooldown_seconds": undo_cooldown_seconds,
             "last_move": (
                 None
                 if last_move is None
@@ -545,8 +433,16 @@ class RoomManager:
             "rated": room.rated,
             "your_rating_before": room.rating_before.get(user_id),
             "your_rating_after": room.rating_after.get(user_id),
-            "opponent_rating_before": room.rating_before.get(opponent_id),
-            "opponent_rating_after": room.rating_after.get(opponent_id),
+            "opponent_rating_before": (
+                room.rating_before.get(opponent_id)
+                if opponent_id is not None
+                else None
+            ),
+            "opponent_rating_after": (
+                room.rating_after.get(opponent_id)
+                if opponent_id is not None
+                else None
+            ),
             "rating_delta": room.rating_delta.get(user_id),
         }
 
@@ -700,6 +596,8 @@ class RoomManager:
         queued: Optional[QueuedPlayer] = None
         async with self._state_lock:
             old_conn = self._connections.get(conn.user_id)
+            if old_conn is not None and old_conn is not conn:
+                self._release_connection_locked(old_conn.connection_id)
             self._connections[conn.user_id] = conn
             queued = self._queue.get(conn.user_id)
             if queued is not None:
@@ -715,7 +613,17 @@ class RoomManager:
                     # 观战者重连：重新挂上新连接并补发一份快照，
                     # 否则棋盘会是空白的。
                     async with watched.lock:
+                        was_watching = conn.user_id not in watched.spectators
                         watched.spectators[conn.user_id] = conn
+                        if was_watching:
+                            self._metrics.reconnects.inc()
+                            logger.info(
+                                "spectator_reconnected",
+                                extra={
+                                    "event": "spectator_reconnected",
+                                    "game_id": watched.game_id,
+                                },
+                            )
                         await self._send_game_state(watched, conn)
                 if queued is not None:
                     await self._send_queue_status(conn)
@@ -724,8 +632,18 @@ class RoomManager:
             async with room.lock:
                 if conn.user_id not in room.participant_ids():
                     return
+                is_reconnect = conn.user_id not in room.connections
                 room.connections[conn.user_id] = conn
                 self._cancel_escape_timer_locked(room, conn.user_id)
+                if is_reconnect:
+                    self._metrics.reconnects.inc()
+                    logger.info(
+                        "ws_reconnected",
+                        extra={
+                            "event": "ws_reconnected",
+                            "game_id": room.game_id,
+                        },
+                    )
                 if room.status == "waiting":
                     if conn.user_id == room.black_user_id:
                         await self._send_room_created(conn, room)
@@ -751,6 +669,7 @@ class RoomManager:
     async def detach(self, conn: ClientConnection) -> None:
         """连接断开；旧连接被新连接替换时不做任何房间变更。"""
         async with self._state_lock:
+            self._release_connection_locked(conn.connection_id)
             if self._connections.get(conn.user_id) is not conn:
                 return
             self._connections.pop(conn.user_id, None)
@@ -769,7 +688,6 @@ class RoomManager:
         if room is None:
             return
 
-        current_task = asyncio.current_task()
         cleanup = False
         room_closed_reason = ""
         async with room.lock:
@@ -856,7 +774,10 @@ class RoomManager:
         return game_row
 
     async def create_room(
-        self, conn: ClientConnection, request_id: Optional[str] = None
+        self,
+        conn: ClientConnection,
+        request_id: Optional[str] = None,
+        allow_spectators: bool = True,
     ) -> None:
         if not self._is_current_connection(conn):
             return
@@ -888,6 +809,7 @@ class RoomManager:
                         black_avatar_version=conn.avatar_version,
                         black_achievements=conn.achievements,
                         connections={conn.user_id: conn},
+                        allow_spectators=allow_spectators,
                     )
                     self._rooms_by_code[code] = room
                     self._room_by_user[conn.user_id] = room
@@ -978,6 +900,7 @@ class RoomManager:
         elif joined_room is not None:
             async with joined_room.lock:
                 await self._broadcast_game_state(joined_room)
+            self._record_game_started(joined_room)
             # 对局开始，进行中的对局列表多了一条。
             await self._notify_live_games_changed()
 
@@ -1239,6 +1162,7 @@ class RoomManager:
         if joined_room is not None:
             async with joined_room.lock:
                 await self._broadcast_game_state(joined_room)
+            self._record_game_started(joined_room)
             # 对局开始，进行中的对局列表多了一条。
             await self._notify_live_games_changed()
 
@@ -1401,6 +1325,7 @@ class RoomManager:
         self._rooms_by_code[code] = room
         self._room_by_user[black.conn.user_id] = room
         self._room_by_user[white.conn.user_id] = room
+        self._record_game_started(room)
         self._start_timeout_locked(room)
 
         outgoing: list[tuple[ClientConnection, dict]] = []
@@ -1516,14 +1441,22 @@ class RoomManager:
             target = self._find_playing_room(game_id)
             if target is None:
                 error = "对局不存在或已结束"
+            elif not target.allow_spectators:
+                error = "该对局未开启观战"
             elif target.color_for(conn.user_id) is not None:
                 # 自己下的棋不能观摩，只能专心下。
                 error = "你不能观摩自己的对局"
             elif conn.user_id in self._room_by_user:
                 error = "你已经在一个房间中"
             elif self._rooms_by_code.get(target.code) is not target:
-                # 房间在查找和登记之间被清理掉了。
+                # 房间在查找或登记时被清理掉了。
                 error = "对局不存在或已结束"
+            elif (
+                conn.user_id not in target.spectators
+                and len(target.spectators)
+                >= self._settings.max_spectators_per_room
+            ):
+                error = "观战人数已满"
             else:
                 previous = self._spectator_by_user.get(conn.user_id)
                 if previous is not None and previous is not target:
@@ -1554,11 +1487,59 @@ class RoomManager:
                 "status": room.status,
             }
             for room in self._rooms_by_code.values()
-            if room.status == "playing"
+            if room.status == "playing" and room.allow_spectators
         ]
         # 手数多的对局更“热”，排在前面；game_id 兜底保证顺序稳定。
-        entries.sort(key=lambda entry: (-entry["move_no"], entry["game_id"]))
+        entries.sort(
+            key=lambda entry: (
+                -cast(int, entry["move_no"]),
+                cast(str, entry["game_id"]),
+            )
+        )
         return entries
+
+    def metrics_snapshot(self) -> dict[str, int]:
+        """给 Prometheus collector 读取的即时房间/连接状态。"""
+        rooms = list(self._rooms_by_code.values())
+        return {
+            "connections": len(self._connections),
+            "rooms_active": len(rooms),
+            "rooms_playing": sum(
+                1 for room in rooms if room.status == "playing"
+            ),
+            "rooms_waiting": sum(
+                1 for room in rooms if room.status == "waiting"
+            ),
+            "spectators": sum(
+                len(room.spectators) for room in rooms
+            ),
+            "match_queue": len(self._queue),
+        }
+
+    def _record_game_started(self, room: Room) -> None:
+        self._metrics.games_started.inc()
+        logger.info(
+            "game_started",
+            extra={
+                "event": "game_started",
+                "game_id": room.game_id,
+                "rated": room.rated,
+            },
+        )
+
+    def _record_game_finished(self, room: Room) -> None:
+        reason = room.result_reason or "unknown"
+        self._metrics.games_finished.labels(reason=reason).inc()
+        logger.info(
+            "game_ended",
+            extra={
+                "event": "game_ended",
+                "game_id": room.game_id,
+                "reason": reason,
+                "move_no": room.game.move_count,
+                "status": room.status,
+            },
+        )
 
     # ------------------------------------------------------------------
     # 落子/认输/再战
@@ -1627,6 +1608,7 @@ class RoomManager:
             elif room.game.winner is Player.WHITE:
                 winner_id = room.white_user_id
 
+            db_started = time.perf_counter()
             try:
                 async with self._session_factory() as session:
                     game_row = await session.get(Game, room.game_id)
@@ -1657,6 +1639,17 @@ class RoomManager:
                 room.game.undo()
                 await self._send_error(conn, "服务器保存落子失败，请重试")
                 return
+            db_seconds = time.perf_counter() - db_started
+            self._metrics.record_move(db_seconds)
+            logger.debug(
+                "move_confirmed",
+                extra={
+                    "event": "move_confirmed",
+                    "game_id": room.game_id,
+                    "move_no": new_move_no,
+                    "duration_ms": round(db_seconds * 1000, 2),
+                },
+            )
 
             room.processed_moves[request_id] = new_move_no
             room.status = status
@@ -1672,6 +1665,7 @@ class RoomManager:
                     "five" if winner_id is not None else "draw"
                 )
                 room.turn_deadline_ms = None
+                self._record_game_finished(room)
                 await self._settle_rated_game_locked(room)
 
             await self._broadcast_game_state(
@@ -1762,6 +1756,33 @@ class RoomManager:
                 )
                 return
 
+            limit = self._settings.undo_limit_per_game
+            if limit <= 0:
+                await self._send_error(conn, "本局未开启悔棋", request_id)
+                return
+            used = room.undo_counts.get(conn.user_id, 0)
+            if used >= limit:
+                await self._send_error(
+                    conn,
+                    f"本局悔棋次数已用完（每方 {limit} 次）",
+                    request_id,
+                )
+                return
+            cooldown = self._settings.undo_cooldown_seconds
+            now = time.time()
+            last_request = room.undo_last_request.get(conn.user_id)
+            if cooldown > 0 and last_request is not None:
+                wait = last_request + cooldown - now
+                if wait > 0:
+                    await self._send_error(
+                        conn,
+                        f"悔棋请求过于频繁，请 {max(1, int(wait) + 1)} 秒后再试",
+                        request_id,
+                    )
+                    return
+
+            room.undo_counts[conn.user_id] = used + 1
+            room.undo_last_request[conn.user_id] = now
             room.undo_requester_id = conn.user_id
             room.state_version += 1
             # 等待回应期间暂停本回合计时，避免对手故意拖延。
@@ -1875,6 +1896,14 @@ class RoomManager:
             }
             room.state_version += 1
             self._start_timeout_locked(room)
+            logger.info(
+                "undo_accepted",
+                extra={
+                    "event": "undo_accepted",
+                    "game_id": room.game_id,
+                    "move_no": target_move_no,
+                },
+            )
             await self._broadcast_undo_status(
                 room, "accepted", requester_id, "对手已同意悔棋"
             )
@@ -1905,9 +1934,11 @@ class RoomManager:
                         await self._send_rematch_status(room)
                     else:
                         try:
+                            # 能进入再战说明对局已结束且双方都在房间，
+                            # 白方座位必然存在；cast 仅用于满足类型检查。
                             new_game = await self._create_game_row(
                                 room.code,
-                                room.white_user_id,  # 交换黑白
+                                cast(str, room.white_user_id),  # 交换黑白
                                 room.black_user_id,
                                 "playing",
                                 True,
@@ -1917,7 +1948,7 @@ class RoomManager:
                             error = "服务器无法开始下一局"
                         else:
                             old_black = room.black_user_id
-                            old_white = room.white_user_id
+                            old_white = cast(str, room.white_user_id)
                             old_black_name = room.black_name
                             old_white_name = room.white_name
                             old_black_avatar = room.black_avatar
@@ -1944,11 +1975,14 @@ class RoomManager:
                             room.new_achievements.clear()
                             room.rematch_votes.clear()
                             room.processed_moves.clear()
+                            room.undo_counts.clear()
+                            room.undo_last_request.clear()
                             self._clear_undo_locked(room)
                             self._cancel_all_escape_timers_locked(room)
                             room.state_version = 0
                             self._start_timeout_locked(room)
                             await self._broadcast_game_state(room)
+                            self._record_game_started(room)
                             # 再战开新局：列表里的对局编号换了一个。
                             await self._notify_live_games_changed()
                 else:
@@ -2176,6 +2210,7 @@ class RoomManager:
         room.result_reason = reason
         room.turn_deadline_ms = None
         room.rematch_votes.clear()
+        self._record_game_finished(room)
         room.state_version += 1
         self._clear_undo_locked(room)
         self._cancel_all_escape_timers_locked(room)
@@ -2450,7 +2485,14 @@ class RoomManager:
         self._room_by_user.clear()
         self._spectator_by_user.clear()
         self._connections.clear()
+        self._connection_limiter.clear()
         self._queue.clear()
 
 
-__all__ = ["ClientConnection", "Room", "RoomManager"]
+__all__ = [
+    "ClientConnection",
+    "QueuedPlayer",
+    "Room",
+    "RoomInvite",
+    "RoomManager",
+]

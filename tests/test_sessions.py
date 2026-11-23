@@ -27,7 +27,14 @@ from gomoku.client.sessions import (  # noqa: E402
     LocalGameSession,
     OnlineGameSession,
 )
+from gomoku.client.sessions.online_state import (  # noqa: E402
+    OnlineSessionPhase,
+)
+from gomoku.shared.capabilities import (  # noqa: E402
+    CLIENT_CAPABILITIES,
+)
 from gomoku.shared.protocol import (  # noqa: E402
+    CLIENT_AUTH,
     CLIENT_CANCEL_MATCH,
     CLIENT_QUICK_MATCH,
     CLIENT_UNDO_REQUEST,
@@ -38,7 +45,6 @@ from gomoku.shared.protocol import (  # noqa: E402
     SERVER_MOVE_REJECTED,
     SERVER_OPPONENT_STATUS,
     SERVER_QUEUE_STATUS,
-    SERVER_REMATCH_STATUS,
     SERVER_ROOM_CLOSED,
     SERVER_ROOM_CREATED,
     SERVER_UNDO_STATUS,
@@ -122,7 +128,8 @@ def state_message(
     board: list[list[str | None]],
     *,
     current: str = "black",
-    your_color: str = "black",
+    your_color: str | None = "black",
+    is_spectator: bool = False,
     move_no: int = 0,
     status: str = "playing",
     last_move: dict | None = None,
@@ -139,6 +146,11 @@ def state_message(
     state_version: int = 0,
     result_reason: str = "",
     undo_requester_id: str = "",
+    undo_remaining: int = 3,
+    undo_limit: int = 3,
+    undo_cooldown_seconds: int = 10,
+    undo_cooldown_until_ms: int | None = None,
+    server_now_ms: int | None = None,
 ) -> dict:
     """构造一个符合协议的服务器局面消息。"""
     return make_message(
@@ -148,6 +160,7 @@ def state_message(
             "board": board,
             "current_player": current,
             "your_color": your_color,
+            "is_spectator": is_spectator,
             "move_no": move_no,
             "status": status,
             "last_move": last_move,
@@ -156,6 +169,11 @@ def state_message(
             "state_version": state_version,
             "result_reason": result_reason,
             "undo_requester_id": undo_requester_id,
+            "undo_remaining": undo_remaining,
+            "undo_limit": undo_limit,
+            "undo_cooldown_seconds": undo_cooldown_seconds,
+            "undo_cooldown_until_ms": undo_cooldown_until_ms,
+            "server_now_ms": server_now_ms,
             "room_code": room_code,
             "your_rating_before": your_rating_before,
             "your_rating_after": your_rating_after,
@@ -397,6 +415,112 @@ class OnlineSessionTests(unittest.TestCase):
                 {"user": {"id": "u1", "username": "tester"}},
             )
         )
+
+    def test_capability_negotiation(self) -> None:
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        try:
+            self.assertTrue(session.authenticate("token"))
+            sent = transport.sent_messages[-1]
+            self.assertEqual(sent["type"], CLIENT_AUTH)
+            self.assertEqual(
+                set(sent["payload"]["capabilities"]),
+                set(CLIENT_CAPABILITIES),
+            )
+
+            transport.receive(
+                make_message(
+                    SERVER_AUTHENTICATED,
+                    {
+                        "user": {"id": "u1", "username": "tester"},
+                        "capabilities": ["spectate", "unknown_feature"],
+                    },
+                )
+            )
+            self.assertEqual(
+                session.server_capabilities,
+                frozenset({"spectate", "unknown_feature"}),
+            )
+            self.assertTrue(session.supports("spectate"))
+            self.assertFalse(session.supports("missing"))
+        finally:
+            session.shutdown()
+            transport.close()
+
+    def test_phase_transitions(self) -> None:
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        try:
+            self.assertIs(
+                session.phase, OnlineSessionPhase.CONNECTING
+            )
+            self._authenticate(transport, session)
+            self.assertIs(session.phase, OnlineSessionPhase.LOBBY)
+
+            transport.receive(
+                make_message(
+                    SERVER_ROOM_CREATED,
+                    {
+                        "room_code": "ABC123",
+                        "game_id": "game-phase",
+                        "your_color": "black",
+                        "black_name": "tester",
+                        "white_name": "",
+                        "turn_seconds": 30,
+                    },
+                )
+            )
+            self.assertIs(session.phase, OnlineSessionPhase.WAITING)
+
+            transport.receive(
+                state_message(
+                    blank_board(),
+                    game_id="game-phase",
+                    current="black",
+                    your_color="black",
+                    move_no=0,
+                )
+            )
+            self.assertIs(session.phase, OnlineSessionPhase.PLAYING)
+            self.assertTrue(session.is_connected)
+
+            transport.drop("network lost")
+            self.assertFalse(session.is_connected)
+            self.assertIs(session.phase, OnlineSessionPhase.PLAYING)
+        finally:
+            session.shutdown()
+            transport.close()
+        self.assertIs(session.phase, OnlineSessionPhase.CLOSED)
+
+    def test_phase_queued_and_spectating(self) -> None:
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        try:
+            self._authenticate(transport, session)
+            transport.receive(
+                make_message(
+                    SERVER_QUEUE_STATUS,
+                    {"state": "queued", "queue_size": 1},
+                )
+            )
+            self.assertIs(session.phase, OnlineSessionPhase.QUEUED)
+
+            transport.receive(
+                state_message(
+                    blank_board(),
+                    current="black",
+                    your_color=None,
+                    is_spectator=True,
+                    move_no=0,
+                    game_id="spectate-phase",
+                )
+            )
+            self.assertIs(
+                session.phase, OnlineSessionPhase.SPECTATING
+            )
+        finally:
+            session.shutdown()
+            transport.close()
 
     def test_auth_room_lobby_lifecycle(self) -> None:
         transport = FakeTransport()
@@ -881,6 +1005,65 @@ class OnlineSessionTests(unittest.TestCase):
             response = transport.sent_messages[-1]
             self.assertEqual(response["type"], CLIENT_UNDO_RESPONSE)
             self.assertTrue(response["payload"]["accept"])
+        finally:
+            session.shutdown()
+            transport.close()
+
+    def test_undo_quota_and_cooldown_block_requests(self) -> None:
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        try:
+            self._authenticate(transport, session)
+            board = blank_board()
+            board[7][7] = "black"
+
+            transport.receive(
+                state_message(
+                    board,
+                    current="black",
+                    your_color="black",
+                    move_no=1,
+                    state_version=1,
+                    undo_remaining=0,
+                    undo_limit=3,
+                )
+            )
+            self.assertFalse(session.can_undo)
+            self.assertFalse(session.request_undo())
+
+            transport.receive(
+                state_message(
+                    board,
+                    current="black",
+                    your_color="black",
+                    move_no=1,
+                    state_version=2,
+                    undo_remaining=2,
+                    undo_limit=3,
+                    undo_cooldown_until_ms=1_010_000,
+                    server_now_ms=1_000_000,
+                )
+            )
+            self.assertFalse(session.can_undo)
+            self.assertGreater(session.undo_cooldown_remaining, 0)
+            self.assertLessEqual(session.undo_cooldown_remaining, 10)
+
+            transport.receive(
+                state_message(
+                    board,
+                    current="black",
+                    your_color="black",
+                    move_no=1,
+                    state_version=3,
+                    undo_remaining=2,
+                    undo_limit=3,
+                    undo_cooldown_until_ms=999_000,
+                    server_now_ms=1_000_000,
+                )
+            )
+            self.assertTrue(session.can_undo)
+            self.assertEqual(session.undo_remaining, 2)
+            self.assertEqual(session.undo_limit, 3)
         finally:
             session.shutdown()
             transport.close()

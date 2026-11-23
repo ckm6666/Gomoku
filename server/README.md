@@ -25,7 +25,10 @@ server/
 ├── app/
 │   ├── main.py             # FastAPI app factory、REST/WS 路由、生命周期
 │   ├── config.py           # 环境变量配置
-│   ├── db.py               # 异步引擎、建表、加列迁移、启动作废未完成对局
+│   ├── db.py               # 异步引擎、旧库兼容建表、启动作废未完成对局
+│   ├── migrations.py       # 启动时执行 Alembic upgrade / 旧库登记基线
+│   ├── metrics.py          # Prometheus 指标与房间状态 collector
+│   ├── observability.py    # 结构化日志、请求 ID、用户上下文
 │   ├── models.py           # users/friendships/direct_messages/games/moves/rating_events
 │   ├── ratings.py          # Elo 与段位纯函数
 │   ├── achievement_service.py  # 由账号统计推导成就
@@ -39,13 +42,21 @@ server/
 │   ├── api/friends.py      # 好友申请/列表/同意/拒绝/删除
 │   ├── api/messages.py     # 好友私聊历史与发送
 │   ├── api/games.py        # /games/recent、/games/live 与 /games/{id}
-│   └── ws/
-│       ├── endpoint.py     # WebSocket 首帧认证与命令分发
-│       └── rooms.py        # 自建房邀请、匹配队列、排位结算、时钟、重连、再战
-├── tests/                  # REST + 双 WebSocket + Elo 测试
-├── requirements.txt
-├── requirements-dev.txt
-├── requirements-postgres.txt
+│   ├── ws/
+│   │   ├── endpoint.py     # WebSocket 首帧认证、能力协商与命令分发
+│   │   ├── entities.py     # 连接/房间/邀请/队列纯数据实体
+│   │   ├── limits.py       # 命令令牌桶与单 IP 连接配额
+│   │   └── rooms.py        # 自建房邀请、匹配队列、排位结算、时钟、重连、再战
+├── migrations/             # Alembic 版本化迁移（0001_baseline 起）
+├── alembic.ini             # 迁移脚本路径与数据库 URL 占位
+├── Dockerfile              # 服务端生产镜像（非 root、健康检查）
+├── tests/                  # REST + 双 WebSocket + Elo + 迁移 + 可观测性测试
+├── requirements.txt              # 运行依赖（版本范围）
+├── requirements.lock             # 运行依赖锁定（含哈希）
+├── requirements-dev.txt          # 开发/测试依赖
+├── requirements-dev.lock         # 开发/测试依赖锁定（含哈希）
+├── requirements-postgres.txt     # PostgreSQL 驱动
+├── requirements-postgres.lock    # PostgreSQL 驱动锁定（含哈希）
 └── manage.py               # 管理员重置密码
 ```
 
@@ -56,9 +67,9 @@ server/
 ```powershell
 cd C:\Users\a1325\Desktop\Gomoku
 
-# 项目已包含 server\.venv；若从零安装：
+# 项目已包含 server\.venv；若从零安装（可复现，推荐）：
 py -3 -m venv server\.venv
-server\.venv\Scripts\python.exe -m pip install -r server\requirements-dev.txt
+server\.venv\Scripts\python.exe -m pip install --require-hashes -r server\requirements-dev.lock
 
 # 固定一个足够长的开发 secret（生产必须换成真正随机秘密）
 $env:GOMOKU_SERVER_ENV = "development"
@@ -153,11 +164,13 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 | `DELETE /api/v1/friends/{user_id}` | 删除好友 |
 | `GET /api/v1/messages/{user_id}?limit=50` | 与好友的最近私聊；只把本次返回的消息标记已读 |
 | `POST /api/v1/messages/{user_id}` | 发送私聊（`{"content": ...}`），在线时实时推送 |
+| `WS auth` | 首帧认证；可携带 `capabilities` 声明客户端能力，响应返回服务端 `capabilities` |
+| `WS create_room` | 自建房；`allow_spectators=false` 可关闭观战并移出对战广场 |
 | `WS quick_match` | 加入排位匹配队列 |
 | `WS cancel_match` | 离开排位队列 |
 | `WS queue_status` | 服务端返回 queued/idle、队列人数、当前积分/段位 |
 | `WS match_found` | 匹配成功，返回 game_id、执子颜色、对手昵称和双方赛前积分 |
-| `WS game_state` | 权威快照新增 `rated`、`your_rating_before/after`、`opponent_rating_before/after`、`rating_delta`、双方 user_id/头像版本/已解锁成就，以及本人的 `your_new_achievements`；`state_version` 标识回滚、`result_reason` 标识终局原因、`undo_requester_id` 标识待回应悔棋 |
+| `WS game_state` | 权威快照新增 `rated`、`your_rating_before/after`、`opponent_rating_before/after`、`rating_delta`、双方 user_id/头像版本/已解锁成就，以及本人的 `your_new_achievements`；`state_version` 标识回滚、`result_reason` 标识终局原因、`undo_requester_id` 标识待回应悔棋、`undo_remaining/undo_limit/undo_cooldown_*` 标识悔棋配额与冷却 |
 | `WS undo_request` / `undo_response` | 当前回合玩家发起悔棋请求，对手同意或拒绝 |
 | `WS undo_status` | 悔棋状态：requested/accepted/declined/expired/cancelled |
 | `WS invite_to_room` | 房主邀请在线好友加入自建房 |
@@ -172,12 +185,19 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 - 创建自建房者执黑先手，被邀请并接受的玩家执白。
 - 每手默认 30 秒，服务器倒计时；超时由服务器判负。
 - 客户端只发送落子意图；服务器校验座位/回合/坐标/时钟后，先把落子和局面写入数据库，再广播权威快照。
+- 认证帧可携带 `capabilities`，服务端在认证响应中返回自身能力；未知能力会被忽略，
+  但权限仍由服务端独立校验，不能只依赖能力声明。
 - 断线不立即结束服务端房间：服务器保留房间与时钟，客户端可在宽限期内重连；重连后服务器下发完整快照。
 - 掉线超过 `GOMOKU_DISCONNECT_FORFEIT_SECONDS`（默认 20 秒）仍未重连，判对手获胜，
   终局原因记为 `escape`；排位赛照常结算。
 - 进行中的对局不支持单方面悔棋：当前回合玩家可发起悔棋请求，对手同意后服务器删除
   请求者最后一手及其后的落子（数据库同步删除），拒绝或 30 秒未回应则保持原局面。
-- 支持认输。
+  每方每局有悔棋次数上限，两次请求之间有冷却。
+- 支持认输；客户端会二次确认，服务端仍以认输消息为准。
+- 自建房可以在创建时关闭观战；关闭后不出现在广场，`watch_game` 也会被拒绝。
+  每局观战人数有上限，避免慢连接拖慢落子广播。
+- 单 IP 的已认证 WebSocket 连接数有上限；非心跳命令使用令牌桶限流。
+  生产位于可信反向代理后时，开启 `GOMOKU_TRUST_PROXY_HEADERS` 才能按真实客户端 IP 限流。
 - 自建房双方都申请再战后，服务器创建新对局（不计分）并交换黑白；排位房拒绝再战。
 - 服务重启时未终局对局统一标记为 `abandoned`，客户端回到大厅；不伪装成崩溃恢复。
 - 自建房使用过期时间 60 秒的定向邀请；邀请要求双方为好友且被邀请者在线。内部仍保留随机房间码用于数据库记录，但客户端不再展示或要求输入。
@@ -186,18 +206,46 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 ## 数据库兼容与迁移
 
 - 开发默认 SQLite（`server/data/gomoku.db`），生产可切换 PostgreSQL。
-- 启动时 `create_all` 创建缺失表；`db._apply_additive_schema` 会为 Stage 1 旧数据库
-  自动补加 `users.rating` 等列、`games.rating_applied` 和 `ix_users_rating` 索引。
+- 启动时由 [`server/app/migrations.py`](app/migrations.py) 执行 Alembic：
+  - 全新数据库执行基线迁移 `0001_baseline`；
+  - 已登记 `alembic_version` 的数据库执行 `upgrade head`；
+  - 引入 Alembic 之前的旧库会先补齐历史增量列/表、登记基线，再升级到 head。
+- 后续结构变更必须新增 `server/migrations/versions/` 下的迁移，并在本地执行
+  `alembic upgrade head` 验证；不要再依赖 `create_all` 修改已存在的表。
 - 新表 `rating_events` 有 `(game_id, user_id)` 唯一约束，防止同一局重复入账。
-- 正式公开化前仍建议引入 Alembic 版本化迁移、备份恢复演练和数据库连接池监控。
+- 多实例部署前需要给迁移加数据库级 advisory lock，避免多个 worker 同时升级。
+- 正式公开化前仍建议备份恢复演练和数据库连接池监控。
+
+常用命令（在项目根目录执行）：
+
+```powershell
+# 查看当前版本
+server\.venv\Scripts\alembic.exe -c server\alembic.ini current
+
+# 升级到最新版本
+server\.venv\Scripts\alembic.exe -c server\alembic.ini upgrade head
+
+# 生成新迁移（先设置 GOMOKU_DATABASE_URL）
+$env:GOMOKU_DATABASE_URL = "sqlite+aiosqlite:///server/data/gomoku.db"
+server\.venv\Scripts\alembic.exe -c server\alembic.ini revision --autogenerate -m "描述"
+```
 
 ### PostgreSQL
 
 本机没有安装 PostgreSQL，因此开发默认 SQLite。生产建议安装 PostgreSQL 并执行：
 
 ```powershell
-server\.venv\Scripts\python.exe -m pip install -r server\requirements-postgres.txt
+server\.venv\Scripts\python.exe -m pip install --require-hashes -r server\requirements.lock
+server\.venv\Scripts\python.exe -m pip install --require-hashes -r server\requirements-postgres.lock
 $env:GOMOKU_DATABASE_URL = "postgresql+asyncpg://user:password@host:5432/gomoku"
+```
+
+修改 `requirements*.txt` 后，用 uv 重新生成锁文件：
+
+```powershell
+.\.venv\Scripts\uv.exe pip compile --universal --generate-hashes --no-header server\requirements.txt -o server\requirements.lock
+.\.venv\Scripts\uv.exe pip compile --universal --generate-hashes --no-header server\requirements-dev.txt -o server\requirements-dev.lock
+.\.venv\Scripts\uv.exe pip compile --universal --generate-hashes --no-header server\requirements-postgres.txt -o server\requirements-postgres.lock
 ```
 
 ## 客户端远程连接
@@ -228,9 +276,67 @@ Start-Process C:\Users\a1325\Desktop\Gomoku\dist\Gomoku.exe
 | `GOMOKU_DISCONNECT_FORFEIT_SECONDS` | `20` | 掉线后等待重连的宽限时间，超时判逃跑，0～300 |
 | `GOMOKU_WS_AUTH_TIMEOUT` | `10` | WebSocket 首帧认证超时 |
 | `GOMOKU_WS_IDLE_TIMEOUT` | `75` | 客户端心跳间隔需短于此 |
+| `GOMOKU_LOG_LEVEL` | `INFO` | DEBUG/INFO/WARNING/ERROR/CRITICAL |
+| `GOMOKU_LOG_FORMAT` | `text` | `text` 开发可读；`json` 生产采集 |
+| `GOMOKU_UNDO_LIMIT_PER_GAME` | `3` | 每方每局悔棋次数上限，0 表示关闭悔棋 |
+| `GOMOKU_UNDO_COOLDOWN_SECONDS` | `10` | 同一玩家两次悔棋请求的最小间隔，0 表示无冷却 |
+| `GOMOKU_MAX_SPECTATORS_PER_ROOM` | `50` | 每局观战人数上限 |
+| `GOMOKU_MAX_CONNECTIONS_PER_IP` | `20` | 单个 IP 的已认证 WebSocket 连接上限 |
+| `GOMOKU_WS_COMMAND_BURST` | `40` | 命令令牌桶容量（心跳不计入） |
+| `GOMOKU_WS_COMMAND_WINDOW_SECONDS` | `10` | 命令令牌桶补充窗口，1～3600 秒 |
+| `GOMOKU_TRUST_PROXY_HEADERS` | `0` | 位于可信反向代理后时设为 1，读取 X-Forwarded-For/X-Real-IP |
 
 起始积分、K 值、段位阈值目前定义在 `server/app/ratings.py`，修改后需同步更新文档；
 不通过环境变量开放，避免部署时不同实例积分规则漂移。
+
+## 日志、健康检查与指标
+
+- 日志只记录请求元数据（方法、路由、状态码、耗时、请求 ID、用户/对局 ID），
+  不记录请求体、Authorization 头、密码或 token。
+- HTTP 响应会回写 `X-Request-ID`；客户端传入非法值时服务器生成新的 UUID。
+- 健康检查：
+  - `GET /api/v1/health`、`GET /api/v1/health/live`：进程存活；
+  - `GET /api/v1/health/ready`：额外执行 `SELECT 1`，数据库不可用时返回 503。
+- Prometheus 指标在 `GET /metrics`，包含：
+  - HTTP 请求数/耗时、WebSocket 连接数、房间/观战/匹配队列数；
+  - 落子确认数、落子数据库事务耗时；
+  - 对局开始/结束（按终局原因）、重连数、WebSocket 消息异常数；
+  - 命令限流与单 IP 连接超限被拒绝的次数。
+- `/metrics` 默认无鉴权，生产应在反向代理层限制为内网或监控网段访问。
+- 生产建议 `GOMOKU_LOG_FORMAT=json`，配合 Loki/ELK/云日志采集。
+
+## Docker 部署
+
+项目根目录提供 `docker-compose.yml`，包含服务端和 PostgreSQL 17：
+
+```powershell
+# 在项目根目录创建 .env
+# GOMOKU_JWT_SECRET=至少32字符随机串
+# GOMOKU_DB_PASSWORD=URL安全字符的数据库密码
+docker compose up -d --build
+docker compose logs -f server
+```
+
+Compose 会等待 PostgreSQL 健康后启动服务端；数据库数据保存在
+`gomoku-db` volume，服务端镜像以非 root 用户运行。
+
+只构建服务端镜像：
+
+```powershell
+docker build -f server/Dockerfile -t gomoku-server .
+```
+
+用 SQLite 直接运行镜像（开发/小规模）：
+
+```powershell
+docker run -d --name gomoku-server -p 8000:8000 `
+  -e GOMOKU_SERVER_ENV=development `
+  -e GOMOKU_JWT_SECRET=replace-with-a-long-random-secret-32chars+ `
+  -v gomoku-data:/app/server/data `
+  gomoku-server
+```
+
+生产必须通过 HTTPS/WSS 反向代理访问；不要直接暴露容器端口的明文 HTTP。
 
 ## 生产部署要点
 
@@ -253,11 +359,14 @@ cd C:\Users\a1325\Desktop\Gomoku
 server\.venv\Scripts\python.exe -m unittest discover -s server/tests -v
 ```
 
-当前 **76 项**测试覆盖：
+当前 **95 项**测试覆盖：
 
 - 用户名 + 密码注册、登录、refresh 轮换/重放、登出、认证响应积分/成就字段；
 - 双 WebSocket 建房/邀请/加入/落子/拒绝/认输/再战、服务器五连判定、断线重连；
-- 悔棋请求的同意/拒绝、回滚数据库落子、非本回合请求拒绝、掉线宽限后的逃跑判负；
+- 悔棋请求的同意/拒绝、回滚数据库落子、次数/冷却、非本回合请求拒绝、掉线宽限后的逃跑判负；
+- 单 IP 连接上限、WS 命令令牌桶、观战开关与人数上限、协议能力协商；
+- Alembic 全新库基线迁移、旧库自动登记基线、重复启动幂等；
+- 健康检查 live/ready、请求 ID 回写与非法值清洗、Prometheus 核心指标、日志级别/格式配置；
 - 快速匹配、取消匹配、排位房、随机黑白、终局 Elo 结算、自建房不计分；
 - 排行榜、个人资料与最近战绩；
 - 最近对局/单局棋谱的参与者权限、分页、认输终局；

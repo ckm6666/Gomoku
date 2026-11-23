@@ -37,14 +37,12 @@ from gomoku.client.theme_palette import (
     CINNABAR,
     CINNABAR_DARK,
     GOLD,
-    GOLD_PALE,
     INK,
     INK_MUTED,
     INK_SOFT,
     PAPER,
     PAPER_DEEP,
     PAPER_LIGHT,
-    PAPER_MUTED,
 )
 
 logger = logging.getLogger(__name__)

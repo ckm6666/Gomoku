@@ -823,6 +823,9 @@ class _FakeConfirmDialog:
     def exec(self) -> int:
         return 0
 
+    def deleteLater(self) -> None:
+        pass
+
 
 class _ConfirmedDialog(_FakeConfirmDialog):
     """确认弹窗的替身：一律按“删除”处理。"""
@@ -938,6 +941,57 @@ class FriendRemovalTests(unittest.TestCase):
 
         self.assertEqual(panel._social_client.removed, ["u2"])
         self.assertFalse(buttons["聊天"].isEnabled())
+        panel.close()
+
+
+class OnlineResignConfirmationTests(unittest.TestCase):
+    """认输必须二次确认，避免误触直接判负。"""
+
+    class _FakeSession:
+        def __init__(self) -> None:
+            self.snapshot = GameSnapshot(
+                game_id="g-resign",
+                board=tuple(
+                    tuple(None for _ in range(15)) for _ in range(15)
+                ),
+                current_player=Player.BLACK,
+                last_move=None,
+                winner=None,
+                winning_line=(),
+                is_draw=False,
+                is_game_over=False,
+                move_no=1,
+                your_color=Player.BLACK,
+            )
+            self.resigned = 0
+
+        def resign(self) -> None:
+            self.resigned += 1
+
+    def _panel(self) -> tuple[OnlinePanel, "OnlineResignConfirmationTests._FakeSession"]:
+        panel = OnlinePanel()
+        session = self._FakeSession()
+        panel._session = session  # type: ignore[assignment]
+        return panel, session
+
+    def test_cancel_does_not_resign(self) -> None:
+        panel, session = self._panel()
+        with mock.patch(
+            "gomoku.client.online_panel.ConfirmDialog",
+            _FakeConfirmDialog,
+        ):
+            panel._on_resign()
+        self.assertEqual(session.resigned, 0)
+        panel.close()
+
+    def test_confirm_resigns_once(self) -> None:
+        panel, session = self._panel()
+        with mock.patch(
+            "gomoku.client.online_panel.ConfirmDialog",
+            _ConfirmedDialog,
+        ):
+            panel._on_resign()
+        self.assertEqual(session.resigned, 1)
         panel.close()
 
 
