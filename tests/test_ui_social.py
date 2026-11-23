@@ -998,6 +998,22 @@ class OnlineResignConfirmationTests(unittest.TestCase):
         panel.close()
 
 
+class RememberPasswordUiTests(unittest.TestCase):
+    def test_checkbox_has_visible_hint_text(self) -> None:
+        panel = OnlinePanel()
+        self.assertEqual(
+            panel.remember_password_checkbox.text(), "记住密码"
+        )
+        self.assertIn(
+            "自动填充", panel.remember_password_hint.text()
+        )
+        self.assertEqual(
+            panel.remember_password_hint.objectName(),
+            "rememberPasswordHint",
+        )
+        panel.close()
+
+
 class LobbyTimeControlUiTests(unittest.TestCase):
     class _FakeSession:
         is_authenticated = True

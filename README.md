@@ -360,7 +360,7 @@ Gomoku/
 │   ├── requirements*.txt
 │   ├── manage.py                   # 管理员重置密码
 │   └── README.md                   # 服务端安装、部署、PostgreSQL、TLS 说明
-├── tests/                          # 客户端 347 项自动化测试
+├── tests/                          # 客户端 348 项自动化测试
 ├── requirements.txt                # 客户端运行依赖（人工维护的版本范围）
 ├── requirements.lock               # 客户端运行依赖锁定（含哈希）
 ├── requirements-tools.txt          # ruff / mypy / coverage 工具依赖
@@ -638,7 +638,7 @@ CI 安装依赖时使用带哈希的锁文件，避免同一提交在不同时�
 server\.venv\Scripts\python.exe -m pip install --require-hashes -r server\requirements-dev.lock
 ```
 
-客户端当前 **347 项**测试覆盖规则、AI、配置/协议、协议能力协商、联机阶段状态机、SGF 导入/导出、每日残局/连续通关、登录凭据 DPAPI 加密、排位固定时限与自建房 Fischer 时钟协议、本地/AI/在线会话、排位快照/匹配队列、
+客户端当前 **348 项**测试覆盖规则、AI、配置/协议、协议能力协商、联机阶段状态机、SGF 导入/导出、每日残局/连续通关、登录凭据 DPAPI 加密、排位固定时限与自建房 Fischer 时钟协议、本地/AI/在线会话、排位快照/匹配队列、
 程序化音频/MP3 解码/缓存/设置持久化、按钮点击滤波器、主菜单导航/返回确认、古风主题资源/
 绘制、终局与确认弹窗、双人模式设置栏和离屏 UI/QThread；在线悔棋请求/回滚快照/配额与
 冷却、认输二次确认、逃跑/认输胜利提示文案；表情/评论协议校验与清洗、在线会话发言冷却与信号路由、弹幕覆盖层绘制
