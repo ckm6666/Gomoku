@@ -5,13 +5,18 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from gomoku.client.auth import AuthSession  # noqa: E402
-from gomoku.client.config import AppConfig  # noqa: E402
+from gomoku.client.config import (  # noqa: E402
+    DEFAULT_API_BASE_URL,
+    DEFAULT_WS_BASE_URL,
+    AppConfig,
+)
 from gomoku.shared.capabilities import (  # noqa: E402
     MAX_CAPABILITIES,
     normalize_capabilities,
@@ -66,6 +71,24 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.request_timeout_seconds, 7.5)
         self.assertEqual(config.log_level, "DEBUG")
         self.assertTrue(config.online_configured)
+
+    def test_frozen_build_defaults_to_public_server(self) -> None:
+        with mock.patch.object(sys, "frozen", True, create=True):
+            config = AppConfig.from_env({})
+        self.assertEqual(config.api_base_url, DEFAULT_API_BASE_URL)
+        self.assertEqual(config.ws_base_url, DEFAULT_WS_BASE_URL)
+        self.assertTrue(config.online_configured)
+
+    def test_frozen_build_allows_env_override(self) -> None:
+        with mock.patch.object(sys, "frozen", True, create=True):
+            config = AppConfig.from_env(
+                {
+                    "GOMOKU_API_BASE_URL": "https://api.example.test",
+                    "GOMOKU_WS_BASE_URL": "wss://api.example.test",
+                }
+            )
+        self.assertEqual(config.api_base_url, "https://api.example.test")
+        self.assertEqual(config.ws_base_url, "wss://api.example.test")
 
     def test_invalid_values_raise(self) -> None:
         with self.assertRaises(ConfigurationError):

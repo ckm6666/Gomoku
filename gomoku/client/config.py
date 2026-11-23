@@ -8,11 +8,22 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from typing import Mapping, Optional
 from urllib.parse import urlparse
 
 from gomoku.shared.errors import ConfigurationError
+
+#: 打包后（PyInstaller）默认连接的公网入口，由 Tailscale Funnel 代理本机
+#: 8000 端口。源码运行时仍走开发默认（127.0.0.1:8000），环境变量可覆盖。
+DEFAULT_API_BASE_URL = "https://gomoku-host.taild407ad.ts.net"
+DEFAULT_WS_BASE_URL = "wss://gomoku-host.taild407ad.ts.net/api/v1/ws"
+
+
+def _is_frozen() -> bool:
+    """是否为 PyInstaller 打包产物。"""
+    return bool(getattr(sys, "frozen", False))
 
 _VALID_LOG_LEVELS = {
     "CRITICAL",
@@ -69,6 +80,12 @@ class AppConfig:
             "GOMOKU_WS_BASE_URL",
         )
 
+        # 打包产物默认连固定公网入口，朋友拿到 exe 无需配置环境变量；
+        # 未打包时保持离线/本机开发默认，避免开发误连线上。
+        if not api_url and not ws_url and _is_frozen():
+            api_url = DEFAULT_API_BASE_URL
+            ws_url = DEFAULT_WS_BASE_URL
+
         log_level = source.get("GOMOKU_LOG_LEVEL", "INFO").strip().upper()
         if log_level not in _VALID_LOG_LEVELS:
             raise ConfigurationError(
@@ -95,4 +112,8 @@ class AppConfig:
         )
 
 
-__all__ = ["AppConfig"]
+__all__ = [
+    "AppConfig",
+    "DEFAULT_API_BASE_URL",
+    "DEFAULT_WS_BASE_URL",
+]

@@ -707,7 +707,11 @@ pyinstaller --noconfirm --clean Gomoku.spec
 dist\Gomoku.exe
 ```
 
-双击即可启动离线模式。联机模式仍需要启动 `server`；exe 不会内置或自动启动服务端，开发默认连接本机 `127.0.0.1:8000`。远程服务器请通过环境变量配置后再启动 exe。
+双击即可启动离线模式。联机模式仍需要启动 `server`；exe 不会内置或自动启动服务端。
+打包后的 exe 默认连接固定公网入口 `https://gomoku-host.taild407ad.ts.net`
+（Tailscale Funnel 代理本机 8000 端口，WebSocket 自动使用
+`wss://gomoku-host.taild407ad.ts.net/api/v1/ws`），朋友拿到 exe 无需配置环境变量；
+从源码运行时仍默认连接本机 `127.0.0.1:8000`。两种情况都可以用环境变量覆盖。
 
 构建注意：
 
