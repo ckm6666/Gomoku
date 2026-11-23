@@ -354,7 +354,6 @@ jobs:
       - quality-server
       - build-windows
       - build-server-image
-    if: ${{ needs.resolve.outputs.dry_run != 'true' }}
     permissions:
       contents: write
     steps:
@@ -428,7 +427,10 @@ jobs:
           print(Path("release-notes.md").read_text(encoding="utf-8"))
           PY
 
+      # 只有真正创建 Release 这一步受 dry_run 门禁；前面的产物下载与说明生成
+      # 始终执行，这样 dry_run 能完整演练到最后一步而不产生任何外部副作用。
       - name: Create GitHub Release
+        if: ${{ needs.resolve.outputs.dry_run != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
