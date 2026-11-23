@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from gomoku.client.avatar_widgets import AvatarView
+from gomoku.client.font_settings import current_font_scale
 from gomoku.client.paper_panel import InkDivider, PaperPanel
 from gomoku.shared.social import MAX_DIRECT_MESSAGE_LENGTH
 
@@ -251,9 +252,10 @@ class PrivateChatPanel(PaperPanel):
         time_text = self._format_time(message)
         align = "right" if is_self else "left"
         bubble = "#E8D5B5" if is_self else "#EFE6D5"
+        meta_size = max(8, int(round(11 * current_font_scale())))
         block = (
             f'<div style="margin:6px 0;text-align:{align};">'
-            f'<span style="color:#7A6A55;font-size:11px;">'
+            f'<span style="color:#7A6A55;font-size:{meta_size}px;">'
             f"{html.escape(sender_name)} · {time_text}</span><br/>"
             f'<span style="background:{bubble};padding:4px 8px;'
             f'border-radius:6px;color:#2B2118;">{content}</span>'
