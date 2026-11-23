@@ -984,6 +984,11 @@ class OnlinePanel(InkBackdrop):
             self._profile_user["avatar"] = user.avatar
             self._profile_user["avatar_version"] = user.avatar_version
         self._update_self_avatar()
+        # 已经打开的私聊窗也要换上新的头像。
+        for window in self._chat_panels.values():
+            window.set_self_avatar(
+                user.avatar, avatar_version=user.avatar_version
+            )
         if (
             self._profile_panel is not None
             and self._profile_panel.user_id == user.id
@@ -1149,6 +1154,7 @@ class OnlinePanel(InkBackdrop):
             existing.set_friend(
                 resolved_name, avatar, avatar_version=avatar_version
             )
+            self._sync_chat_self_avatar(existing)
             existing.show()
             if self._auth_session is not None:
                 self._social_client.fetch_messages(
@@ -1167,12 +1173,22 @@ class OnlinePanel(InkBackdrop):
             lambda *_: self._chat_panels.pop(user_id, None)
         )
         self._chat_panels[user_id] = window
+        self._sync_chat_self_avatar(window)
         window.set_send_enabled(True)
         window.show()
         if self._auth_session is not None:
             self._social_client.fetch_messages(
                 self._auth_session.access_token, user_id, limit=200
             )
+
+    def _sync_chat_self_avatar(self, window: PrivateChatPanel) -> None:
+        """把自己的头像告诉聊天窗：自己发的消息旁边也要挂头像。"""
+        if self._auth_session is None:
+            return
+        user = self._auth_session.user
+        window.set_self_avatar(
+            user.avatar, avatar_version=user.avatar_version
+        )
 
     def _send_private_message(self, user_id: str, text: str) -> None:
         if self._auth_session is None or not text.strip():
