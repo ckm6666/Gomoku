@@ -364,7 +364,7 @@ Gomoku/
 │   ├── requirements*.txt
 │   ├── manage.py                   # 管理员重置密码
 │   └── README.md                   # 服务端安装、部署、PostgreSQL、TLS 说明
-├── tests/                          # 客户端 342 项自动化测试
+├── tests/                          # 客户端 444 项自动化测试
 ├── requirements.txt                # 客户端运行依赖（人工维护的版本范围）
 ├── requirements.lock               # 客户端运行依赖锁定（含哈希）
 ├── requirements-tools.txt          # ruff / mypy / coverage 工具依赖
@@ -384,11 +384,18 @@ Gomoku/
 ## 环境要求
 
 - Windows 10 / 11（64 位）。
-- 客户端：Python 3.10+，推荐 3.11～3.14。
-- 当前验证环境：Windows 11、Python 3.14.7、PySide6-Essentials/Addons 6.12.0、PyInstaller 6.22.3。
-- 服务端：Python 3.10+（当前机器使用 3.14.7），FastAPI、Uvicorn、SQLAlchemy async、SQLite dev / PostgreSQL prod。
+- 客户端：Python 3.10+，推荐 3.11～3.15。
+- 当前验证环境：Windows 11、Python 3.15.2、PySide6-Essentials/Addons 6.12.0、PyInstaller 6.22.3。
+- 服务端：Python 3.10+（当前机器使用 3.15.2），FastAPI、Uvicorn、SQLAlchemy async、SQLite dev / PostgreSQL prod。
 - 客户端只使用官方 PySide6 包，不引入其他 GUI 库；AI、棋盘绘制和服务端通信均为自研代码。
 - 本地开发数据库为 SQLite；生产建议 PostgreSQL。
+- **Python 3.15 请用 `unittest` 跑测试，不要用 pytest**：CPython 3.15 引入了新的
+  `lazy` 导入语句（`concurrent.futures` 就用了它），而 pytest 的断言重写钩子
+  （`AssertionRewritingHook`）会让这个惰性占位对象永远不解析，
+  `concurrent.futures.ThreadPoolExecutor` 拿到的是不可调用的 `lazy_import` 对象，
+  凡是走到 `asyncio.run_in_executor` 的用例都会报
+  `TypeError: 'lazy_import' object is not callable`。本项目 CI 用的是
+  `unittest` + `coverage`（pytest 不在依赖锁文件里），不受影响。
 
 ## 客户端安装与运行
 
@@ -624,7 +631,7 @@ server\.venv\Scripts\python.exe -m mypy gomoku/shared server/app
 ```
 
 GitHub Actions 会在 push/PR 时自动执行 ruff、mypy（shared + server）、
-Windows 客户端测试（Python 3.13/3.14）和 Linux 服务端测试（Python 3.13/3.14），
+Windows 客户端测试（Python 3.13/3.14/3.15）和 Linux 服务端测试（Python 3.13/3.14/3.15），
 并输出覆盖率、`dist/Gomoku.exe` 构建产物，以及 Docker 镜像启动/readiness
 smoke test；当前覆盖率基线约为客户端 71%、服务端 78%。
 
@@ -646,7 +653,7 @@ CI 安装依赖时使用带哈希的锁文件，避免同一提交在不同时�
 server\.venv\Scripts\python.exe -m pip install --require-hashes -r server\requirements-dev.lock
 ```
 
-客户端当前 **342 项**测试覆盖规则、AI、配置/协议、协议能力协商、联机阶段状态机、SGF 导入/导出、每日残局/连续通关、排位每手时间与 Fischer 时钟协议、本地/AI/在线会话、排位快照/匹配队列、
+客户端当前 **444 项**测试覆盖规则、AI、配置/协议、协议能力协商、联机阶段状态机、SGF 导入/导出、每日残局/连续通关、排位每手时间与 Fischer 时钟协议、本地/AI/在线会话、排位快照/匹配队列、
 程序化音频/MP3 解码/缓存/设置持久化、按钮点击滤波器、主菜单导航/返回确认、古风主题资源/
 绘制、终局与确认弹窗、双人模式设置栏和离屏 UI/QThread；在线悔棋请求/回滚快照/配额与
 冷却、认输二次确认、逃跑/认输胜利提示文案；表情/评论协议校验与清洗、在线会话发言冷却与信号路由、弹幕覆盖层绘制
@@ -658,7 +665,7 @@ server\.venv\Scripts\python.exe -m pip install --require-hashes -r server\requir
 基线隔离、落子/撤销/重置/切换执子方与胜负判定；沙盘面板：打开关闭、覆盖真实棋盘、
 撤销与回到当前局面、真实对局推进提示；以及沙盘与真实对局的隔离：沙盘落子绝不发往服务器）；
 以及 AI 复盘评分映射/标注阈值/逐手结构、举报浮层提交与审计摘要展示。
-服务端当前 **121 项**测试覆盖用户名 + 密码注册/登录/refresh 重放/登出、双 WebSocket 建房/邀请/加入/落子/拒绝/认输/再战、
+服务端当前 **146 项**测试覆盖用户名 + 密码注册/登录/refresh 重放/登出、双 WebSocket 建房/邀请/加入/落子/拒绝/认输/再战、
 五连终局和断线重连、悔棋请求的同意/拒绝与数据库回滚、悔棋次数/冷却、掉线宽限后的逃跑判负、
 Alembic 全新库/旧库兼容迁移与重复启动幂等、健康检查/请求 ID/Prometheus 指标、
 单 IP 连接数与 WS 命令限流、观战开关/人数上限、协议能力协商与限流器单元测试、排位每手时间与
