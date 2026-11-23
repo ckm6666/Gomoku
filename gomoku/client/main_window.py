@@ -55,6 +55,7 @@ from gomoku.client.audio import get_audio_manager
 from gomoku.client.board_widget import BoardWidget
 from gomoku.client.config import AppConfig
 from gomoku.client.confirm_dialog import ConfirmDialog
+from gomoku.client.font_control import FontSizeButton
 from gomoku.client.constants import (
     APP_NAME,
     APP_TITLE,
@@ -571,6 +572,10 @@ class MainWindow(QMainWindow):
         utility_row.addWidget(
             self.menu_sound_button, 0, Qt.AlignmentFlag.AlignVCenter
         )
+        self.menu_font_button = FontSizeButton(page)
+        utility_row.addWidget(
+            self.menu_font_button, 0, Qt.AlignmentFlag.AlignVCenter
+        )
         layout.addLayout(utility_row)
         layout.addStretch(1)
 
@@ -814,10 +819,14 @@ class MainWindow(QMainWindow):
         bar_layout.addWidget(self.puzzle_info_label)
         bar_layout.addStretch(1)
 
-        # 声音设置与模式设置同栏，不参与 AI 回合的锁定逻辑。
+        # 声音与字号设置同栏，不参与 AI 回合的锁定逻辑。
         self.sound_button = SoundButton(settings_bar)
         bar_layout.addWidget(
             self.sound_button, 0, Qt.AlignmentFlag.AlignVCenter
+        )
+        self.font_button = FontSizeButton(settings_bar)
+        bar_layout.addWidget(
+            self.font_button, 0, Qt.AlignmentFlag.AlignVCenter
         )
         return settings_bar
 

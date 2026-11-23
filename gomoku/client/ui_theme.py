@@ -39,8 +39,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gomoku.client.font_settings import (
+    DEFAULT_FONT_SCALE,
+    apply_font_scale,
+)
 from gomoku.client.frozen import is_frozen
-from gomoku.client.styles import APP_STYLE
 from gomoku.client.theme_palette import (
     CINNABAR,
     CINNABAR_DARK,
@@ -144,26 +147,19 @@ def _ensure_system_classical_fonts() -> None:
             QFontDatabase.addApplicationFont(str(path))
 
 
-def apply_app_theme(app: QApplication) -> tuple[str, ...]:
-    """加载主题字体、设置全局字体与 QSS；返回内置主题字体的 family。"""
+def apply_app_theme(
+    app: QApplication, *, font_scale: float = DEFAULT_FONT_SCALE
+) -> tuple[str, ...]:
+    """加载主题字体、设置全局字体与 QSS；返回内置主题字体的 family。
+
+    ``font_scale`` 是全局字号比例（1.0 为默认），会同时作用于应用基础字号
+    和 QSS 里的 px 字号。
+    """
     _ensure_system_classical_fonts()
     families = load_theme_fonts()
     # 正文字体优先使用仿宋/楷体（古雅且小字号清晰），ZCOOL XiaoWei 作为
     # 项目内置的跨环境回退，保证无中文系统字体时仍有 CJK 覆盖。
-    font = QFont()
-    font.setFamilies(
-        [
-            "FangSong",
-            "KaiTi",
-            "Microsoft YaHei UI",
-            "ZCOOL XiaoWei",
-            "Microsoft YaHei",
-            "Segoe UI",
-        ]
-    )
-    font.setPointSize(10)
-    app.setFont(font)
-    app.setStyleSheet(APP_STYLE)
+    apply_font_scale(app, font_scale)
     return families
 
 
@@ -230,6 +226,7 @@ _texture_cache: dict[float, QPixmap] = {}
 _seal_cache: dict[tuple[str, int, str, float], QPixmap] = {}
 _divider_cache: dict[tuple[int, int, float], QPixmap] = {}
 _sound_icon_cache: dict[tuple[bool, int, float], QPixmap] = {}
+_font_icon_cache: dict[tuple[int, float], QPixmap] = {}
 _missing_logged: set[str] = set()
 
 
@@ -617,6 +614,33 @@ def make_sound_icon(
 
     painter.end()
     _sound_icon_cache[key] = pixmap
+    return pixmap
+
+
+def make_font_icon(size: int = 18, *, dpr: float = 1.0) -> QPixmap:
+    """水墨风格的“字号”图标：一个墨色的“字”字。"""
+    key = (size, round(max(1.0, dpr), 2))
+    cached = _font_icon_cache.get(key)
+    if cached is not None:
+        return cached
+
+    pixmap = QPixmap(round(size * dpr), round(size * dpr))
+    pixmap.setDevicePixelRatio(dpr)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+    font = QFont(DISPLAY_FONT_FAMILY)
+    font.setPixelSize(max(8, int(size * 0.86)))
+    font.setWeight(QFont.Weight.Normal)
+    painter.setFont(font)
+    painter.setPen(QColor(INK_SOFT))
+    painter.drawText(
+        QRectF(0.0, 0.0, size, size),
+        int(Qt.AlignmentFlag.AlignCenter),
+        "字",
+    )
+    painter.end()
+    _font_icon_cache[key] = pixmap
     return pixmap
 
 
@@ -1124,6 +1148,7 @@ __all__ = [
     "find_ui_asset",
     "fonts_directory",
     "load_theme_fonts",
+    "make_font_icon",
     "make_ink_divider",
     "make_seal_pixmap",
     "make_sound_icon",

@@ -32,6 +32,7 @@ from gomoku.client.danmaku import (
     _resolve_emoji_font,
     resolve_emoji_font_family,
 )
+from gomoku.client.font_settings import current_font_scale
 from gomoku.shared.chat import (
     CHAT_KIND_EMOJI,
     COMMENT_PRESETS,
@@ -182,14 +183,15 @@ class ChatLogPanel(QFrame):
         """用富文本渲染表情，让表情字形使用解析出的彩色字体。"""
         prefix = plain[: len(plain) - len(emoji)] if emoji else plain
         family = resolve_emoji_font_family()
+        emoji_size = max(8, int(round(16 * current_font_scale())))
         if family is None:
             label.setTextFormat(Qt.TextFormat.PlainText)
             label.setText(plain)
-            label.setFont(_resolve_emoji_font(16))
+            label.setFont(_resolve_emoji_font(emoji_size))
             return
 
         style = (
-            f"font-family:'{family}'; font-size:16px;"
+            f"font-family:'{family}'; font-size:{emoji_size}px;"
         )
         label.setTextFormat(Qt.TextFormat.RichText)
         label.setText(

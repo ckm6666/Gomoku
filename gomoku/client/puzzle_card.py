@@ -16,6 +16,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QPushButton, QSizePolicy, QWidget
 
+from gomoku.client.font_settings import current_font_scale
 from gomoku.client.theme_palette import (
     CINNABAR,
     GOLD,
@@ -162,7 +163,9 @@ class PuzzleCardButton(QPushButton):
         text_width = max(60.0, rect.width() - 104.0)
 
         title_font = QFont(DISPLAY_FONT_FAMILY)
-        title_font.setPointSize(22)
+        title_font.setPointSize(
+            max(1, int(round(22 * current_font_scale())))
+        )
         title_font.setWeight(QFont.Weight.Normal)
         painter.setFont(title_font)
         painter.setPen(QColor(INK))
@@ -193,7 +196,9 @@ class PuzzleCardButton(QPushButton):
         painter.drawEllipse(badge_center, 5.0, 5.0)
 
         caption_font = QFont(self.font())
-        caption_font.setPointSize(10)
+        caption_font.setPointSize(
+            max(1, int(round(10 * current_font_scale())))
+        )
         caption_font.setWeight(QFont.Weight.Medium)
         painter.setFont(caption_font)
         painter.setPen(QColor(INK_MUTED))
@@ -209,7 +214,9 @@ class PuzzleCardButton(QPushButton):
         )
 
         hint_font = QFont(self.font())
-        hint_font.setPointSize(9)
+        hint_font.setPointSize(
+            max(1, int(round(9 * current_font_scale())))
+        )
         painter.setFont(hint_font)
         painter.setPen(QColor(INK_FAINT))
         painter.drawText(
