@@ -201,12 +201,12 @@ async def admin_reports(
     games: dict[str, Game] = {}
     game_ids = {report.game_id for report in reports}
     if game_ids:
-        rows = (
+        game_rows = (
             await session.scalars(
                 select(Game).where(Game.id.in_(game_ids))
             )
         ).all()
-        games = {game.id: game for game in rows}
+        games = {game.id: game for game in game_rows}
     audit_counts: dict[str, int] = {}
     entries: list[AdminReportEntry] = []
     for report in reports:
