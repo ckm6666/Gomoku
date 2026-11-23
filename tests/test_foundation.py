@@ -5,13 +5,21 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from gomoku.client.auth import AuthSession  # noqa: E402
-from gomoku.client.config import AppConfig  # noqa: E402
+from gomoku.client.config import (  # noqa: E402
+    DEFAULT_API_BASE_URL,
+    DEFAULT_WS_BASE_URL,
+    DEV_API_BASE_URL,
+    WS_PATH,
+    AppConfig,
+    resolve_endpoints,
+)
 from gomoku.shared.capabilities import (  # noqa: E402
     MAX_CAPABILITIES,
     normalize_capabilities,
@@ -66,6 +74,108 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.request_timeout_seconds, 7.5)
         self.assertEqual(config.log_level, "DEBUG")
         self.assertTrue(config.online_configured)
+
+    def test_frozen_build_defaults_to_public_server(self) -> None:
+        with mock.patch.object(sys, "frozen", True, create=True):
+            config = AppConfig.from_env({})
+        self.assertEqual(config.api_base_url, DEFAULT_API_BASE_URL)
+        self.assertEqual(config.ws_base_url, DEFAULT_WS_BASE_URL)
+        self.assertTrue(config.online_configured)
+
+    def test_frozen_build_allows_env_override(self) -> None:
+        with mock.patch.object(sys, "frozen", True, create=True):
+            config = AppConfig.from_env(
+                {
+                    "GOMOKU_API_BASE_URL": "https://api.example.test",
+                    "GOMOKU_WS_BASE_URL": "wss://api.example.test",
+                }
+            )
+        self.assertEqual(config.api_base_url, "https://api.example.test")
+        self.assertEqual(config.ws_base_url, "wss://api.example.test")
+
+    def test_frozen_build_derives_ws_from_api_override(self) -> None:
+        """只配 REST 地址时，WS 应当同源推导，而不是回落到公网入口。"""
+        with mock.patch.object(sys, "frozen", True, create=True):
+            config = AppConfig.from_env(
+                {"GOMOKU_API_BASE_URL": "https://api.example.test"}
+            )
+        self.assertEqual(config.api_base_url, "https://api.example.test")
+        self.assertEqual(config.ws_base_url, "wss://api.example.test")
+        self.assertTrue(config.online_configured)
+
+    def test_frozen_build_derives_api_from_ws_override(self) -> None:
+        """只配 WS 地址时，REST 应当同源推导，避免回落到本机开发地址。"""
+        with mock.patch.object(sys, "frozen", True, create=True):
+            config = AppConfig.from_env(
+                {"GOMOKU_WS_BASE_URL": "wss://api.example.test"}
+            )
+        self.assertEqual(config.ws_base_url, "wss://api.example.test")
+        self.assertEqual(config.api_base_url, "https://api.example.test")
+        self.assertTrue(config.online_configured)
+
+    def test_frozen_build_default_applies_to_plain_construction(self) -> None:
+        """回退路径直接构造 AppConfig 时，也应连上公网入口。"""
+        with mock.patch.object(sys, "frozen", True, create=True):
+            config = AppConfig()
+        self.assertEqual(config.api_base_url, DEFAULT_API_BASE_URL)
+        self.assertEqual(config.ws_base_url, DEFAULT_WS_BASE_URL)
+
+    def test_frozen_build_rejects_invalid_env_override(self) -> None:
+        with mock.patch.object(sys, "frozen", True, create=True):
+            with self.assertRaises(ConfigurationError):
+                AppConfig.from_env({"GOMOKU_API_BASE_URL": "ftp://bad"})
+            with self.assertRaises(ConfigurationError):
+                AppConfig.from_env({"GOMOKU_WS_BASE_URL": "https://bad"})
+
+    def test_frozen_build_defaults_to_production_environment(self) -> None:
+        with mock.patch.object(sys, "frozen", True, create=True):
+            config = AppConfig.from_env({})
+            overridden = AppConfig.from_env({"GOMOKU_ENV": "staging"})
+        self.assertEqual(config.environment, "production")
+        self.assertEqual(overridden.environment, "staging")
+
+    def test_source_build_never_uses_public_server(self) -> None:
+        """源码运行不得落到公网入口。"""
+        with mock.patch.object(sys, "frozen", False, create=True):
+            config = AppConfig.from_env({})
+            partial = AppConfig.from_env(
+                {"GOMOKU_API_BASE_URL": "https://api.example.test"}
+            )
+            ws_only = AppConfig.from_env(
+                {"GOMOKU_WS_BASE_URL": "wss://api.example.test"}
+            )
+        self.assertIsNone(config.api_base_url)
+        self.assertIsNone(config.ws_base_url)
+        self.assertFalse(config.online_configured)
+        self.assertEqual(partial.api_base_url, "https://api.example.test")
+        self.assertEqual(partial.ws_base_url, "wss://api.example.test")
+        self.assertEqual(ws_only.api_base_url, "https://api.example.test")
+        self.assertEqual(ws_only.ws_base_url, "wss://api.example.test")
+
+    def test_frozen_build_resolves_public_entry_endpoints(self) -> None:
+        """打包产物应当连上内置公网入口，WS 带上 /api/v1/ws 路径。"""
+        with mock.patch.object(sys, "frozen", True, create=True):
+            config = AppConfig.from_env({})
+        api, ws = resolve_endpoints(config)
+        self.assertEqual(api, DEFAULT_API_BASE_URL)
+        self.assertEqual(ws, f"{DEFAULT_WS_BASE_URL}{WS_PATH}")
+
+    def test_source_build_resolves_local_dev_endpoints(self) -> None:
+        """源码运行未配置地址时连本机开发服务端。"""
+        api, ws = resolve_endpoints(AppConfig.from_env({}))
+        self.assertEqual(api, DEV_API_BASE_URL)
+        self.assertEqual(ws, "ws://127.0.0.1:8000/api/v1/ws")
+
+    def test_resolve_endpoints_keeps_explicit_ws_path(self) -> None:
+        """显式写了完整 /api/v1/ws 时不应重复追加。"""
+        config = AppConfig(
+            environment="production",
+            api_base_url="https://api.example.test",
+            ws_base_url="wss://api.example.test/api/v1/ws",
+        )
+        api, ws = resolve_endpoints(config)
+        self.assertEqual(api, "https://api.example.test")
+        self.assertEqual(ws, "wss://api.example.test/api/v1/ws")
 
     def test_invalid_values_raise(self) -> None:
         with self.assertRaises(ConfigurationError):

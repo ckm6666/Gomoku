@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+from gomoku.client.frozen import is_frozen
 from gomoku.shared.rules import BOARD_SIZE, BoardLike
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ _BOARD_LAST = BOARD_SIZE - 1
 
 def _default_path() -> Path:
     """返回开局库默认路径；兼容源码与 PyInstaller。"""
-    if getattr(sys, "frozen", False):
+    if is_frozen():
         base = Path(
             getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)
         )

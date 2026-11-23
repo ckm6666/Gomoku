@@ -39,6 +39,8 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QAbstractButton
 
+from gomoku.client.frozen import is_frozen
+
 try:
     from PySide6.QtMultimedia import (
         QAudioDecoder,
@@ -641,7 +643,7 @@ def decode_audio_to_wav_bytes(source: Path) -> Optional[bytes]:
 # ---------------------------------------------------------------------------
 def assets_directory() -> Path:
     """返回内置音频素材目录；兼容源码运行和 PyInstaller 单文件。"""
-    if getattr(sys, "frozen", False):
+    if is_frozen():
         base = Path(
             getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)
         )
