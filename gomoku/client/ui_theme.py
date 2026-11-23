@@ -15,7 +15,7 @@ import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt
 from PySide6.QtGui import (
@@ -30,19 +30,30 @@ from PySide6.QtGui import (
     QPixmap,
     QRadialGradient,
 )
-from PySide6.QtWidgets import QApplication, QFrame, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QFrame,
+    QStyle,
+    QStyleOptionButton,
+    QWidget,
+)
 
 from gomoku.client.styles import APP_STYLE
 from gomoku.client.theme_palette import (
     CINNABAR,
     CINNABAR_DARK,
+    DISABLED_BG,
+    DISABLED_TEXT,
     GOLD,
+    GOLD_DARK,
     INK,
     INK_MUTED,
     INK_SOFT,
     PAPER,
     PAPER_DEEP,
     PAPER_LIGHT,
+    PAPER_MUTED,
 )
 
 logger = logging.getLogger(__name__)
@@ -889,6 +900,70 @@ def render_result_backdrop(
     return pixmap
 
 
+class PaperCheckBox(QCheckBox):
+    """水墨主题勾选框：纸色方框 + 墨色勾，不使用系统蓝色高亮。
+
+    Qt 原生勾选框的选中底色跟随系统强调色（Windows 上通常是蓝色），
+    与宣纸主题冲突。这里保留 QCheckBox 的文本/焦点行为，只把指示器
+    重绘成纸色方框，避免在 QSS 里引用图片资源。
+
+    原生指示器必须先被隐藏：不隐藏的话，它的圆角像素会从自绘方框的
+    四角漏出来，在宣纸底色上留下一圈系统灰边。隐藏方式是一条只针对
+    ``::indicator`` 的局部样式；应用级样式里按 objectName 设置的文字
+    颜色和字号不受影响。
+    """
+
+    _BOX_RADIUS = 3.0
+    _HIDE_NATIVE_INDICATOR = (
+        "QCheckBox::indicator { background: transparent; border: none; }"
+    )
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.setStyleSheet(self._HIDE_NATIVE_INDICATOR)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        rect = self.style().subElementRect(
+            QStyle.SubElement.SE_CheckBoxIndicator, option, self
+        )
+        if rect.isEmpty():
+            # 样式没有给出指示器区域：没有可画的自绘方框，直接返回。
+            return
+        painter = QPainter(self)
+        try:
+            self._paint_indicator(painter, rect)
+        finally:
+            painter.end()
+
+    def _paint_indicator(self, painter: QPainter, rect: QRect) -> None:
+        """把指示器画成纸色方框 + 墨色勾。"""
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        box = QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5)
+        enabled = self.isEnabled()
+        border = GOLD_DARK if enabled and self.hasFocus() else PAPER_MUTED
+        fill = PAPER_LIGHT if enabled else DISABLED_BG
+        painter.setPen(QPen(QColor(border), 1.0))
+        painter.setBrush(QBrush(QColor(fill)))
+        painter.drawRoundedRect(box, self._BOX_RADIUS, self._BOX_RADIUS)
+        if self.isChecked():
+            pen = QPen(
+                QColor(INK_SOFT if enabled else DISABLED_TEXT), 1.8
+            )
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            path = QPainterPath()
+            x, y = box.x(), box.y()
+            width, height = box.width(), box.height()
+            path.moveTo(x + width * 0.24, y + height * 0.54)
+            path.lineTo(x + width * 0.43, y + height * 0.74)
+            path.lineTo(x + width * 0.78, y + height * 0.30)
+            painter.drawPath(path)
+
+
 class InkBackdrop(QWidget):
     """以水墨宣纸为背景的页面容器。"""
 
@@ -1040,6 +1115,7 @@ __all__ = [
     "InkBackdrop",
     "MENU_BACKDROP_SPEC",
     "ONLINE_BACKDROP_SPEC",
+    "PaperCheckBox",
     "RicePaperCard",
     "apply_app_theme",
     "assets_root",

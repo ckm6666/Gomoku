@@ -54,7 +54,7 @@ from gomoku.shared.social import (
     FRIEND_EVENT_OFFLINE,
     FRIEND_EVENT_ONLINE,
 )
-from gomoku.shared.time_control import TimeControl
+from gomoku.shared.time_control import DEFAULT_TIME_CONTROL, TimeControl
 from server.app.achievement_service import achievement_keys_for_user
 from server.app.config import Settings
 from server.app.db import utcnow_naive
@@ -1257,22 +1257,17 @@ class RoomManager:
         self,
         conn: ClientConnection,
         request_id: Optional[str] = None,
-        turn_seconds: Optional[int] = None,
-        time_control: Optional[TimeControl] = None,
     ) -> None:
-        """加入排位队列；只与时限设置完全相同的玩家配对。"""
+        """加入排位队列；排位赛固定每手 30 秒，不接受自定义时限。
+
+        客户端仍可能带着旧的 ``turn_seconds``/``time_control`` 字段：
+        WebSocket 端点会先校验它们的格式（畸形协议直接报错），但实际
+        对局一律使用固定的 ``DEFAULT_TIME_CONTROL``。
+        """
         if not self._is_current_connection(conn):
             return
-        if turn_seconds is not None and (
-            not isinstance(turn_seconds, int)
-            or isinstance(turn_seconds, bool)
-            or not 5 <= turn_seconds <= 600
-        ):
-            await self._send_error(
-                conn, "每手时间必须在 5～600 秒", request_id
-            )
-            return
-        control = self._requested_time_control(turn_seconds, time_control)
+        # 排位固定每手 30 秒：刻意忽略客户端的自定义选择。
+        control = DEFAULT_TIME_CONTROL
         if conn.user_id in self._room_by_user:
             await self._send_error(conn, "你已经在房间中", request_id)
             return
@@ -1347,6 +1342,7 @@ class RoomManager:
     ]:
         """为入队玩家选择积分最接近的对手并创建排位房。
 
+        排位赛固定每手 30 秒，所有排队玩家时限一致，不再按设置筛选。
         调用方必须持有 ``_state_lock``。写库失败时本次入队的玩家退出队列
         并收到错误，其他等待者保留；避免客户端认为未入队而服务器仍在队列。
         """
@@ -1357,7 +1353,6 @@ class RoomManager:
             player
             for user_id, player in self._queue.items()
             if user_id != conn.user_id
-            and player.time_control == queued.time_control
         ]
         if not candidates:
             return (

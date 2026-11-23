@@ -477,7 +477,9 @@ async def game_websocket(websocket: WebSocket) -> None:
                 elif message_type == CLIENT_REMATCH:
                     await room_manager.rematch(conn)
                 elif message_type == CLIENT_QUICK_MATCH:
-                    time_control, time_error = _requested_time_control(
+                    # 排位固定每手 30 秒；这里仍解析一次时限字段，
+                    # 只为了拒绝畸形请求，实际对局不采用客户端的设置。
+                    _ignored, time_error = _requested_time_control(
                         payload
                     )
                     if time_error:
@@ -489,11 +491,7 @@ async def game_websocket(websocket: WebSocket) -> None:
                             )
                         )
                     else:
-                        await room_manager.quick_match(
-                            conn,
-                            request_id,
-                            time_control=time_control,
-                        )
+                        await room_manager.quick_match(conn, request_id)
                 elif message_type == CLIENT_CANCEL_MATCH:
                     await room_manager.cancel_match(conn, request_id)
                 elif message_type == CLIENT_CHAT:

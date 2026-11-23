@@ -50,70 +50,44 @@ class RankedMatchTests(ServerTestBase):
         self.fail(f"未收到期望消息 {expected}")
         return {}
 
-    def test_quick_match_matches_same_time_control_only(self) -> None:
+    def test_quick_match_ignores_requested_time_control(self) -> None:
         first_token = self._register_access("time_a")
         second_token = self._register_access("time_b")
-        third_token = self._register_access("time_c")
 
         with self.client.websocket_connect("/api/v1/ws") as first:
             with self.client.websocket_connect("/api/v1/ws") as second:
-                with self.client.websocket_connect("/api/v1/ws") as third:
-                    self._authenticate(first, first_token)
-                    self._authenticate(second, second_token)
-                    self._authenticate(third, third_token)
+                self._authenticate(first, first_token)
+                self._authenticate(second, second_token)
 
-                    first.send_json(
-                        make_message(
-                            CLIENT_QUICK_MATCH, {"turn_seconds": 15}
-                        )
+                first.send_json(
+                    make_message(
+                        CLIENT_QUICK_MATCH, {"turn_seconds": 15}
                     )
-                    first_queued = first.receive_json()
-                    self.assertEqual(
-                        first_queued["payload"]["state"], "queued"
-                    )
+                )
+                first_queued = first.receive_json()
+                self.assertEqual(
+                    first_queued["payload"]["state"], "queued"
+                )
 
-                    second.send_json(
-                        make_message(
-                            CLIENT_QUICK_MATCH, {"turn_seconds": 30}
-                        )
+                # 即使请求的每手秒数不同，排位也立即配对并固定 30 秒。
+                # 双方都请求 15 秒：若服务端沿用入队者的设置，这里会得到
+                # 15 而不是 30，测试就能真正区分"固定 30 秒"和"沿用请求"。
+                second.send_json(
+                    make_message(
+                        CLIENT_QUICK_MATCH, {"turn_seconds": 15}
                     )
-                    second_queued = second.receive_json()
-                    self.assertEqual(
-                        second_queued["payload"]["state"], "queued"
-                    )
-
-                    third.send_json(
-                        make_message(
-                            CLIENT_QUICK_MATCH, {"turn_seconds": 15}
-                        )
-                    )
-                    first_state = parse_game_state(
+                )
+                self._receive_type(first, SERVER_MATCH_FOUND)
+                self._receive_type(second, SERVER_MATCH_FOUND)
+                for ws in (first, second):
+                    state = parse_game_state(
                         self._receive_type(
-                            first, SERVER_GAME_STATE
+                            ws, SERVER_GAME_STATE
                         )["payload"]
                     )
-                    third_state = parse_game_state(
-                        self._receive_type(
-                            third, SERVER_GAME_STATE
-                        )["payload"]
-                    )
-                    self.assertIsNotNone(first_state)
-                    self.assertIsNotNone(third_state)
-                    self.assertEqual(
-                        first_state.move_timeout_seconds, 15
-                    )
-                    self.assertEqual(
-                        third_state.move_timeout_seconds, 15
-                    )
-
-                    # 时间设置不同的第二名玩家仍在队列中。
-                    second.send_json(
-                        make_message(CLIENT_CANCEL_MATCH, {})
-                    )
-                    idle = self._receive_type(
-                        second, SERVER_QUEUE_STATUS
-                    )
-                    self.assertEqual(idle["payload"]["state"], "idle")
+                    self.assertIsNotNone(state.time_control)
+                    self.assertEqual(state.time_control.turn_seconds, 30)
+                    self.assertEqual(state.move_timeout_seconds, 30)
 
     def test_match_resign_rating_profile_and_leaderboard(self) -> None:
         host_token = self._register_access("rank_host")

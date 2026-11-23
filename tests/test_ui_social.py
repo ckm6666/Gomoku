@@ -16,14 +16,17 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtCore import QSettings, Qt  # noqa: E402
 from PySide6.QtGui import QColor, QImage  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
+    QCheckBox,
     QFrame,
     QLabel,
     QPushButton,
+    QStyle,
+    QStyleOptionButton,
     QWidget,
 )
 
@@ -41,6 +44,7 @@ from gomoku.client.online_panel import (  # noqa: E402
     OnlinePlayerCard,
 )
 from gomoku.client.private_chat_panel import PrivateChatPanel  # noqa: E402
+from gomoku.client.ui_theme import PaperCheckBox  # noqa: E402
 from gomoku.shared.rules import Player  # noqa: E402
 from gomoku.client.profile_panel import (  # noqa: E402
     AvatarPickerPanel,
@@ -57,6 +61,7 @@ from gomoku.shared.achievements import (  # noqa: E402
 from gomoku.shared.avatar import AVATARS  # noqa: E402
 from gomoku.shared.protocol import GameSnapshot  # noqa: E402
 from gomoku.shared.social import DirectMessage  # noqa: E402
+from gomoku.shared.time_control import TimeControl  # noqa: E402
 
 QT_APP = QApplication.instance() or QApplication([])
 
@@ -994,6 +999,181 @@ class OnlineResignConfirmationTests(unittest.TestCase):
         ):
             panel._on_resign()
         self.assertEqual(session.resigned, 1)
+        panel.close()
+
+
+class RememberPasswordUiTests(unittest.TestCase):
+    def test_checkbox_only_shows_short_label(self) -> None:
+        panel = OnlinePanel()
+        self.assertEqual(
+            panel.remember_password_checkbox.text(), "记住密码"
+        )
+        self.assertFalse(hasattr(panel, "remember_password_hint"))
+        panel.close()
+
+    def test_saved_password_is_restored_after_logout(self) -> None:
+        """退出登录后要把已保存的密码重新填回去。
+
+        登录成功后密码框会被清空；不补回来的话，用户每次退出登录都得
+        再输一遍密码，尽管它已经安全地存在本机。
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            panel = OnlinePanel()
+            try:
+                # 用独立的 ini 存凭据，别写到开发机的真实设置里。
+                panel._settings = QSettings(
+                    os.path.join(directory, "settings.ini"),
+                    QSettings.Format.IniFormat,
+                )
+                panel.username_edit.setText("alice")
+                panel.password_edit.setText("s3cret-pass")
+                panel.remember_password_checkbox.setChecked(True)
+                panel._save_saved_login("alice")
+                # 登录成功会清空密码框。
+                panel.password_edit.clear()
+                self.assertEqual(panel.password_edit.text(), "")
+
+                panel._show_auth_page()
+                self.assertEqual(panel.password_edit.text(), "s3cret-pass")
+                self.assertEqual(panel.username_edit.text(), "alice")
+            finally:
+                panel.remember_password_checkbox.setChecked(False)
+                panel.close()
+
+    def test_checkbox_uses_paper_colors_instead_of_system_blue(
+        self,
+    ) -> None:
+        panel = OnlinePanel()
+        self.assertIsInstance(
+            panel.remember_password_checkbox, PaperCheckBox
+        )
+        panel.close()
+        box = PaperCheckBox("记住密码")
+        box.setChecked(True)
+        box.show()
+        QT_APP.processEvents()
+        image = box.grab().toImage()
+        # 指示器在左侧；宣纸/墨色都不应出现明显偏蓝的像素。
+        blue_pixels = 0
+        for y in range(image.height()):
+            for x in range(min(24, image.width())):
+                color = image.pixelColor(x, y)
+                if (
+                    color.blue() > color.red() + 40
+                    and color.blue() > color.green() + 40
+                ):
+                    blue_pixels += 1
+        self.assertEqual(blue_pixels, 0)
+        box.close()
+
+    def test_checkbox_paints_its_own_indicator(self) -> None:
+        """自绘指示器必须真的生效。
+
+        只断言"没有蓝色像素"是不够的：应用固定使用 Fusion 风格，原生
+        指示器本来就是灰黑色，同样没有蓝色像素。这里直接比较自绘方框
+        与原生 QCheckBox 的渲染结果。
+        """
+        native = QCheckBox("记住密码")
+        native.setChecked(True)
+        native.resize(120, 24)
+        native.show()
+        QT_APP.processEvents()
+        native_image = native.grab().toImage()
+
+        box = PaperCheckBox("记住密码")
+        box.setChecked(True)
+        box.resize(120, 24)
+        box.show()
+        QT_APP.processEvents()
+        paper_image = box.grab().toImage()
+
+        differences = 0
+        for y in range(
+            min(native_image.height(), paper_image.height())
+        ):
+            for x in range(
+                min(24, native_image.width(), paper_image.width())
+            ):
+                if (
+                    native_image.pixelColor(x, y)
+                    != paper_image.pixelColor(x, y)
+                ):
+                    differences += 1
+        self.assertGreater(differences, 0)
+        native.close()
+        box.close()
+
+    def test_checkbox_does_not_leak_native_indicator_pixels(self) -> None:
+        """原生指示器必须完全隐藏。
+
+        如果只把自绘方框盖在原生指示器上，原生圆角处的灰色像素会从四角
+        漏出来，在宣纸底色上留下一圈系统灰边。主题色都是暖色（红通道
+        明显高于蓝通道），原生指示器是中性灰，据此判断是否泄漏。
+        """
+        box = PaperCheckBox("记住密码")
+        box.setChecked(True)
+        box.resize(120, 24)
+        box.show()
+        QT_APP.processEvents()
+        image = box.grab().toImage()
+
+        option = QStyleOptionButton()
+        box.initStyleOption(option)
+        rect = box.style().subElementRect(
+            QStyle.SubElement.SE_CheckBoxIndicator, option, box
+        )
+        self.assertFalse(rect.isEmpty())
+        background = image.pixelColor(
+            image.width() - 2, image.height() - 2
+        )
+        leaked = []
+        for y in range(rect.y(), rect.y() + rect.height()):
+            for x in range(rect.x(), rect.x() + rect.width()):
+                color = image.pixelColor(x, y)
+                if color == background:
+                    continue
+                spread = max(color.red(), color.green(), color.blue()) - min(
+                    color.red(), color.green(), color.blue()
+                )
+                if spread <= 4:
+                    leaked.append((x, y, color.name()))
+        self.assertEqual(leaked, [])
+        box.close()
+
+
+class LobbyTimeControlUiTests(unittest.TestCase):
+    class _FakeSession:
+        is_authenticated = True
+        in_room = False
+        queued = False
+        room_code = None
+
+        def __init__(self) -> None:
+            self.created: list[object] = []
+
+        def supports(self, capability: str) -> bool:
+            return True
+
+        def create_room(
+            self,
+            allow_spectators: bool,
+            turn_seconds: int | None = None,
+            *,
+            time_control: object = None,
+        ) -> bool:
+            self.created.append(time_control)
+            return True
+
+    def test_casual_time_control_selection_is_sent(self) -> None:
+        panel = OnlinePanel()
+        session = self._FakeSession()
+        panel._session = session  # type: ignore[assignment]
+        # 排位固定每手 30 秒，不再提供自定义时限下拉框。
+        self.assertFalse(hasattr(panel, "ranked_turn_combo"))
+        # 预设顺序：15/30/60/90 秒 + Fischer。
+        panel.turn_seconds_combo.setCurrentIndex(3)
+        panel._on_create_room()
+        self.assertEqual(session.created, [TimeControl.per_move(90)])
         panel.close()
 
 

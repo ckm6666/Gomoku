@@ -167,7 +167,7 @@ class TimeControl:
         raise ProtocolError("时间模式必须是 per_move 或 fischer")
 
 
-#: 界面提供的预设。排位匹配只与相同预设的玩家配对。
+#: 界面提供的预设。排位赛固定每手 30 秒，预设只用于自建房。
 TIME_CONTROL_PRESETS: tuple[TimeControl, ...] = (
     TimeControl.per_move(15),
     TimeControl.per_move(30),

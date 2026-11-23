@@ -10,16 +10,18 @@ from gomoku.shared.protocol import (
     CLIENT_AUTH,
     CLIENT_CANCEL_MATCH,
     CLIENT_CREATE_ROOM,
+    CLIENT_JOIN_ROOM,
     CLIENT_MOVE_INTENT,
     CLIENT_QUICK_MATCH,
     SERVER_AUTHENTICATED,
     SERVER_ERROR,
     SERVER_GAME_STATE,
     SERVER_MATCH_FOUND,
-    SERVER_QUEUE_STATUS,
+    SERVER_ROOM_CREATED,
     make_message,
     parse_game_state,
 )
+from gomoku.shared.rules import Player
 from gomoku.shared.time_control import TimeControl
 from server.app.ws.entities import Room
 from server.tests.helpers import ServerTestBase
@@ -55,15 +57,16 @@ class FischerMatchTests(ServerTestBase):
         }
         return first_token, second_token, control
 
-    def test_fischer_match_exposes_clocks_and_increment(self) -> None:
-        first_token, second_token, control = self._match_fischer()
+    def test_ranked_match_is_fixed_per_move_30(self) -> None:
+        first_token, second_token, fischer = self._match_fischer()
         with self.client.websocket_connect("/api/v1/ws") as first:
             with self.client.websocket_connect("/api/v1/ws") as second:
                 self._authenticate(first, first_token)
                 self._authenticate(second, second_token)
+                # 即使双方请求不同的自定义时限，排位也固定每手 30 秒。
                 first.send_json(
                     make_message(
-                        CLIENT_QUICK_MATCH, {"time_control": control}
+                        CLIENT_QUICK_MATCH, {"time_control": fischer}
                     )
                 )
                 self.assertEqual(
@@ -71,14 +74,20 @@ class FischerMatchTests(ServerTestBase):
                 )
                 second.send_json(
                     make_message(
-                        CLIENT_QUICK_MATCH, {"time_control": control}
+                        CLIENT_QUICK_MATCH,
+                        {
+                            "time_control": {
+                                "mode": "per_move",
+                                "turn_seconds": 15,
+                            }
+                        },
                     )
                 )
                 first_found = self._receive_type(first, SERVER_MATCH_FOUND)
                 self._receive_type(second, SERVER_MATCH_FOUND)
                 self.assertEqual(
-                    first_found["payload"]["time_control"]["mode"],
-                    "fischer",
+                    first_found["payload"]["time_control"],
+                    {"mode": "per_move", "turn_seconds": 30},
                 )
                 first_state = parse_game_state(
                     self._receive_type(first, SERVER_GAME_STATE)["payload"]
@@ -86,24 +95,19 @@ class FischerMatchTests(ServerTestBase):
                 second_state = parse_game_state(
                     self._receive_type(second, SERVER_GAME_STATE)["payload"]
                 )
-                self.assertTrue(first_state.time_control.is_fischer)
-                self.assertEqual(
-                    first_state.time_control.main_seconds, 300
-                )
-                self.assertIsNone(first_state.move_timeout_seconds)
-                self.assertIsNotNone(first_state.turn_deadline_ms)
-                self.assertGreaterEqual(
-                    first_state.black_remaining_ms or 0, 295_000
-                )
-                self.assertLessEqual(
-                    first_state.black_remaining_ms or 0, 300_100
-                )
-                self.assertGreaterEqual(
-                    first_state.white_remaining_ms or 0, 295_000
-                )
-                self.assertLessEqual(
-                    first_state.white_remaining_ms or 0, 300_100
-                )
+                for state in (first_state, second_state):
+                    self.assertFalse(state.time_control.is_fischer)
+                    self.assertEqual(state.time_control.turn_seconds, 30)
+                    self.assertEqual(state.move_timeout_seconds, 30)
+                    self.assertIsNone(state.black_remaining_ms)
+                    self.assertIsNone(state.white_remaining_ms)
+                    self.assertIsNotNone(state.turn_deadline_ms)
+                    self.assertIsNotNone(state.server_now_ms)
+                    deadline = (
+                        state.turn_deadline_ms - state.server_now_ms
+                    )
+                    self.assertGreaterEqual(deadline, 29_000)
+                    self.assertLessEqual(deadline, 30_100)
 
                 if first_state.your_color is second_state.your_color:
                     self.fail("双方执子颜色必须不同")
@@ -117,7 +121,7 @@ class FischerMatchTests(ServerTestBase):
                     make_message(
                         CLIENT_MOVE_INTENT,
                         {"row": 7, "col": 7},
-                        request_id="fischer-move-1",
+                        request_id="fixed-move-1",
                     )
                 )
                 black_after = parse_game_state(
@@ -132,28 +136,16 @@ class FischerMatchTests(ServerTestBase):
                 )
                 self.assertEqual(black_after.move_no, 1)
                 self.assertEqual(white_after.move_no, 1)
-                # 黑方落子后获得 +3 秒，余量不会低于初始 300 秒；
-                # 白方尚未行动，余量保持初始值。
-                self.assertGreaterEqual(
-                    black_after.black_remaining_ms or 0, 300_000
-                )
-                self.assertGreaterEqual(
-                    white_after.white_remaining_ms or 0, 299_000
-                )
-                self.assertLessEqual(
-                    white_after.white_remaining_ms or 0, 300_000
-                )
                 self.assertIs(white_after.current_player.value, "white")
-                self.assertGreaterEqual(
-                    white_after.turn_deadline_ms or 0,
-                    white_after.server_now_ms or 0,
+                next_deadline = (
+                    white_after.turn_deadline_ms - white_after.server_now_ms
                 )
-                self.assertEqual(
-                    black_after.black_remaining_ms,
-                    white_after.black_remaining_ms,
-                )
+                self.assertGreaterEqual(next_deadline, 29_000)
+                self.assertLessEqual(next_deadline, 30_100)
 
-    def test_different_time_controls_do_not_match(self) -> None:
+    def test_different_requested_controls_still_match_at_fixed_30(
+        self,
+    ) -> None:
         first_token, second_token, _ = self._match_fischer()
         with self.client.websocket_connect("/api/v1/ws") as first:
             with self.client.websocket_connect("/api/v1/ws") as second:
@@ -165,7 +157,7 @@ class FischerMatchTests(ServerTestBase):
                         {
                             "time_control": {
                                 "mode": "per_move",
-                                "turn_seconds": 30,
+                                "turn_seconds": 60,
                             }
                         },
                     )
@@ -185,13 +177,18 @@ class FischerMatchTests(ServerTestBase):
                         },
                     )
                 )
-                queued = second.receive_json()
-                self.assertEqual(queued["type"], SERVER_QUEUE_STATUS)
-                self.assertEqual(queued["payload"]["state"], "queued")
+                first_found = self._receive_type(first, SERVER_MATCH_FOUND)
+                self._receive_type(second, SERVER_MATCH_FOUND)
+                self.assertEqual(
+                    first_found["payload"]["time_control"],
+                    {"mode": "per_move", "turn_seconds": 30},
+                )
                 for ws in (first, second):
-                    ws.send_json(make_message(CLIENT_CANCEL_MATCH, {}))
-                    idle = self._receive_type(ws, SERVER_QUEUE_STATUS)
-                    self.assertEqual(idle["payload"]["state"], "idle")
+                    state = parse_game_state(
+                        self._receive_type(ws, SERVER_GAME_STATE)["payload"]
+                    )
+                    self.assertEqual(state.time_control.turn_seconds, 30)
+                    self.assertEqual(state.move_timeout_seconds, 30)
 
     def test_invalid_time_control_is_rejected(self) -> None:
         token = self._register_access("fischer_invalid")
@@ -240,6 +237,157 @@ class FischerMatchTests(ServerTestBase):
             self.assertEqual(queued["payload"]["state"], "queued")
             ws.send_json(make_message(CLIENT_CANCEL_MATCH, {}))
             ws.receive_json()
+
+
+class CasualRoomTimeControlTests(ServerTestBase):
+    """自建房必须真正采用房主选择的时限。"""
+
+    def _receive_type(self, ws, expected: str, attempts: int = 10) -> dict:
+        for _ in range(attempts):
+            message = ws.receive_json()
+            if message["type"] == expected:
+                return message
+        self.fail(f"未收到期望消息 {expected}")
+        return {}
+
+    def _register_access(self, username: str) -> str:
+        response = self.register(username)
+        self.assertEqual(response.status_code, 201, response.text)
+        return response.json()["access_token"]
+
+    def _authenticate(self, ws, token: str) -> None:
+        ws.send_json(make_message(CLIENT_AUTH, {"access_token": token}))
+        self.assertEqual(ws.receive_json()["type"], SERVER_AUTHENTICATED)
+
+    def test_create_room_honors_per_move_seconds(self) -> None:
+        host_token = self._register_access("casual_per_move_host")
+        guest_token = self._register_access("casual_per_move_guest")
+        with self.client.websocket_connect("/api/v1/ws") as host:
+            with self.client.websocket_connect("/api/v1/ws") as guest:
+                self._authenticate(host, host_token)
+                self._authenticate(guest, guest_token)
+                host.send_json(
+                    make_message(
+                        CLIENT_CREATE_ROOM,
+                        {
+                            "time_control": {
+                                "mode": "per_move",
+                                "turn_seconds": 90,
+                            }
+                        },
+                    )
+                )
+                created = host.receive_json()
+                self.assertEqual(created["type"], SERVER_ROOM_CREATED)
+                self.assertEqual(
+                    created["payload"]["time_control"],
+                    {"mode": "per_move", "turn_seconds": 90},
+                )
+                self.assertEqual(created["payload"]["turn_seconds"], 90)
+                guest.send_json(
+                    make_message(
+                        CLIENT_JOIN_ROOM,
+                        {"room_code": created["payload"]["room_code"]},
+                    )
+                )
+                for ws in (host, guest):
+                    state = parse_game_state(
+                        ws.receive_json()["payload"]
+                    )
+                    self.assertFalse(state.time_control.is_fischer)
+                    self.assertEqual(state.time_control.turn_seconds, 90)
+                    self.assertEqual(state.move_timeout_seconds, 90)
+                    deadline = (
+                        state.turn_deadline_ms - state.server_now_ms
+                    )
+                    self.assertGreaterEqual(deadline, 89_000)
+                    self.assertLessEqual(deadline, 90_100)
+
+    def test_create_room_honors_fischer(self) -> None:
+        host_token = self._register_access("casual_fischer_host")
+        guest_token = self._register_access("casual_fischer_guest")
+        with self.client.websocket_connect("/api/v1/ws") as host:
+            with self.client.websocket_connect("/api/v1/ws") as guest:
+                self._authenticate(host, host_token)
+                self._authenticate(guest, guest_token)
+                host.send_json(
+                    make_message(
+                        CLIENT_CREATE_ROOM,
+                        {
+                            "time_control": {
+                                "mode": "fischer",
+                                "main_seconds": 180,
+                                "increment_seconds": 2,
+                            }
+                        },
+                    )
+                )
+                created = host.receive_json()
+                self.assertEqual(created["type"], SERVER_ROOM_CREATED)
+                self.assertEqual(
+                    created["payload"]["time_control"],
+                    {
+                        "mode": "fischer",
+                        "main_seconds": 180,
+                        "increment_seconds": 2,
+                    },
+                )
+                guest.send_json(
+                    make_message(
+                        CLIENT_JOIN_ROOM,
+                        {"room_code": created["payload"]["room_code"]},
+                    )
+                )
+                host_state = None
+                for ws in (host, guest):
+                    state = parse_game_state(
+                        ws.receive_json()["payload"]
+                    )
+                    if ws is host:
+                        host_state = state
+                    self.assertTrue(state.time_control.is_fischer)
+                    self.assertEqual(
+                        state.time_control.main_seconds, 180
+                    )
+                    self.assertEqual(
+                        state.time_control.increment_seconds, 2
+                    )
+                    self.assertIsNone(state.move_timeout_seconds)
+                    self.assertGreaterEqual(
+                        state.black_remaining_ms or 0, 175_000
+                    )
+                    self.assertLessEqual(
+                        state.black_remaining_ms or 0, 180_100
+                    )
+
+                # 房主执黑先手：落子后验证加秒真的生效——黑方余量扣掉本手
+                # 耗时后加回 2 秒，仍不低于初始的 180 秒；白方尚未行动，
+                # 余量保持初始值。
+                self.assertIs(host_state.your_color, Player.BLACK)
+                host.send_json(
+                    make_message(
+                        CLIENT_MOVE_INTENT,
+                        {"row": 7, "col": 7},
+                        request_id="fischer-casual-move-1",
+                    )
+                )
+                host_after = parse_game_state(
+                    self._receive_type(host, SERVER_GAME_STATE)["payload"]
+                )
+                guest_after = parse_game_state(
+                    self._receive_type(guest, SERVER_GAME_STATE)["payload"]
+                )
+                self.assertEqual(host_after.move_no, 1)
+                self.assertEqual(guest_after.move_no, 1)
+                self.assertGreaterEqual(
+                    host_after.black_remaining_ms or 0, 180_000
+                )
+                self.assertGreaterEqual(
+                    guest_after.white_remaining_ms or 0, 179_000
+                )
+                self.assertLessEqual(
+                    guest_after.white_remaining_ms or 0, 180_100
+                )
 
 
 class ClockMathTests(ServerTestBase):
