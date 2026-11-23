@@ -377,12 +377,21 @@ docker run -d --name gomoku-server -p 8000:8000 `
 2. 使用 Caddy/Nginx 终止 TLS，对外只开放 HTTPS/WSS 443；不要把开发 HTTP/WS
    服务直接暴露到公网。
 3. 固定随机 `GOMOKU_JWT_SECRET`，限制配置文件权限，不把 secret 写入客户端或仓库。
-4. 配置每日 PostgreSQL 备份、健康检查和日志收集；设置防火墙，仅开放必要端口。
-5. 客户端 token 目前只存内存，应用重启需要重新登录；后续可用 Windows DPAPI 安全保存 refresh token。
-6. 排位已通过“仅匹配计分、自建房不计分、排位不可直接再战”降低刷分面；举报与回放审计
+   使用 `run_server.py --production` 时会自动生成并持久化到 `server/data/.prod_jwt_secret`；
+   手工运行 `uvicorn` 时必须显式设置环境变量。
+4. 位于 Tailscale Funnel / Caddy / Nginx 等可信反向代理之后时，设置
+   `GOMOKU_TRUST_PROXY_HEADERS=1`（`--production` 默认开启），否则所有客户端会共享
+   代理 IP，单 IP 连接上限退化成全局上限；服务直接暴露给客户端时不要开启，避免伪造
+   `X-Forwarded-For`。
+5. 配置每日备份、健康检查和日志收集。SQLite 可用
+   `python tools/backup_server_data.py` 在线备份；PostgreSQL 使用 `pg_dump`。
+   设置防火墙，仅开放必要端口。
+6. 客户端仅在勾选“记住密码”时持久化 DPAPI 加密的 refresh token（access token 只存内存），
+   下次启动可静默恢复登录；取消勾选或退出登录会删除本地 token。
+7. 排位已通过“仅匹配计分、自建房不计分、排位不可直接再战”降低刷分面；举报与回放审计
    只提供客观异常摘要，仍无法自动识别排队串通、故意送分和外部 AI 辅助。管理员需通过
    `GOMOKU_ADMIN_USERNAMES` 白名单人工复核，处罚不会由服务端自动执行。
-7. 若未来在中国大陆公开运营，需单独评估 ICP/公安备案、实名/未成年人保护、隐私与游戏出版等要求；
+8. 若未来在中国大陆公开运营，需单独评估 ICP/公安备案、实名/未成年人保护、隐私与游戏出版等要求；
    当前定位仅为内测。
 
 ## 测试

@@ -41,6 +41,7 @@ class AuthHTTPClient(QObject):
         self._active_reply: Optional[QNetworkReply] = None
         self._active_kind = ""
         self._session: Optional[AuthSession] = None
+        self._last_error_status: Optional[int] = None
 
     @property
     def session(self) -> Optional[AuthSession]:
@@ -49,6 +50,11 @@ class AuthHTTPClient(QObject):
     @property
     def busy(self) -> bool:
         return self._active_reply is not None
+
+    @property
+    def last_error_status(self) -> Optional[int]:
+        """最近一次失败请求的 HTTP 状态码；网络错误时为 None。"""
+        return self._last_error_status
 
     # ------------------------------------------------------------------
     # 公开请求
@@ -117,6 +123,7 @@ class AuthHTTPClient(QObject):
             self.failed.emit("未配置登录服务器")
             return False
 
+        self._last_error_status = None
         url = QUrl(f"{self._api_base_url}/api/v1/auth/{path}")
         if url.scheme() not in ("http", "https") or not url.host():
             self.failed.emit("登录服务器地址无效")
@@ -171,9 +178,13 @@ class AuthHTTPClient(QObject):
                 reply.error() == QNetworkReply.NetworkError.NoError
                 or (isinstance(status, int) and 200 <= status < 300)
             ):
+                self._last_error_status = None
                 self._handle_success(kind, data, status)
                 return
 
+            self._last_error_status = (
+                status if isinstance(status, int) else None
+            )
             message = self._extract_error(data)
             if not message:
                 if status == 429:

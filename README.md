@@ -23,7 +23,7 @@
   提示新版本号与更新说明，并跳转发布页下载——安装包不经游戏服务端分发；
 - 可打包为单个 `Gomoku.exe`。
 
-当前版本：**1.13.0**（新增主菜单「检查更新」入口，从 GitHub Releases 检索最新版本并跳转下载页；1.12.0 新增登录页“记住密码”与排位固定每手 30 秒，打包版默认连固定公网入口；1.11.0 加入 Fischer 总时长时钟、Glicko-2 与排位赛季、举报与回放审计、AI 复盘分析；1.10.0 加入对战广场与观战；1.9.0 加入自定义头像上传、成就/勋章系统与对局勋章展示）。
+当前版本：**1.13.0**（新增主菜单「检查更新」入口，从 GitHub Releases 检索最新版本并跳转下载页；“记住密码”后可用 DPAPI 加密保存的 refresh token 静默恢复登录；1.12.0 新增登录页“记住密码”与排位固定每手 30 秒，打包版默认连固定公网入口；1.11.0 加入 Fischer 总时长时钟、Glicko-2 与排位赛季、举报与回放审计、AI 复盘分析；1.10.0 加入对战广场与观战；1.9.0 加入自定义头像上传、成就/勋章系统与对局勋章展示）。
 
 > 联机功能需要同时运行本项目的服务端；离线双人/AI 模式不需要服务器。
 > 当前仍是内测定位，注册需要用户名与密码。
@@ -113,9 +113,13 @@
 ### 账号与联机
 
 - 用户名 + 密码注册、登录、refresh token 轮换、登出；Argon2id 密码哈希。
-- 登录页可勾选 **记住密码**：密码使用 Windows DPAPI 按当前 Windows 用户加密后保存在本机，
-  下次启动自动填充账号与密码，退出登录后回到登录页也会重新填入；取消勾选会立即删除已保存的
-  凭据，非 Windows 平台不保存密码，只记住用户名。
+- 登录页可勾选 **记住密码**：密码与 refresh token 使用 Windows DPAPI 按当前 Windows
+  用户加密后保存在本机。下次启动会自动填充账号密码，并用保存的 refresh token 静默恢复
+  登录（服务端轮换 token 后客户端同步保存新值）；退出登录后回到登录页也会重新填入密码。
+  取消勾选会立即删除已保存的凭据，非 Windows 平台不保存密码或 token，只记住用户名。
+- **忘记密码**：没有邮件自助找回；管理员可在项目根目录执行
+  `server\.venv\Scripts\python.exe -m server.manage reset-password --username 用户名`
+  生成新密码（不传 `--new-password` 时随机生成并打印），该账号已登录会话会被撤销。
 - **公开排位快速匹配**：按当前积分选择最接近的对手，双方随机黑白；排位赛固定
   **每手 30 秒**，不提供自定义时限；服务器权威落子、时钟、胜负和积分。
 - **排位赛季与 Glicko-2**：积分、评分不确定度（RD）和波动率由服务器用 Glicko-2 结算；
@@ -368,7 +372,7 @@ Gomoku/
 │   ├── requirements*.txt
 │   ├── manage.py                   # 管理员重置密码
 │   └── README.md                   # 服务端安装、部署、PostgreSQL、TLS 说明
-├── tests/                          # 客户端 435 项自动化测试
+├── tests/                          # 客户端 455 项自动化测试
 ├── requirements.txt                # 客户端运行依赖（人工维护的版本范围）
 ├── requirements.lock               # 客户端运行依赖锁定（含哈希）
 ├── requirements-tools.txt          # ruff / mypy / coverage 工具依赖
@@ -444,9 +448,12 @@ python run_server.py
 
 - `run_server.py` 会自动挑选解释器：优先使用独立的服务端虚拟环境 `server\.venv`，
   其次回退到当前解释器（需已安装 `fastapi` / `uvicorn`）。
-- 脚本会自动补齐开发环境变量：`GOMOKU_SERVER_ENV=development` 与
+- 开发模式会自动补齐环境变量：`GOMOKU_SERVER_ENV=development` 与
   `GOMOKU_JWT_SECRET`（持久化到 `server/data/.dev_jwt_secret`，重启后客户端登录 token 依然有效）。
-- 可选参数：`--port 9000`、`--host 0.0.0.0`、`--no-reload`（默认已开启热重载）、`--env production`。
+- 生产模式使用 `--production`：独立的 `server/data/.prod_jwt_secret`、
+  默认信任反向代理的 `X-Forwarded-For`、默认关闭热重载。
+- 可选参数：`--port 9000`、`--host 0.0.0.0`、`--no-reload`、`--no-trust-proxy`、
+  `--env production`。
 
 ### 手动命令
 
@@ -469,6 +476,33 @@ server\.venv\Scripts\python.exe -m uvicorn server.app.main:app --host 127.0.0.1 
   “开始排位匹配”，或创建自建房后从好友列表邀请在线好友。
 - 默认开发环境没有外部数据库；生产 PostgreSQL、TLS、部署与安全说明见
   [`server/README.md`](server/README.md)。
+
+### 生产运行与备份
+
+对外提供固定公网入口时，推荐后台生产模式：
+
+```powershell
+python run_server.py --background --production   # 或双击 start_server.vbs
+python run_server.py --status
+python run_server.py --stop                      # 或双击 stop_server.vbs
+```
+
+- `--production` 默认开启 `GOMOKU_TRUST_PROXY_HEADERS=1`，让 Tailscale Funnel /
+  Caddy / Nginx 之后的客户端按真实 IP 限流；如果服务直接暴露给客户端、没有可信
+  反向代理，请加 `--no-trust-proxy`，否则客户端可伪造 `X-Forwarded-For` 绕过单 IP 限制。
+- 生产 secret 持久化在 `server/data/.prod_jwt_secret`（已被 `.gitignore` 忽略）。
+  删除该文件会导致所有已登录用户的 token 失效，但不影响账号与棋谱数据。
+- 后台日志写入 `server/data/server-8000.out.log` 与 `server-8000.err.log`，
+  PID 写入 `server-8000.pid`。
+- 定期备份 SQLite 数据库（服务运行中也可执行，默认保留最近 30 份）：
+
+```powershell
+python tools\backup_server_data.py --keep 30
+```
+
+  备份写入 `server/data/backups/`。使用 PostgreSQL 时请改用 `pg_dump`。
+- 本仓库不注册开机自启；需要长期在线时请自行通过任务计划或服务管理器
+  拉起 `start_server.vbs`。
 
 ### 日志、健康检查与指标
 
@@ -700,7 +734,7 @@ CI 安装依赖时使用带哈希的锁文件，避免同一提交在不同时�
 server\.venv\Scripts\python.exe -m pip install --require-hashes -r server\requirements-dev.lock
 ```
 
-客户端当前 **355 项**测试覆盖规则、AI、配置/协议、协议能力协商、联机阶段状态机、SGF 导入/导出、每日残局/连续通关、登录凭据 DPAPI 加密与失效处理、排位固定时限与自建房 Fischer 时钟协议、本地/AI/在线会话、排位快照/匹配队列、
+客户端当前 **386 项**测试覆盖规则、AI、配置/协议、协议能力协商、联机阶段状态机、SGF 导入/导出、每日残局/连续通关、登录凭据 DPAPI 加密与失效处理、refresh token 持久化与静默恢复登录、排位固定时限与自建房 Fischer 时钟协议、本地/AI/在线会话、排位快照/匹配队列、
 程序化音频/MP3 解码/缓存/设置持久化、按钮点击滤波器、主菜单导航/返回确认、古风主题资源/
 绘制、终局与确认弹窗、双人模式设置栏和离屏 UI/QThread；纸色自绘勾选框（不漏出原生指示器
 像素、自绘指示器确实生效）；记住密码（DPAPI 加解密、密文失效按未记住处理、退出登录后
@@ -819,8 +853,9 @@ server\data\gomoku.db
 ```
 
 积分变化写入 `rating_events`；对局/落子仍每手写穿数据库。日志和接口都不记录密码、
-Authorization 头或 token。当前客户端 token 只保存在内存，关闭应用后需要重新登录；
-勾选“记住密码”时仅保存 DPAPI 加密后的账号密码，不持久化 access/refresh token。
+Authorization 头或 token。客户端仅在勾选“记住密码”时持久化 DPAPI 加密的 refresh token
+（access token 只保存在内存），用于下次启动静默恢复登录；取消勾选或退出登录会删除
+本地 refresh token。
 
 客户端偏好（音量、对话日志展开状态等）与“记住密码”的凭据都写在同一个
 `QSettings` 存储里，Windows 上是注册表：
@@ -829,9 +864,9 @@ Authorization 头或 token。当前客户端 token 只保存在内存，关闭�
 HKEY_CURRENT_USER\Software\Gomoku\Gomoku
 ```
 
-其中 `online/saved_password` 存的是 DPAPI 密文（`dpapi:` 前缀），密文只有当前
-Windows 用户能解密；复制到其他账户或机器无法还原明文。取消勾选“记住密码”会立即
-删除该条目。
+其中 `online/saved_password` 与 `online/refresh_token` 存的是 DPAPI 密文
+（`dpapi:` 前缀），密文只有当前 Windows 用户能解密；复制到其他账户或机器无法还原
+明文。取消勾选“记住密码”会立即删除这些条目。
 
 ## 安全与限制
 
@@ -842,9 +877,10 @@ Windows 用户能解密；复制到其他账户或机器无法还原明文。取
   Funnel 关闭或服务端未启动时，所有拿到 exe 的用户都会失去联机功能，客户端不会
   自动切换到备用入口；此时可用环境变量指向自建服务端。
 - 内置公网入口前面有反向代理，所有用户的出口 IP 会收敛成同一个代理 IP。服务端默认
-  按 IP 限制单 IP 的已认证 WebSocket 连接数（默认 20），代理主机需要显式设置
-  `GOMOKU_TRUST_PROXY_HEADERS=1` 才能按真实客户端 IP 限流，否则该上限会退化成整个
-  公网入口的全局上限。
+  按 IP 限制单 IP 的已认证 WebSocket 连接数（默认 20），代理主机的服务端必须设置
+  `GOMOKU_TRUST_PROXY_HEADERS=1` 才能按真实客户端 IP 限流（`run_server.py
+  --production` 会自动开启），否则该上限会退化成整个公网入口的全局上限。反之，
+  服务直接暴露给客户端时应保持关闭，避免伪造 `X-Forwarded-For` 绕过限流。
 - 联机采用服务器权威落子、每手 DB 写穿、房间异步锁、唯一步序/客户端 move_id 幂等、
   服务器时钟和终局一次性 Glicko-2 结算；客户端不能提交胜负或积分。
 - 排位固定每手 30 秒；自建房支持每手倒计时与 Fischer 总时长/加秒。服务器按权威时间扣除与加秒，
