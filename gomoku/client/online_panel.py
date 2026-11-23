@@ -59,6 +59,11 @@ from gomoku.client.online_pages.common import (
     CHAT_INPUT_HINT,
     online_victory_notice,
 )
+from gomoku.client.credential_store import (
+    clear_login,
+    load_login,
+    save_login,
+)
 from gomoku.client.online_player_card import OnlinePlayerCard
 from gomoku.client.online_pages.plaza_page import PlazaPage
 from gomoku.client.sessions.online import OnlineGameSession
@@ -66,7 +71,7 @@ from gomoku.client.sessions.online_state import OnlineSessionPhase
 from gomoku.client.sound_control import SoundButton
 from gomoku.shared.achievements import normalize_achievement_keys
 from gomoku.shared.avatar import normalize_avatar
-from gomoku.shared.capabilities import CAP_ROOM_OPTIONS
+from gomoku.shared.capabilities import CAP_ROOM_OPTIONS, CAP_TIME_CONTROL
 from gomoku.shared.chat import (
     CHAT_KIND_EMOJI,
     CHAT_KIND_TEXT,
@@ -308,6 +313,7 @@ class OnlinePanel(InkBackdrop):
         self._live_refresh_timer.timeout.connect(self._on_live_timer)
 
         self._build_ui()
+        self._load_saved_login()
         self._show_auth_page()
         self._refresh_auth_availability()
 
@@ -481,11 +487,25 @@ class OnlinePanel(InkBackdrop):
         self.quick_match_button.setText(
             "取消排位匹配" if queued else "开始排位匹配"
         )
-        self.ranked_turn_combo.setEnabled(
-            connected and not pending and not queued
-        )
         friend_enabled = connected and not pending and not queued
         self.create_room_button.setEnabled(friend_enabled)
+        supports_time_control = (
+            self._session is not None
+            and self._session.supports(CAP_TIME_CONTROL)
+        )
+        # 旧服务端不读取客户端的时限设置，会静默退回每手 30 秒；
+        # 这里直接禁用选择并提示，避免用户以为选择没有生效。
+        self.turn_seconds_combo.setEnabled(
+            friend_enabled and supports_time_control
+        )
+        self.time_control_hint.setVisible(
+            connected and not supports_time_control
+        )
+        if connected and not supports_time_control:
+            self.time_control_hint.setText(
+                "服务端版本过旧，不支持自定义时限；请升级服务端，"
+                "否则自建房会按每手 30 秒进行。"
+            )
         self.allow_spectators_checkbox.setVisible(
             self._session is not None
             and self._session.supports(CAP_ROOM_OPTIONS)
@@ -1751,11 +1771,40 @@ class OnlinePanel(InkBackdrop):
             self._set_auth_status("无法发起注册请求", error=True)
             self._set_auth_form_busy(False)
 
+    def _load_saved_login(self) -> None:
+        """启动时恢复“记住密码”保存的账号与密码。"""
+        remember, username, password = load_login(self._settings)
+        if username:
+            self.username_edit.setText(username)
+        if password:
+            self.password_edit.setText(password)
+        self.remember_password_checkbox.setChecked(remember)
+
+    def _save_saved_login(self, username: str) -> None:
+        """按复选框状态保存或清除登录凭据。"""
+        if not self.remember_password_checkbox.isChecked():
+            clear_login(self._settings)
+            return
+        if not username:
+            return
+        if not save_login(
+            self._settings, username, self.password_edit.text()
+        ):
+            logger.warning(
+                "登录密码无法通过 DPAPI 安全保存，本次仅记住用户名"
+            )
+
+    def _on_remember_password_toggled(self, checked: bool) -> None:
+        """取消勾选时立即删除已保存的凭据。"""
+        if not checked:
+            clear_login(self._settings)
+
     def _set_auth_form_busy(self, busy: bool) -> None:
         enabled = not busy and self.stack.currentWidget() is self.auth_page
         for widget in (
             self.username_edit,
             self.password_edit,
+            self.remember_password_checkbox,
             self.login_button,
             self.register_button,
         ):
@@ -1771,6 +1820,8 @@ class OnlinePanel(InkBackdrop):
         self._auth_session = session
         self._logging_out = False
         self._reconnect_attempts = 0
+        # 密码编辑框马上就要清空；先按用户的选择保存凭据。
+        self._save_saved_login(session.user.username)
         self.password_edit.clear()
         self._clear_profile_ui()
         self._set_auth_status("登录成功，正在连接游戏服务器…")
@@ -2037,6 +2088,11 @@ class OnlinePanel(InkBackdrop):
         time_control = self.turn_seconds_combo.currentData()
         if not isinstance(time_control, TimeControl):
             time_control = None
+        logger.info(
+            "请求创建自建房：允许观战=%s，时限=%s",
+            self.allow_spectators_checkbox.isChecked(),
+            time_control.label() if time_control is not None else "服务器默认",
+        )
         if not self._session.create_room(
             self.allow_spectators_checkbox.isChecked(),
             time_control=time_control,
@@ -2066,10 +2122,8 @@ class OnlinePanel(InkBackdrop):
         self._set_lobby_status("")
         self._set_match_status("正在进入排位匹配队列…")
         self._refresh_lobby_controls()
-        time_control = self.ranked_turn_combo.currentData()
-        if not isinstance(time_control, TimeControl):
-            time_control = None
-        if not self._session.quick_match(time_control=time_control):
+        # 排位固定每手 30 秒，不需要向服务器提交时限设置。
+        if not self._session.quick_match():
             self._room_action_pending = False
             self._set_match_status("无法开始匹配，请检查连接", error=True)
             self._refresh_lobby_controls()
@@ -2703,6 +2757,10 @@ class OnlinePanel(InkBackdrop):
             room_title = "自建房，等待好友"
         else:
             room_title = "自建房，休闲对局"
+        time_control = session.time_control
+        if time_control is not None:
+            # 把服务端实际采用的时限显示出来，选项未生效时能一眼看出。
+            room_title = f"{room_title}，{time_control.label()}"
         self.room_title_label.setText(room_title)
         self.invite_friend_button.setVisible(waiting)
         self.invite_friend_button.setEnabled(
@@ -3084,9 +3142,12 @@ class OnlinePanel(InkBackdrop):
         session = self._session
         self._sync_sandbox_button(session)
         rated = snapshot.rated
-        self.room_title_label.setText(
-            "观战 · 排位赛" if rated else "观战 · 自建房"
-        )
+        spectator_title = "观战 · 排位赛" if rated else "观战 · 自建房"
+        if snapshot.time_control is not None:
+            spectator_title = (
+                f"{spectator_title}，{snapshot.time_control.label()}"
+            )
+        self.room_title_label.setText(spectator_title)
         # 旁观者不能邀请好友进自己的房间。
         self.invite_friend_button.setVisible(False)
         self.connection_label.setText(

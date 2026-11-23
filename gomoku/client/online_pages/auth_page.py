@@ -6,6 +6,7 @@ from typing import Any
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -76,6 +77,16 @@ def build_auth_page(panel: Any) -> QWidget:
         card_layout.addWidget(label)
         card_layout.addWidget(widget)
 
+    panel.remember_password_checkbox = QCheckBox(
+        "记住密码（仅保存在本机）", card
+    )
+    panel.remember_password_checkbox.setObjectName("rememberPasswordCheck")
+    panel.remember_password_checkbox.setToolTip(
+        "密码使用 Windows 凭据保护（DPAPI）加密后保存在本机，"
+        "仅当前 Windows 用户可解密。"
+    )
+    card_layout.addWidget(panel.remember_password_checkbox)
+
     buttons = QHBoxLayout()
     buttons.setSpacing(10)
     panel.login_button = QPushButton("登录", card)
@@ -97,5 +108,8 @@ def build_auth_page(panel: Any) -> QWidget:
     panel.login_button.clicked.connect(panel._on_login_clicked)
     panel.register_button.clicked.connect(panel._on_register_clicked)
     panel.password_edit.returnPressed.connect(panel._on_login_clicked)
+    panel.remember_password_checkbox.toggled.connect(
+        panel._on_remember_password_toggled
+    )
 
     return _centered_card_page(panel, card)

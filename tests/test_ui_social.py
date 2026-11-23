@@ -57,6 +57,7 @@ from gomoku.shared.achievements import (  # noqa: E402
 from gomoku.shared.avatar import AVATARS  # noqa: E402
 from gomoku.shared.protocol import GameSnapshot  # noqa: E402
 from gomoku.shared.social import DirectMessage  # noqa: E402
+from gomoku.shared.time_control import TimeControl  # noqa: E402
 
 QT_APP = QApplication.instance() or QApplication([])
 
@@ -994,6 +995,42 @@ class OnlineResignConfirmationTests(unittest.TestCase):
         ):
             panel._on_resign()
         self.assertEqual(session.resigned, 1)
+        panel.close()
+
+
+class LobbyTimeControlUiTests(unittest.TestCase):
+    class _FakeSession:
+        is_authenticated = True
+        in_room = False
+        queued = False
+        room_code = None
+
+        def __init__(self) -> None:
+            self.created: list[object] = []
+
+        def supports(self, capability: str) -> bool:
+            return True
+
+        def create_room(
+            self,
+            allow_spectators: bool,
+            turn_seconds: int | None = None,
+            *,
+            time_control: object = None,
+        ) -> bool:
+            self.created.append(time_control)
+            return True
+
+    def test_casual_time_control_selection_is_sent(self) -> None:
+        panel = OnlinePanel()
+        session = self._FakeSession()
+        panel._session = session  # type: ignore[assignment]
+        # 排位固定每手 30 秒，不再提供自定义时限下拉框。
+        self.assertFalse(hasattr(panel, "ranked_turn_combo"))
+        # 预设顺序：15/30/60/90 秒 + Fischer。
+        panel.turn_seconds_combo.setCurrentIndex(3)
+        panel._on_create_room()
+        self.assertEqual(session.created, [TimeControl.per_move(90)])
         panel.close()
 
 

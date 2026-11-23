@@ -104,7 +104,9 @@ def build_lobby_page(panel: Any) -> QWidget:
     ranked_title = QLabel("排位匹配，计入段位积分", card)
     ranked_title.setObjectName("sectionTitle")
     ranked_hint = QLabel(
-        "按积分匹配对手；胜者加分、负者扣分，自建房不计分。", card
+        "按积分匹配对手，排位固定每手 30 秒；胜者加分、负者扣分，"
+        "自建房不计分。",
+        card,
     )
     ranked_hint.setObjectName("hintLabel")
     ranked_hint.setWordWrap(True)
@@ -121,17 +123,10 @@ def build_lobby_page(panel: Any) -> QWidget:
     panel.match_status_label.setMinimumHeight(20)
     layout.addWidget(ranked_title)
     layout.addWidget(ranked_hint)
-    ranked_time_row = QHBoxLayout()
-    ranked_time_label = QLabel("时限", card)
+    # 排位赛固定每手 30 秒，不提供自定义入口；自建房才可选时限。
+    ranked_time_label = QLabel("时限：每手 30 秒（排位固定）", card)
     ranked_time_label.setObjectName("formLabel")
-    panel.ranked_turn_combo = QComboBox(card)
-    for control in time_control_presets():
-        panel.ranked_turn_combo.addItem(control.label(), control)
-    panel.ranked_turn_combo.setCurrentIndex(1)
-    ranked_time_row.addWidget(ranked_time_label)
-    ranked_time_row.addWidget(panel.ranked_turn_combo)
-    ranked_time_row.addStretch(1)
-    layout.addLayout(ranked_time_row)
+    layout.addWidget(ranked_time_label)
     layout.addWidget(panel.quick_match_button)
     layout.addWidget(panel.match_status_label)
 
@@ -162,6 +157,11 @@ def build_lobby_page(panel: Any) -> QWidget:
     time_row.addWidget(time_label)
     time_row.addWidget(panel.turn_seconds_combo)
     time_row.addStretch(1)
+    # 服务端太旧时不支持自定义时限，由面板在联机后显示原因。
+    panel.time_control_hint = QLabel("", card)
+    panel.time_control_hint.setObjectName("hintLabel")
+    panel.time_control_hint.setWordWrap(True)
+    panel.time_control_hint.setVisible(False)
     panel.create_room_button = QPushButton("创建自建房", card)
     panel.create_room_button.setObjectName("undoButton")
     panel.create_room_button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -169,6 +169,7 @@ def build_lobby_page(panel: Any) -> QWidget:
     layout.addWidget(friend_hint)
     layout.addWidget(panel.allow_spectators_checkbox)
     layout.addLayout(time_row)
+    layout.addWidget(panel.time_control_hint)
     layout.addWidget(panel.create_room_button)
 
     layout.addSpacing(4)

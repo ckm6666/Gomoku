@@ -152,6 +152,8 @@ def state_message(
     undo_cooldown_seconds: int = 10,
     undo_cooldown_until_ms: int | None = None,
     server_now_ms: int | None = None,
+    time_control: dict | None = None,
+    move_timeout_seconds: int | None = None,
 ) -> dict:
     """构造一个符合协议的服务器局面消息。"""
     return make_message(
@@ -181,6 +183,8 @@ def state_message(
             "opponent_rating_before": opponent_rating_before,
             "opponent_rating_after": opponent_rating_after,
             "rating_delta": rating_delta,
+            "time_control": time_control,
+            "move_timeout_seconds": move_timeout_seconds,
         },
         request_id=request_id,
     )
@@ -644,6 +648,52 @@ class OnlineSessionTests(unittest.TestCase):
             self.assertEqual(session.room_code, "")
             self.assertFalse(session.waiting_for_opponent)
             self.assertEqual(closed_events, ["测试关闭"])
+        finally:
+            session.shutdown()
+            transport.close()
+
+    def test_session_exposes_room_and_snapshot_time_control(self) -> None:
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        try:
+            self._authenticate(transport, session)
+            self.assertIsNone(session.time_control)
+            transport.receive(
+                make_message(
+                    SERVER_ROOM_CREATED,
+                    {
+                        "room_code": "ABC123",
+                        "game_id": "game-abc",
+                        "your_color": "black",
+                        "black_name": "tester",
+                        "white_name": "",
+                        "turn_seconds": 90,
+                        "time_control": {
+                            "mode": "per_move",
+                            "turn_seconds": 90,
+                        },
+                    },
+                )
+            )
+            self.assertEqual(
+                session.time_control, TimeControl.per_move(90)
+            )
+
+            # 对局开始后以权威快照里的时限为准。
+            transport.receive(
+                state_message(
+                    blank_board(),
+                    room_code="ABC123",
+                    time_control={
+                        "mode": "fischer",
+                        "main_seconds": 180,
+                        "increment_seconds": 2,
+                    },
+                )
+            )
+            self.assertEqual(
+                session.time_control, TimeControl.fischer(180, 2)
+            )
         finally:
             session.shutdown()
             transport.close()

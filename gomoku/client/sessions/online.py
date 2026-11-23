@@ -82,7 +82,10 @@ from gomoku.shared.social import (
     parse_direct_message,
     parse_friend_event,
 )
-from gomoku.shared.time_control import TimeControl
+from gomoku.shared.time_control import (
+    TimeControl,
+    time_control_from_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +160,9 @@ class OnlineGameSession(GameSession):
         self._user_id = ""
         self._username = ""
         self._room_code = ""
+        # 当前房间/对局的时限设置；等待房间由 room_created 下发，
+        # 对局开始后以权威快照为准。
+        self._time_control: Optional[TimeControl] = None
         self._waiting = False
         self._your_color: Optional[Player] = None
         self._game_id: Optional[str] = None
@@ -248,6 +254,11 @@ class OnlineGameSession(GameSession):
     @property
     def room_code(self) -> str:
         return self._room_code
+
+    @property
+    def time_control(self) -> Optional[TimeControl]:
+        """当前房间/对局的时限；未知时为 None。"""
+        return self._time_control
 
     @property
     def waiting_for_opponent(self) -> bool:
@@ -568,7 +579,7 @@ class OnlineGameSession(GameSession):
         *,
         time_control: Optional[TimeControl] = None,
     ) -> bool:
-        """加入公开排位匹配队列；只与相同时限设置的玩家配对。"""
+        """加入公开排位匹配队列；排位固定每手 30 秒。"""
         if not self._authenticated or self._closed:
             return False
         payload: dict[str, Any] = {}
@@ -784,6 +795,7 @@ class OnlineGameSession(GameSession):
         self._snapshot = None
         self._view = _empty_view()
         self._room_code = ""
+        self._time_control = None
         self._waiting = False
         self._your_color = None
         self._game_id = None
@@ -937,6 +949,9 @@ class OnlineGameSession(GameSession):
             self.error.emit("服务器返回了无效房间码")
             return
         self._room_code = code
+        self._time_control = time_control_from_snapshot(
+            payload.get("time_control"), payload.get("turn_seconds")
+        )
         self._waiting = True
         self._active = False
         self._snapshot = None
@@ -975,6 +990,8 @@ class OnlineGameSession(GameSession):
             self.error.emit("服务器返回了无效棋局")
             return
 
+        if snapshot.time_control is not None:
+            self._time_control = snapshot.time_control
         same_game = self._game_id == snapshot.game_id
         if same_game:
             # 新版服务端用 state_version 识别回滚；没有版本号时退回手数比较，
@@ -1204,6 +1221,7 @@ class OnlineGameSession(GameSession):
         self._your_color = color
         self._spectating = False
         self._room_code = ""
+        self._time_control = None
         self._waiting = False
         self._active = False
         self._snapshot = None
