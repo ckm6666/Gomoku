@@ -1,10 +1,11 @@
-"""Elo 积分与休闲段位（纯函数，方便单元测试）。
+"""排位积分（Glicko-2）与休闲段位。
 
 设计要点：
+* 采用 Glicko-2 同时维护积分、评分不确定度（RD）和波动率；
 * 新账号起始 1200 分（黄金段位），最低 100 分；
-* 前 10 局为定级保护期，K=40，之后按分段 K=32/24/16；
-* 排位对局由服务器结算一次，积分变化写入 rating_events 便于审计；
+* 排位对局由服务器结算一次，积分/RD/波动率变化写入 rating_events 审计；
 * 好友房不计分，避免通过固定对手刷分；
+* 赛季切换时调用 :func:`server.app.glicko2.season_soft_reset` 做软重置；
 * 段位阈值只存在服务端，客户端通过接口/对局快照读取，避免两端规则漂移。
 """
 
@@ -13,9 +14,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from server.app.glicko2 import (
+    GlickoState,
+    calculate_pair as _calculate_glicko_pair,
+)
+
 START_RATING = 1200
 MIN_RATING = 100
-PROVISIONAL_GAMES = 10
+
 
 # 段位从低到高；next threshold 由下一档自动推导。
 _RANK_TIERS: tuple[tuple[str, str, int], ...] = (
@@ -83,28 +89,16 @@ def rank_payload(rating: int) -> dict:
     }
 
 
-def expected_score(rating: int, opponent_rating: int) -> float:
-    """Elo 期望胜率（胜=1，平=0.5）。"""
-    return 1.0 / (1.0 + 10.0 ** ((opponent_rating - rating) / 400.0))
-
-
-def k_factor(rating: int, rated_games: int) -> int:
-    """按定级期/分段选择 K 值。"""
-    if rated_games < PROVISIONAL_GAMES:
-        return 40
-    if rating < 1600:
-        return 32
-    if rating < 2000:
-        return 24
-    return 16
-
-
 @dataclass(frozen=True)
 class RatingChange:
-    """一名玩家一局的积分变化。"""
+    """一名玩家一局的积分变化（含 Glicko-2 审计字段）。"""
 
     before: int
     after: int
+    rd_before: float
+    rd_after: float
+    volatility_before: float
+    volatility_after: float
 
     @property
     def delta(self) -> int:
@@ -113,44 +107,50 @@ class RatingChange:
 
 def calculate_pair(
     rating_a: int,
-    games_a: int,
+    rd_a: float,
+    volatility_a: float,
     rating_b: int,
-    games_b: int,
+    rd_b: float,
+    volatility_b: float,
     score_a: float,
 ) -> tuple[RatingChange, RatingChange]:
-    """计算两名玩家的新积分。
+    """结算一局排位赛：``score_a`` 为 A 的得分（胜 1 / 平 0.5 / 负 0）。
 
-    ``score_a`` 为 A 的得分：胜 1.0、平 0.5、负 0.0；B 得分为其补数。
+    返回顺序与传入顺序一致。积分最低钳制到 ``MIN_RATING``。
     """
-    if score_a not in (0.0, 0.5, 1.0):
-        raise ValueError("score_a 只能是 0.0/0.5/1.0")
-
-    expected_a = expected_score(rating_a, rating_b)
-    expected_b = 1.0 - expected_a
-    score_b = 1.0 - score_a
-
-    k_a = k_factor(rating_a, games_a)
-    k_b = k_factor(rating_b, games_b)
-
-    after_a = max(MIN_RATING, int(round(rating_a + k_a * (score_a - expected_a))))
-    after_b = max(MIN_RATING, int(round(rating_b + k_b * (score_b - expected_b))))
+    glicko_a, glicko_b = _calculate_glicko_pair(
+        GlickoState.from_stored(rating_a, rd_a, volatility_a),
+        GlickoState.from_stored(rating_b, rd_b, volatility_b),
+        score_a,
+    )
     return (
-        RatingChange(before=rating_a, after=after_a),
-        RatingChange(before=rating_b, after=after_b),
+        RatingChange(
+            before=rating_a,
+            after=max(MIN_RATING, int(round(glicko_a.after.rating))),
+            rd_before=glicko_a.before.rd,
+            rd_after=glicko_a.after.rd,
+            volatility_before=glicko_a.before.volatility,
+            volatility_after=glicko_a.after.volatility,
+        ),
+        RatingChange(
+            before=rating_b,
+            after=max(MIN_RATING, int(round(glicko_b.after.rating))),
+            rd_before=glicko_b.before.rd,
+            rd_after=glicko_b.after.rd,
+            volatility_before=glicko_b.before.volatility,
+            volatility_after=glicko_b.after.volatility,
+        ),
     )
 
 
 __all__ = [
     "START_RATING",
     "MIN_RATING",
-    "PROVISIONAL_GAMES",
     "RANK_TIERS",
     "RankTier",
     "rank_for_rating",
     "rank_progress_percent",
     "rank_payload",
-    "expected_score",
-    "k_factor",
     "RatingChange",
     "calculate_pair",
 ]

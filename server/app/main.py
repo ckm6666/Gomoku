@@ -22,6 +22,8 @@ from server.app.api.friends import router as friends_router
 from server.app.api.games import router as games_router
 from server.app.api.messages import router as messages_router
 from server.app.api.ranked import router as ranked_router
+from server.app.api.reports import router as reports_router
+from server.app.api.seasons import router as seasons_router
 from server.app.api.users import router as users_router
 from server.app.config import Settings
 from server.app.db import (
@@ -37,6 +39,7 @@ from server.app.observability import (
     reset_request_id,
     sanitize_request_id,
 )
+from server.app.seasons import ensure_current_season
 from server.app.security import LoginBackoff
 from server.app.ws.endpoint import router as ws_router
 from server.app.ws.rooms import RoomManager
@@ -55,6 +58,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         session_factory = create_session_factory(engine)
         await prepare_database(engine, service_settings)
         await mark_unfinished_games_abandoned(session_factory)
+        await ensure_current_season(session_factory, service_settings)
 
         app.state.settings = service_settings
         app.state.engine = engine
@@ -87,7 +91,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     app = FastAPI(
         title="Gomoku Online Service",
-        version="0.4.0",
+        version="0.5.0",
         lifespan=lifespan,
     )
 
@@ -147,7 +151,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(ranked_router, prefix="/api/v1")
+    app.include_router(seasons_router, prefix="/api/v1")
     app.include_router(games_router, prefix="/api/v1")
+    app.include_router(reports_router, prefix="/api/v1")
     app.include_router(users_router, prefix="/api/v1")
     app.include_router(friends_router, prefix="/api/v1")
     app.include_router(messages_router, prefix="/api/v1")

@@ -57,4 +57,18 @@ async def get_current_user(
     return user
 
 
-__all__ = ["get_db", "get_current_user"]
+async def get_admin_user(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """管理员依赖：用户名必须在 ``GOMOKU_ADMIN_USERNAMES`` 白名单中。"""
+    settings: Settings = request.app.state.settings
+    if current_user.username_key.lower() not in settings.admin_usernames:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="需要管理员权限",
+        )
+    return current_user
+
+
+__all__ = ["get_db", "get_current_user", "get_admin_user"]

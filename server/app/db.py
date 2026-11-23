@@ -88,9 +88,21 @@ _ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("avatar_version", "INTEGER NOT NULL DEFAULT 0"),
         ("current_win_streak", "INTEGER NOT NULL DEFAULT 0"),
         ("best_win_streak", "INTEGER NOT NULL DEFAULT 0"),
+        ("rating_rd", "FLOAT NOT NULL DEFAULT 100.0"),
+        ("rating_volatility", "FLOAT NOT NULL DEFAULT 0.06"),
     ),
     "games": (
         ("rating_applied", "BOOLEAN NOT NULL DEFAULT {false}"),
+        ("time_mode", "VARCHAR(16) NOT NULL DEFAULT 'per_move'"),
+        ("main_seconds", "INTEGER NOT NULL DEFAULT 0"),
+        ("increment_seconds", "INTEGER NOT NULL DEFAULT 0"),
+    ),
+    "rating_events": (
+        ("rating_rd_before", "FLOAT"),
+        ("rating_rd_after", "FLOAT"),
+        ("rating_volatility_before", "FLOAT"),
+        ("rating_volatility_after", "FLOAT"),
+        ("season_id", "VARCHAR(36)"),
     ),
 }
 

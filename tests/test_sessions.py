@@ -51,6 +51,7 @@ from gomoku.shared.protocol import (  # noqa: E402
     make_message,
 )
 from gomoku.shared.rules import BOARD_SIZE, Player  # noqa: E402
+from gomoku.shared.time_control import TimeControl  # noqa: E402
 from tests.fakes import FakeTransport  # noqa: E402
 
 # 保持 QApplication 单例；若 UI 测试先创建则复用同一个实例。
@@ -517,6 +518,76 @@ class OnlineSessionTests(unittest.TestCase):
             )
             self.assertIs(
                 session.phase, OnlineSessionPhase.SPECTATING
+            )
+        finally:
+            session.shutdown()
+            transport.close()
+
+    def test_quick_match_sends_turn_seconds(self) -> None:
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        try:
+            self._authenticate(transport, session)
+            self.assertTrue(session.quick_match(15))
+            sent = transport.sent_messages[-1]
+            self.assertEqual(sent["type"], CLIENT_QUICK_MATCH)
+            self.assertEqual(sent["payload"]["turn_seconds"], 15)
+        finally:
+            session.shutdown()
+            transport.close()
+
+    def test_quick_match_sends_fischer_time_control(self) -> None:
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        try:
+            self._authenticate(transport, session)
+            control = TimeControl.fischer(300, 3)
+            self.assertTrue(session.quick_match(time_control=control))
+            sent = transport.sent_messages[-1]
+            self.assertEqual(sent["type"], CLIENT_QUICK_MATCH)
+            self.assertEqual(
+                sent["payload"]["time_control"],
+                {
+                    "mode": "fischer",
+                    "main_seconds": 300,
+                    "increment_seconds": 3,
+                },
+            )
+        finally:
+            session.shutdown()
+            transport.close()
+
+    def test_create_room_sends_room_options(self) -> None:
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        try:
+            self._authenticate(transport, session)
+            self.assertTrue(session.create_room(False, 15))
+            sent = transport.sent_messages[-1]
+            self.assertEqual(sent["type"], "create_room")
+            self.assertFalse(sent["payload"]["allow_spectators"])
+            self.assertEqual(sent["payload"]["turn_seconds"], 15)
+        finally:
+            session.shutdown()
+            transport.close()
+
+    def test_create_room_sends_fischer_time_control(self) -> None:
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        try:
+            self._authenticate(transport, session)
+            self.assertTrue(
+                session.create_room(
+                    True, time_control=TimeControl.fischer(180, 2)
+                )
+            )
+            sent = transport.sent_messages[-1]
+            self.assertEqual(sent["type"], "create_room")
+            self.assertEqual(
+                sent["payload"]["time_control"]["mode"], "fischer"
+            )
+            self.assertEqual(
+                sent["payload"]["time_control"]["main_seconds"], 180
             )
         finally:
             session.shutdown()

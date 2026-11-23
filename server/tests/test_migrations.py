@@ -70,7 +70,7 @@ class FreshDatabaseMigrationTests(ServerTestBase):
             ).fetchall()
         finally:
             connection.close()
-        self.assertEqual(version, [("0001_baseline",)])
+        self.assertEqual(version, [("0002_seasons_glicko_reports",)])
 
     def test_prepare_database_is_idempotent(self) -> None:
         # 在独立数据库上连续迁移两次，确认 upgrade head 是幂等的。
@@ -101,7 +101,7 @@ class FreshDatabaseMigrationTests(ServerTestBase):
                 ).fetchall()
             finally:
                 connection.close()
-            self.assertEqual(version, [("0001_baseline",)])
+            self.assertEqual(version, [("0002_seasons_glicko_reports",)])
 
 
 class LegacyDatabaseMigrationTests(unittest.TestCase):
@@ -143,7 +143,7 @@ class LegacyDatabaseMigrationTests(unittest.TestCase):
                 ).fetchall()
             finally:
                 connection.close()
-            self.assertEqual(version, [("0001_baseline",)])
+            self.assertEqual(version, [("0002_seasons_glicko_reports",)])
 
 
 if __name__ == "__main__":

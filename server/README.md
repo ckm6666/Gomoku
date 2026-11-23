@@ -3,20 +3,22 @@
 FastAPI + WebSocket + SQLAlchemy 的联机服务端，提供：
 
 - 用户名 + 密码账号注册、登录、refresh token 轮换、登出；
-- 公开排位快速匹配队列（按积分接近配对、随机黑白）；
+- 公开排位快速匹配队列（按积分接近配对、随机黑白，只匹配完全相同时限设置的玩家）；
+- 每手倒计时与 **Fischer 总时长/加秒**，服务器权威扣除与加秒；
+- **Glicko-2** 积分（积分/RD/波动率）与段位、排行榜、个人资料与最近排位战绩；
+- **排位赛季**：当前赛季信息、到期归档 `season_ratings`、积分软重置、历史赛季排行榜；
 - 预置头像与自定义图片头像（JPEG/PNG 校验、体积/尺寸限制、按版本长缓存）、公开资料与用户搜索；
 - 排位成就：胜场/连胜/段位成就由账号统计推导，排位结算时更新连胜并在终局快照下发新解锁勋章；
 - 好友申请/同意/删除、好友在线状态推送与好友私聊（消息持久化、离线补收）；
 - 自建房邀请：房主创建房间后直接邀请在线好友，对方接受即开局，无需房间码；
-- 服务器权威落子、五连判定、每手倒计时；
-- 断线保留房间与重连恢复（每手 30 秒默认）；
+- **举报与回放审计**：参与者举报对手，管理员白名单复核；审计检查落子序列/座位/终局一致性与时间异常；
+- 断线保留房间与重连恢复；
 - 认输、自建房双方确认再战、离开房间；
-- Elo 积分、段位、排行榜、个人资料与最近排位战绩；
-- 最近对局列表与单局完整棋谱（仅对局参与者可读）；
+- 最近对局列表与单局完整棋谱（仅对局参与者可读）以及参与者审计接口；
 - SQLite 开发默认 / PostgreSQL 生产 URL 兼容。
 
-当前版本对应客户端 **1.9.0**。已提供参与者棋谱读取；尚未实现赛季、Glicko-2、
-邮箱验证、第三方登录、举报/处罚或 Redis 多实例路由。
+当前版本对应客户端 **1.11.0**（服务端 API 0.5.0）。尚未实现邮箱验证、第三方登录、
+账号自动处罚/申诉或 Redis 多实例路由。
 
 ## 目录
 
@@ -29,28 +31,33 @@ server/
 │   ├── migrations.py       # 启动时执行 Alembic upgrade / 旧库登记基线
 │   ├── metrics.py          # Prometheus 指标与房间状态 collector
 │   ├── observability.py    # 结构化日志、请求 ID、用户上下文
-│   ├── models.py           # users/friendships/direct_messages/games/moves/rating_events
-│   ├── ratings.py          # Elo 与段位纯函数
+│   ├── models.py           # users/games/moves/rating_events/seasons/game_reports/社交
+│   ├── glicko2.py          # Glicko-2 积分、RD、波动率纯函数
+│   ├── ratings.py          # 积分结算封装、段位与赛季软重置
+│   ├── seasons.py          # 当前赛季推进、归档与软重置
+│   ├── audit.py            # 回放审计（序列/座位/结果/时间异常）
 │   ├── achievement_service.py  # 由账号统计推导成就
 │   ├── avatar_service.py   # 自定义头像 data URL 校验与解码
 │   ├── security.py         # Argon2id、JWT、refresh token
 │   ├── schemas.py          # 认证/资料/排行榜/好友/私聊 DTO
 │   ├── auth_service.py     # 令牌生成辅助
 │   ├── api/auth.py         # 注册/登录/刷新/登出/me
-│   ├── api/ranked.py       # /profile/me 与 /leaderboard
+│   ├── api/ranked.py       # /profile/me（含赛季排名）与 /leaderboard
+│   ├── api/seasons.py      # /seasons/current 与历史赛季归档排行榜
+│   ├── api/reports.py      # /reports 与 /admin/reports 复核
 │   ├── api/users.py        # /users/{id}、/users/search、头像更新/上传/读取
 │   ├── api/friends.py      # 好友申请/列表/同意/拒绝/删除
 │   ├── api/messages.py     # 好友私聊历史与发送
-│   ├── api/games.py        # /games/recent、/games/live 与 /games/{id}
+│   ├── api/games.py        # /games/recent、/games/live、/games/{id} 与 /audit
 │   ├── ws/
 │   │   ├── endpoint.py     # WebSocket 首帧认证、能力协商与命令分发
 │   │   ├── entities.py     # 连接/房间/邀请/队列纯数据实体
 │   │   ├── limits.py       # 命令令牌桶与单 IP 连接配额
 │   │   └── rooms.py        # 自建房邀请、匹配队列、排位结算、时钟、重连、再战
-├── migrations/             # Alembic 版本化迁移（0001_baseline 起）
+├── migrations/             # Alembic 版本化迁移（0001 baseline、0002 赛季/Glicko/举报）
 ├── alembic.ini             # 迁移脚本路径与数据库 URL 占位
 ├── Dockerfile              # 服务端生产镜像（非 root、健康检查）
-├── tests/                  # REST + 双 WebSocket + Elo + 迁移 + 可观测性测试
+├── tests/                  # REST + 双 WebSocket + Glicko-2/赛季/举报/审计/迁移/可观测性测试
 ├── requirements.txt              # 运行依赖（版本范围）
 ├── requirements.lock             # 运行依赖锁定（含哈希）
 ├── requirements-dev.txt          # 开发/测试依赖
@@ -116,16 +123,17 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 ## 排位积分与匹配
 
 - 客户端大厅发送 `quick_match` 加入内存队列；队列中已有对手时，服务器选择与入队者
-  积分最接近的玩家，随机分配黑白并立即开局。
-- 排位房在数据库中标记 `games.rated=true`，只能通过匹配创建，不能通过好友邀请加入，
-  避免定向刷分；排位终局不支持 `rematch`，客户端需重新匹配。
-- 每手默认 30 秒；认输/超时/五连/平局都由服务器裁决。
-- 终局由服务器执行一次 Elo 结算：
-  - 起始 1200 分，最低 100；
-  - 前 10 局 K=40，此后 <1600 为 32、1600～1999 为 24、≥2000 为 16；
-  - 平局双方各得 0.5 分；
-  - 更新 `users.rating/peak_rating/wins/losses/draws/rated_games`，并为双方写入
-    `rating_events`（含对手、赛前/赛后积分与增减）。
+  积分最接近、且时限设置完全相同的玩家，随机分配黑白并立即开局。
+- 时限支持每手倒计时与 Fischer 总时长/加秒；匹配只与相同设置配对。每手默认 30 秒；
+  认输/超时/五连/平局都由服务器裁决。
+- 终局由服务器执行一次 **Glicko-2** 结算：
+  - 起始 1200 分，最低 100；初始 RD 100、波动率 0.06；
+  - 每局根据双方积分/RD/波动率与期望得分更新；平局按 0.5 分；
+  - 更新 `users.rating/peak_rating/rating_rd/rating_volatility/...rated_games`，并为双方写入
+    `rating_events`（含对手、赛前/赛后积分与增减、RD/波动率变化、赛季归属）。
+- 赛季默认 90 天（`GOMOKU_SEASON_LENGTH_DAYS`）：到期把参赛账号最终积分归档到
+  `season_ratings`，积分软重置为 `1200 + (rating-1200)*0.5`，RD 抬高到至少 120，
+  当前连胜清零；生涯胜场/勋章不重置。`GET /api/v1/seasons/current` 返回当前赛季与个人排名。
 - 段位（由积分计算，服务端唯一定义）：
 
 | 段位 | 积分 |
@@ -146,10 +154,17 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 | 方法/路径 | 说明 |
 | --- | --- |
 | `GET /api/v1/leaderboard?limit=50&offset=0` | 登录后读取排行榜；只包含完成过排位赛的账号，积分降序、场次次序、用户名兜底 |
-| `GET /api/v1/profile/me` | 当前账号积分资料 + 最近 10 场排位记录 |
+| `GET /api/v1/profile/me` | 当前账号积分资料、当前赛季/赛季排名 + 最近 10 场排位记录 |
+| `GET /api/v1/seasons/current` | 当前赛季名称/起止/剩余天数、个人赛季排名与 RD |
+| `GET /api/v1/seasons/{number}/leaderboard` | 历史赛季归档排行榜（`season_ratings`） |
 | `GET /api/v1/games/recent?limit=20&offset=0` | 当前账号参与过的已结束对局（排位 + 自建房），按结束时间倒序 |
 | `GET /api/v1/games/{game_id}` | 单局完整棋谱与落子序列；仅对局参与者可读，非参与者返回 404 |
+| `GET /api/v1/games/{game_id}/audit` | 回放审计：落子序列/座位/终局一致性/时间异常；参与者或管理员可读 |
 | `GET /api/v1/games/live` | 当前正在进行中的对局列表（观战入口）：双方昵称、模式、手数；不含已结束对局 |
+| `POST /api/v1/reports` | 举报已结束对局中的对手（`game_id`、`category`、`description`），每局每人一次 |
+| `GET /api/v1/reports/mine` | 自己提交的举报 |
+| `GET /api/v1/admin/reports?status=pending` | 管理员待处理/已处理举报列表（含审计异常数） |
+| `POST /api/v1/admin/reports/{id}/review` | 管理员复核：`dismiss` / `warn` / `uphold` + 备注 |
 | `GET /api/v1/auth/me` | 当前账号资料（含 avatar/rating/peak/rank_name/win_rate 等计算字段） |
 | `GET /api/v1/users/{user_id}` | 公开资料、在线状态与好友关系状态 |
 | `GET /api/v1/users/search?q=` | 按用户名搜索活跃账号（最多 20 条） |
@@ -165,12 +180,12 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 | `GET /api/v1/messages/{user_id}?limit=50` | 与好友的最近私聊；只把本次返回的消息标记已读 |
 | `POST /api/v1/messages/{user_id}` | 发送私聊（`{"content": ...}`），在线时实时推送 |
 | `WS auth` | 首帧认证；可携带 `capabilities` 声明客户端能力，响应返回服务端 `capabilities` |
-| `WS create_room` | 自建房；`allow_spectators=false` 可关闭观战并移出对战广场 |
-| `WS quick_match` | 加入排位匹配队列 |
+| `WS create_room` | 自建房；`allow_spectators=false` 可关闭观战；`time_control` 可选 `per_move` 或 `fischer`，兼容旧字段 `turn_seconds` |
+| `WS quick_match` | 加入排位匹配队列；可选 `time_control`（或旧 `turn_seconds`），只与完全相同的设置配对 |
 | `WS cancel_match` | 离开排位队列 |
 | `WS queue_status` | 服务端返回 queued/idle、队列人数、当前积分/段位 |
 | `WS match_found` | 匹配成功，返回 game_id、执子颜色、对手昵称和双方赛前积分 |
-| `WS game_state` | 权威快照新增 `rated`、`your_rating_before/after`、`opponent_rating_before/after`、`rating_delta`、双方 user_id/头像版本/已解锁成就，以及本人的 `your_new_achievements`；`state_version` 标识回滚、`result_reason` 标识终局原因、`undo_requester_id` 标识待回应悔棋、`undo_remaining/undo_limit/undo_cooldown_*` 标识悔棋配额与冷却 |
+| `WS game_state` | 权威快照包含 `rated`、`your_rating_before/after`、`opponent_rating_before/after`、`rating_delta`、双方 user_id/头像版本/已解锁成就、`your_new_achievements`；`state_version` 标识回滚、`result_reason` 标识终局原因、`undo_requester_id` 与 `undo_remaining/undo_limit/undo_cooldown_*` 标识悔棋；`time_control`、`turn_deadline_ms`、`server_now_ms`、`black/white_remaining_ms` 标识时限与 Fischer 双方余量 |
 | `WS undo_request` / `undo_response` | 当前回合玩家发起悔棋请求，对手同意或拒绝 |
 | `WS undo_status` | 悔棋状态：requested/accepted/declined/expired/cancelled |
 | `WS invite_to_room` | 房主邀请在线好友加入自建房 |
@@ -183,7 +198,9 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 ## 联机规则与协议
 
 - 创建自建房者执黑先手，被邀请并接受的玩家执白。
-- 每手默认 30 秒，服务器倒计时；超时由服务器判负。
+- 每手默认 30 秒，服务器倒计时；排位匹配和自建房创建时可选 15/30/60/90 秒，或 Fischer
+  总时长/加秒（例如 5 分 + 3 秒）。Fischer 模式双方各有余量，落子后扣除本手耗时并加回
+  固定秒数；余量耗尽由服务器判负。快照同时下发双方余量，客户端只做本地平滑显示。
 - 客户端只发送落子意图；服务器校验座位/回合/坐标/时钟后，先把落子和局面写入数据库，再广播权威快照。
 - 认证帧可携带 `capabilities`，服务端在认证响应中返回自身能力；未知能力会被忽略，
   但权限仍由服务端独立校验，不能只依赖能力声明。
@@ -207,12 +224,16 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 
 - 开发默认 SQLite（`server/data/gomoku.db`），生产可切换 PostgreSQL。
 - 启动时由 [`server/app/migrations.py`](app/migrations.py) 执行 Alembic：
-  - 全新数据库执行基线迁移 `0001_baseline`；
+  - 全新数据库执行基线迁移 `0001_baseline`，再执行
+    `0002_seasons_glicko_reports`（赛季/Glicko-2/时限/举报）；
   - 已登记 `alembic_version` 的数据库执行 `upgrade head`；
-  - 引入 Alembic 之前的旧库会先补齐历史增量列/表、登记基线，再升级到 head。
+  - 引入 Alembic 之前的旧库会先用 `create_tables` 补齐当前模型结构，再直接登记 `head`
+    （避免后续迁移重复执行 `ADD COLUMN`）。
 - 后续结构变更必须新增 `server/migrations/versions/` 下的迁移，并在本地执行
   `alembic upgrade head` 验证；不要再依赖 `create_all` 修改已存在的表。
-- 新表 `rating_events` 有 `(game_id, user_id)` 唯一约束，防止同一局重复入账。
+- `rating_events` 有 `(game_id, user_id)` 唯一约束，防止同一局重复入账；
+  `season_ratings` 有 `(season_id, user_id)` 唯一约束，防止重复归档；
+  `game_reports` 有 `(game_id, reporter_id)` 唯一约束，防止同一人重复举报同一局。
 - 多实例部署前需要给迁移加数据库级 advisory lock，避免多个 worker 同时升级。
 - 正式公开化前仍建议备份恢复演练和数据库连接池监控。
 
@@ -285,8 +306,11 @@ Start-Process C:\Users\a1325\Desktop\Gomoku\dist\Gomoku.exe
 | `GOMOKU_WS_COMMAND_BURST` | `40` | 命令令牌桶容量（心跳不计入） |
 | `GOMOKU_WS_COMMAND_WINDOW_SECONDS` | `10` | 命令令牌桶补充窗口，1～3600 秒 |
 | `GOMOKU_TRUST_PROXY_HEADERS` | `0` | 位于可信反向代理后时设为 1，读取 X-Forwarded-For/X-Real-IP |
+| `GOMOKU_SEASON_LENGTH_DAYS` | `90` | 排位赛季长度，1～3650 天 |
+| `GOMOKU_ADMIN_USERNAMES` | 空 | 逗号分隔的管理员用户名白名单，可访问举报复核接口 |
 
-起始积分、K 值、段位阈值目前定义在 `server/app/ratings.py`，修改后需同步更新文档；
+起始积分、Glicko-2 参数、段位阈值与赛季软重置公式定义在 `server/app/ratings.py`、
+`server/app/glicko2.py` 与 `server/app/seasons.py`，修改后需同步更新文档；
 不通过环境变量开放，避免部署时不同实例积分规则漂移。
 
 ## 日志、健康检查与指标
@@ -347,8 +371,9 @@ docker run -d --name gomoku-server -p 8000:8000 `
 3. 固定随机 `GOMOKU_JWT_SECRET`，限制配置文件权限，不把 secret 写入客户端或仓库。
 4. 配置每日 PostgreSQL 备份、健康检查和日志收集；设置防火墙，仅开放必要端口。
 5. 客户端 token 目前只存内存，应用重启需要重新登录；后续可用 Windows DPAPI 安全保存 refresh token。
-6. 排位已通过“仅匹配计分、自建房不计分、排位不可直接再战”降低刷分面，但仍无法阻止
-   排队串通、故意送分和外部 AI 辅助；积分阶段需另行设计反作弊、举报与回放审计。
+6. 排位已通过“仅匹配计分、自建房不计分、排位不可直接再战”降低刷分面；举报与回放审计
+   只提供客观异常摘要，仍无法自动识别排队串通、故意送分和外部 AI 辅助。管理员需通过
+   `GOMOKU_ADMIN_USERNAMES` 白名单人工复核，处罚不会由服务端自动执行。
 7. 若未来在中国大陆公开运营，需单独评估 ICP/公安备案、实名/未成年人保护、隐私与游戏出版等要求；
    当前定位仅为内测。
 
@@ -359,22 +384,26 @@ cd C:\Users\a1325\Desktop\Gomoku
 server\.venv\Scripts\python.exe -m unittest discover -s server/tests -v
 ```
 
-当前 **95 项**测试覆盖：
+当前 **121 项**测试覆盖：
 
 - 用户名 + 密码注册、登录、refresh 轮换/重放、登出、认证响应积分/成就字段；
 - 双 WebSocket 建房/邀请/加入/落子/拒绝/认输/再战、服务器五连判定、断线重连；
 - 悔棋请求的同意/拒绝、回滚数据库落子、次数/冷却、非本回合请求拒绝、掉线宽限后的逃跑判负；
-- 单 IP 连接上限、WS 命令令牌桶、观战开关与人数上限、协议能力协商；
-- Alembic 全新库基线迁移、旧库自动登记基线、重复启动幂等；
+- 单 IP 连接上限、WS 命令令牌桶、观战开关与人数上限、协议能力协商、自建房每手时间；
+- 每手/Fischer 时限匹配、非法时限拒绝、Fischer 加秒与双方余量、per-move 回合重置；
+- Alembic 全新库迁移到 head、旧库自动补齐并登记 head、重复启动幂等；
 - 健康检查 live/ready、请求 ID 回写与非法值清洗、Prometheus 核心指标、日志级别/格式配置；
-- 快速匹配、取消匹配、排位房、随机黑白、终局 Elo 结算、自建房不计分；
+- 快速匹配、取消匹配、排位房、随机黑白、相同设置才配对、终局 Glicko-2 结算、自建房不计分；
+- 排位资料、赛季排名、当前赛季接口、赛季到期归档与积分软重置、历史赛季排行榜 404；
 - 排行榜、个人资料与最近战绩；
 - 最近对局/单局棋谱的参与者权限、分页、认输终局；
+- 回放审计：序列/颜色/座位/重复落点/终局一致性/时间倒流/秒回警告，参与者与管理员权限；
+- 举报提交、重复举报拒绝、只能举报已结束对局、我的举报、管理员列表与复核；
 - 预置头像更新、自定义头像上传/读取/移除、非法格式/过大/超尺寸图片拒绝；
 - 用户搜索、好友申请/同意/删除、在线状态推送、私聊历史与实时推送；
 - 自建房邀请接受/拒绝、非好友/离线好友拒绝，以及快照中的双方 user_id/头像/勋章；
 - 排位首胜/连胜结算与新解锁成就快照；
-- Elo 期望分/K 值/段位边界/最低分保护；
+- Glicko-2 对称性/平局/下克上/RD 收敛/波动率稳定、段位边界/最低分保护、赛季软重置；
 - 观战（第三客户端旁观）：只读快照与实时更新、落子/认输/悔棋/再战/发言一律被拒、
   玩家不能观战自己的对局、断线与退出观战不影响对局双方、断线重连补发快照、
   `GET /games/live` 进行中对局列表，以及开局/终局时向空闲客户端推送 `live_games_changed`。

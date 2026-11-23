@@ -46,6 +46,11 @@ from gomoku.shared.protocol import (
     make_message,
     parse_message,
 )
+from gomoku.shared.time_control import (
+    PER_MOVE_MAX_SECONDS,
+    PER_MOVE_MIN_SECONDS,
+    TimeControl,
+)
 from server.app.models import User
 from server.app.ratings import rank_for_rating
 from server.app.security import decode_access_token
@@ -100,6 +105,38 @@ async def _safe_close(websocket: WebSocket, code: int, reason: str) -> None:
         await websocket.close(code=code, reason=reason)
     except Exception:
         pass
+
+
+def _requested_time_control(
+    payload: dict,
+) -> tuple[Optional[TimeControl], str]:
+    """解析创建房间/快速匹配的时限设置。
+
+    兼容旧的 ``turn_seconds`` 字段；新的 ``time_control`` 对象优先。
+    返回 ``(time_control, error)``，未指定时 time_control 为 None，
+    由 RoomManager 使用服务端默认每手时间。
+    """
+    raw = payload.get("time_control")
+    if raw is not None:
+        try:
+            return TimeControl.from_payload(raw), ""
+        except ProtocolError as exc:
+            return None, str(exc)
+    turn_seconds = payload.get("turn_seconds")
+    if turn_seconds is None:
+        return None, ""
+    if (
+        not isinstance(turn_seconds, int)
+        or isinstance(turn_seconds, bool)
+        or not PER_MOVE_MIN_SECONDS
+        <= turn_seconds
+        <= PER_MOVE_MAX_SECONDS
+    ):
+        return None, (
+            f"每手时间必须在 {PER_MOVE_MIN_SECONDS}～"
+            f"{PER_MOVE_MAX_SECONDS} 秒"
+        )
+    return TimeControl.per_move(turn_seconds), ""
 
 
 def _client_ip(websocket: WebSocket, settings: Any) -> str:
@@ -202,6 +239,7 @@ async def game_websocket(websocket: WebSocket) -> None:
         )
         current_streak = user.current_win_streak
         best_streak = user.best_win_streak
+        rating_rd = round(float(user.rating_rd), 1)
 
     client_ip = _client_ip(websocket, settings)
     conn = ClientConnection(
@@ -241,6 +279,7 @@ async def game_websocket(websocket: WebSocket) -> None:
             "connection_id": conn.connection_id,
         },
     )
+    season = await room_manager.current_season()
     authenticated = await conn.send(
         make_message(
             SERVER_AUTHENTICATED,
@@ -254,8 +293,12 @@ async def game_websocket(websocket: WebSocket) -> None:
                     "current_win_streak": current_streak,
                     "best_win_streak": best_streak,
                     "rating": rating,
+                    "rating_rd": rating_rd,
                     "rank_name": rank_for_rating(rating).name,
                 },
+                "season": (
+                    season.payload() if season is not None else None
+                ),
                 "capabilities": sorted(SERVER_CAPABILITIES),
             },
         )
@@ -340,6 +383,9 @@ async def game_websocket(websocket: WebSocket) -> None:
                     allow_spectators = payload.get(
                         "allow_spectators", True
                     )
+                    time_control, time_error = _requested_time_control(
+                        payload
+                    )
                     if not isinstance(allow_spectators, bool):
                         await conn.send(
                             make_message(
@@ -348,9 +394,20 @@ async def game_websocket(websocket: WebSocket) -> None:
                                 request_id=request_id,
                             )
                         )
+                    elif time_error:
+                        await conn.send(
+                            make_message(
+                                SERVER_ERROR,
+                                {"reason": time_error},
+                                request_id=request_id,
+                            )
+                        )
                     else:
                         await room_manager.create_room(
-                            conn, request_id, allow_spectators
+                            conn,
+                            request_id,
+                            allow_spectators,
+                            time_control=time_control,
                         )
                 elif message_type == CLIENT_JOIN_ROOM:
                     code = payload.get("room_code")
@@ -420,7 +477,23 @@ async def game_websocket(websocket: WebSocket) -> None:
                 elif message_type == CLIENT_REMATCH:
                     await room_manager.rematch(conn)
                 elif message_type == CLIENT_QUICK_MATCH:
-                    await room_manager.quick_match(conn, request_id)
+                    time_control, time_error = _requested_time_control(
+                        payload
+                    )
+                    if time_error:
+                        await conn.send(
+                            make_message(
+                                SERVER_ERROR,
+                                {"reason": time_error},
+                                request_id=request_id,
+                            )
+                        )
+                    else:
+                        await room_manager.quick_match(
+                            conn,
+                            request_id,
+                            time_control=time_control,
+                        )
                 elif message_type == CLIENT_CANCEL_MATCH:
                     await room_manager.cancel_match(conn, request_id)
                 elif message_type == CLIENT_CHAT:

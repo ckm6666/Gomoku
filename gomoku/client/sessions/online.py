@@ -82,6 +82,7 @@ from gomoku.shared.social import (
     parse_direct_message,
     parse_friend_event,
 )
+from gomoku.shared.time_control import TimeControl
 
 logger = logging.getLogger(__name__)
 
@@ -488,15 +489,23 @@ class OnlineGameSession(GameSession):
             )
         )
 
-    def create_room(self, allow_spectators: bool = True) -> bool:
+    def create_room(
+        self,
+        allow_spectators: bool = True,
+        turn_seconds: Optional[int] = None,
+        *,
+        time_control: Optional[TimeControl] = None,
+    ) -> bool:
         if not self._authenticated or self._closed:
             return False
-        return self._send(
-            make_message(
-                CLIENT_CREATE_ROOM,
-                {"allow_spectators": bool(allow_spectators)},
-            )
-        )
+        payload: dict[str, Any] = {
+            "allow_spectators": bool(allow_spectators)
+        }
+        if time_control is not None:
+            payload["time_control"] = time_control.to_payload()
+        elif turn_seconds is not None:
+            payload["turn_seconds"] = int(turn_seconds)
+        return self._send(make_message(CLIENT_CREATE_ROOM, payload))
 
     def join_room(self, code: str) -> bool:
         if not self._authenticated or self._closed:
@@ -553,11 +562,21 @@ class OnlineGameSession(GameSession):
             )
         )
 
-    def quick_match(self) -> bool:
-        """加入公开排位匹配队列。"""
+    def quick_match(
+        self,
+        turn_seconds: Optional[int] = None,
+        *,
+        time_control: Optional[TimeControl] = None,
+    ) -> bool:
+        """加入公开排位匹配队列；只与相同时限设置的玩家配对。"""
         if not self._authenticated or self._closed:
             return False
-        return self._send(make_message(CLIENT_QUICK_MATCH, {}))
+        payload: dict[str, Any] = {}
+        if time_control is not None:
+            payload["time_control"] = time_control.to_payload()
+        elif turn_seconds is not None:
+            payload["turn_seconds"] = int(turn_seconds)
+        return self._send(make_message(CLIENT_QUICK_MATCH, payload))
 
     def cancel_match(self) -> bool:
         """退出排位匹配队列。"""

@@ -33,6 +33,7 @@ class ServerTestBase(unittest.TestCase):
     max_connections_per_ip: int = 200
     ws_command_burst: int = 40
     ws_command_window_seconds: float = 10.0
+    admin_usernames: frozenset[str] = frozenset()
 
     def setUp(self) -> None:
         # Windows 上 SQLite 文件句柄的释放有延迟，临时目录偶尔会删不掉
@@ -57,6 +58,7 @@ class ServerTestBase(unittest.TestCase):
             max_connections_per_ip=self.max_connections_per_ip,
             ws_command_burst=self.ws_command_burst,
             ws_command_window_seconds=self.ws_command_window_seconds,
+            admin_usernames=self.admin_usernames,
         )
         self.app = create_app(self.settings)
         self._client_cm = TestClient(self.app)

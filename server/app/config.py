@@ -68,6 +68,9 @@ class Settings:
     ws_command_window_seconds: float = 10.0
     # 仅在服务端位于可信反向代理之后时开启，用于读取 X-Forwarded-For。
     trust_proxy_headers: bool = False
+    # 排位赛季长度（天）与管理员账号（可复核举报/查看回放审计）。
+    season_length_days: int = 90
+    admin_usernames: frozenset[str] = frozenset()
 
     @property
     def is_development(self) -> bool:
@@ -174,6 +177,15 @@ class Settings:
             raise ConfigurationError(
                 "GOMOKU_WS_COMMAND_WINDOW_SECONDS 必须在 1～3600 秒"
             )
+        season_days = _int_env(
+            source, "GOMOKU_SEASON_LENGTH_DAYS", 90, 1, 3650
+        )
+        admin_raw = source.get("GOMOKU_ADMIN_USERNAMES", "")
+        admin_usernames = frozenset(
+            item.strip().lower()
+            for item in admin_raw.split(",")
+            if item.strip()
+        )
         trust_raw = source.get(
             "GOMOKU_TRUST_PROXY_HEADERS", "0"
         ).strip().lower()
@@ -206,6 +218,8 @@ class Settings:
             ws_command_burst=ws_burst,
             ws_command_window_seconds=ws_window,
             trust_proxy_headers=trust_proxy_headers,
+            season_length_days=season_days,
+            admin_usernames=admin_usernames,
         )
 
 

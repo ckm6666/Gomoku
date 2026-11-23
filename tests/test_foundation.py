@@ -29,6 +29,11 @@ from gomoku.shared.protocol import (  # noqa: E402
     parse_message,
 )
 from gomoku.shared.rules import BOARD_SIZE, Player  # noqa: E402
+from gomoku.shared.time_control import (  # noqa: E402
+    MODE_FISCHER,
+    MODE_PER_MOVE,
+    TimeControl,
+)
 
 
 def blank_values() -> list[list[str | None]]:
@@ -217,6 +222,68 @@ class ProtocolTests(unittest.TestCase):
         bad_status["status"] = "unknown"
         with self.assertRaises(ProtocolError):
             parse_game_state(bad_status)
+
+    def test_time_control_payload_roundtrip(self) -> None:
+        per_move = TimeControl.per_move(30)
+        self.assertEqual(per_move.mode, MODE_PER_MOVE)
+        self.assertEqual(
+            TimeControl.from_payload(per_move.to_payload()), per_move
+        )
+        fischer = TimeControl.fischer(300, 3)
+        self.assertEqual(fischer.mode, MODE_FISCHER)
+        self.assertEqual(
+            TimeControl.from_payload(fischer.to_payload()), fischer
+        )
+        self.assertEqual(fischer.initial_remaining_ms(), 300_000)
+        self.assertIn("Fischer", fischer.label())
+        with self.assertRaises(ProtocolError):
+            TimeControl.from_payload({"mode": "unknown"})
+        with self.assertRaises(ProtocolError):
+            TimeControl.from_payload(
+                {"mode": "fischer", "main_seconds": 10}
+            )
+        with self.assertRaises(ProtocolError):
+            TimeControl.per_move(1)
+
+    def test_game_state_parses_fischer_clocks(self) -> None:
+        snapshot = parse_game_state(
+            {
+                "game_id": "g-clocks",
+                "board": blank_values(),
+                "current_player": "white",
+                "your_color": "black",
+                "move_no": 1,
+                "status": "playing",
+                "time_control": {
+                    "mode": "fischer",
+                    "main_seconds": 300,
+                    "increment_seconds": 3,
+                },
+                "black_remaining_ms": 301_500,
+                "white_remaining_ms": 299_000,
+                "turn_deadline_ms": 1_000_000,
+                "server_now_ms": 900_000,
+            }
+        )
+        self.assertIsNotNone(snapshot.time_control)
+        self.assertTrue(snapshot.time_control.is_fischer)
+        self.assertEqual(snapshot.black_remaining_ms, 301_500)
+        self.assertEqual(snapshot.white_remaining_ms, 299_000)
+        self.assertIsNone(snapshot.move_timeout_seconds)
+
+        legacy = parse_game_state(
+            {
+                "game_id": "g-legacy",
+                "board": blank_values(),
+                "current_player": "black",
+                "your_color": "black",
+                "move_no": 0,
+                "status": "playing",
+                "move_timeout_seconds": 45,
+            }
+        )
+        self.assertIsNotNone(legacy.time_control)
+        self.assertEqual(legacy.time_control.turn_seconds, 45)
 
     def test_rated_game_state_parse(self) -> None:
         snapshot = parse_game_state(

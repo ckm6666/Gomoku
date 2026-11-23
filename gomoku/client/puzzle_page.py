@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Optional, Sequence
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSettings, Qt, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -16,6 +17,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gomoku.client.daily_puzzle import (
+    daily_puzzle,
+    load_progress,
+    record_result,
+)
 from gomoku.client.puzzle_card import PuzzleCardButton
 from gomoku.client.ui_theme import MENU_BACKDROP_SPEC, InkBackdrop
 from gomoku.shared.puzzle import Puzzle
@@ -26,16 +32,23 @@ class PuzzlePage(InkBackdrop):
     """平铺展示残局卡片，每张卡以成语作为进入按钮标题。"""
 
     puzzle_selected = Signal(object)
+    daily_selected = Signal(object)
     back_requested = Signal()
 
     def __init__(
         self,
         puzzles: Sequence[Puzzle],
         parent: Optional[QWidget] = None,
+        *,
+        settings: Optional[QSettings] = None,
     ) -> None:
         super().__init__(parent, spec=MENU_BACKDROP_SPEC)
         self.setObjectName("puzzlePage")
         self._puzzles = tuple(puzzles)
+        self._settings = settings or QSettings()
+        self._daily_puzzle: Optional[Puzzle] = None
+        self._daily_completed = False
+        self._daily_streak = 0
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 18, 24, 18)
@@ -107,7 +120,78 @@ class PuzzlePage(InkBackdrop):
         footer.addWidget(self.back_button)
         root.addLayout(footer)
 
+        self.refresh_daily()
+
+    # ------------------------------------------------------------------
+    # 每日残局
+    # ------------------------------------------------------------------
+    def refresh_daily(self) -> None:
+        """重新计算今日残局并刷新卡片。"""
+        today = date.today()
+        self._daily_puzzle = daily_puzzle(self._puzzles, today)
+        last_date, streak = load_progress(self._settings)
+        self._daily_completed = bool(
+            self._daily_puzzle is not None
+            and last_date == today.isoformat()
+        )
+        self._daily_streak = streak
         self._rebuild()
+
+    def record_daily_result(self, puzzle_id: str, success: bool) -> None:
+        """如果完成的是今日残局，则更新连续通关进度。"""
+        today = date.today()
+        current = daily_puzzle(self._puzzles, today)
+        if current is None or current.id != puzzle_id:
+            return
+        record_result(self._settings, today, success)
+        self.refresh_daily()
+
+    def _build_daily_card(self, parent: QWidget) -> QFrame:
+        puzzle = self._daily_puzzle
+        assert puzzle is not None
+        card = QFrame(parent)
+        card.setObjectName("dailyPuzzleCard")
+        row = QHBoxLayout(card)
+        row.setContentsMargins(18, 14, 18, 14)
+        row.setSpacing(12)
+
+        text_layout = QVBoxLayout()
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(3)
+        title = QLabel("每日残局", card)
+        title.setObjectName("sectionTitle")
+        self.daily_title_label = QLabel(
+            f"{puzzle.title} · {side_text(puzzle)} · "
+            f"限 {puzzle.max_player_moves} 手",
+            card,
+        )
+        self.daily_title_label.setObjectName("dailyPuzzleTitle")
+        if self._daily_completed:
+            status_text = f"今日已通关 · 连续 {self._daily_streak} 天"
+        elif self._daily_streak:
+            status_text = f"连续 {self._daily_streak} 天 · 今日待挑战"
+        else:
+            status_text = "今日尚未挑战"
+        self.daily_status_label = QLabel(status_text, card)
+        self.daily_status_label.setObjectName("dailyPuzzleStatus")
+        text_layout.addWidget(title)
+        text_layout.addWidget(self.daily_title_label)
+        text_layout.addWidget(self.daily_status_label)
+
+        self.daily_button = QPushButton(
+            "再次挑战" if self._daily_completed else "挑战今日残局",
+            card,
+        )
+        self.daily_button.setObjectName("smallButton")
+        self.daily_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.daily_button.setAutoDefault(False)
+        self.daily_button.clicked.connect(
+            lambda _checked=False: self.daily_selected.emit(puzzle)
+        )
+
+        row.addLayout(text_layout, 1)
+        row.addWidget(self.daily_button, 0)
+        return card
 
     # ------------------------------------------------------------------
     # 构建
@@ -134,6 +218,13 @@ class PuzzlePage(InkBackdrop):
             self._body_layout.insertWidget(0, empty)
             return
 
+        insert_at = 0
+        if self._daily_puzzle is not None:
+            self._body_layout.insertWidget(
+                0, self._build_daily_card(self)
+            )
+            insert_at = 1
+
         group = QWidget(self)
         group.setObjectName("puzzleGroup")
         grid = QGridLayout(group)
@@ -144,7 +235,7 @@ class PuzzlePage(InkBackdrop):
             grid.addWidget(
                 self._build_card(group, puzzle), index // 2, index % 2
             )
-        self._body_layout.insertWidget(0, group)
+        self._body_layout.insertWidget(insert_at, group)
 
     def _build_card(self, parent: QWidget, puzzle: Puzzle) -> PuzzleCardButton:
         button = PuzzleCardButton(

@@ -41,10 +41,12 @@ from gomoku.client.history_records import record_from_game_detail
 from gomoku.client.net.social_api import SocialHTTPClient
 from gomoku.client.private_chat_panel import PrivateChatPanel
 from gomoku.client.profile_panel import AvatarPickerPanel, ProfilePanel
+from gomoku.client.report_panel import ReportPanel
 from gomoku.client.ui_theme import ONLINE_BACKDROP_SPEC, InkBackdrop
 from gomoku.client.config import AppConfig
 from gomoku.client.modal_overlay import NoticeOverlay
 from gomoku.client.net.game_history_api import GameHistoryHTTPClient
+from gomoku.client.net.report_api import ReportHTTPClient
 from gomoku.client.net.http_api import AuthHTTPClient
 from gomoku.client.net.profile_api import ProfileHTTPClient
 from gomoku.client.net.websocket_transport import QtWebSocketTransport
@@ -75,6 +77,7 @@ from gomoku.shared.protocol import GameSnapshot
 from gomoku.shared.record import GameRecord, RecordError
 from gomoku.shared.rules import BOARD_SIZE, Cell, Player
 from gomoku.shared.social import DirectMessage, FriendEvent
+from gomoku.shared.time_control import TimeControl
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +109,18 @@ def _result_label(value: object) -> str:
         "loss": "负",
         "draw": "和",
     }.get(value, "—")
+
+
+def _format_clock_ms(value: Optional[int]) -> str:
+    """把 Fischer 余量格式化为 M:SS（小时以上显示 H:MM:SS）。"""
+    if value is None:
+        return "—"
+    total = max(0, int(value) // 1000)
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
 
 
 def _entry_avatar_version(entry: Mapping) -> int:
@@ -144,7 +159,11 @@ class OnlinePanel(InkBackdrop):
         self._last_snapshot: Optional[GameSnapshot] = None
         self._audio_game_id: Optional[str] = None
         self._deadline_monotonic: Optional[float] = None
+        # 快照接收时刻，用于 Fischer 双方余量的本地平滑倒数。
+        self._snapshot_monotonic: Optional[float] = None
         self._profile_user: Optional[dict] = None
+        self._season_info: Optional[dict] = None
+        self._season_rank: Optional[int] = None
         self._achievements_panel: Optional[AchievementPanel] = None
         self._leaderboard_entries: list = []
         self._achievement_notice_game_id = ""
@@ -211,6 +230,22 @@ class OnlinePanel(InkBackdrop):
             self._on_history_busy_changed
         )
         self._recent_games_entries: list = []
+
+        # 举报与回放审计：报局面板打开时先拉一次审计摘要。
+        self._report_client = ReportHTTPClient(
+            self._api_base_url or None,
+            timeout_seconds=self.config.request_timeout_seconds,
+            parent=self,
+        )
+        self._report_client.submitted.connect(self._on_report_submitted)
+        self._report_client.audit_ready.connect(self._on_report_audit_ready)
+        self._report_client.failed.connect(self._on_report_failed)
+        self._report_client.unauthorized.connect(
+            self._on_history_unauthorized
+        )
+        self._report_panel: Optional[ReportPanel] = None
+        self._report_game_id = ""
+        self._report_awaiting_response = False
 
         # 观战列表单独用一个 HTTP 客户端：它的失败提示不应该混进
         # “最近对局”的状态栏里。
@@ -446,6 +481,9 @@ class OnlinePanel(InkBackdrop):
         self.quick_match_button.setText(
             "取消排位匹配" if queued else "开始排位匹配"
         )
+        self.ranked_turn_combo.setEnabled(
+            connected and not pending and not queued
+        )
         friend_enabled = connected and not pending and not queued
         self.create_room_button.setEnabled(friend_enabled)
         self.allow_spectators_checkbox.setVisible(
@@ -554,11 +592,30 @@ class OnlinePanel(InkBackdrop):
             if rated_games
             else "尚未完成排位赛"
         )
-        self.rating_summary_label.setText(
+        summary = (
             f"积分 {rating}，最高 {data.get('peak_rating', rating)}，{record}"
             if rated_games
             else f"积分 {rating}，{record}"
         )
+        season_name = ""
+        days_remaining = None
+        if isinstance(self._season_info, Mapping):
+            raw_name = self._season_info.get("name")
+            if isinstance(raw_name, str) and raw_name:
+                season_name = raw_name
+            raw_days = self._season_info.get("days_remaining")
+            if isinstance(raw_days, int) and not isinstance(raw_days, bool):
+                days_remaining = max(0, raw_days)
+        if season_name:
+            season_text = season_name
+            if days_remaining is not None:
+                season_text += f"（剩余 {days_remaining} 天）"
+            if isinstance(self._season_rank, int) and not isinstance(
+                self._season_rank, bool
+            ):
+                season_text += f" · 赛季排名 #{self._season_rank}"
+            summary = f"{season_text}\n{summary}"
+        self.rating_summary_label.setText(summary)
 
     def _refresh_profile_data(self) -> None:
         if self._auth_session is None or not self._api_base_url:
@@ -583,6 +640,16 @@ class OnlinePanel(InkBackdrop):
         if isinstance(raw_user, Mapping):
             self._profile_user = dict(raw_user)
             self._sync_auth_user_from_profile(raw_user)
+        raw_season = data.get("season")
+        self._season_info = (
+            dict(raw_season) if isinstance(raw_season, Mapping) else None
+        )
+        raw_rank = data.get("season_rank")
+        self._season_rank = (
+            raw_rank
+            if isinstance(raw_rank, int) and not isinstance(raw_rank, bool)
+            else None
+        )
         self._update_self_avatar()
         self._update_rating_summary()
 
@@ -1636,6 +1703,8 @@ class OnlinePanel(InkBackdrop):
 
     def _clear_profile_ui(self) -> None:
         self._profile_user = None
+        self._season_info = None
+        self._season_rank = None
         self._leaderboard_entries = []
         self.leaderboard_table.setRowCount(0)
         self.leaderboard_status_label.setText("登录后自动加载排行榜")
@@ -1965,8 +2034,12 @@ class OnlinePanel(InkBackdrop):
         self._room_action_pending = True
         self._set_lobby_status("正在创建自建房…")
         self._refresh_lobby_controls()
+        time_control = self.turn_seconds_combo.currentData()
+        if not isinstance(time_control, TimeControl):
+            time_control = None
         if not self._session.create_room(
-            self.allow_spectators_checkbox.isChecked()
+            self.allow_spectators_checkbox.isChecked(),
+            time_control=time_control,
         ):
             self._room_action_pending = False
             self._set_lobby_status("无法创建房间，请检查连接", error=True)
@@ -1993,7 +2066,10 @@ class OnlinePanel(InkBackdrop):
         self._set_lobby_status("")
         self._set_match_status("正在进入排位匹配队列…")
         self._refresh_lobby_controls()
-        if not self._session.quick_match():
+        time_control = self.ranked_turn_combo.currentData()
+        if not isinstance(time_control, TimeControl):
+            time_control = None
+        if not self._session.quick_match(time_control=time_control):
             self._room_action_pending = False
             self._set_match_status("无法开始匹配，请检查连接", error=True)
             self._refresh_lobby_controls()
@@ -2369,6 +2445,106 @@ class OnlinePanel(InkBackdrop):
         if self._session is not None:
             self._auto_requeue = False
             self._session.leave_room()
+
+    # ------------------------------------------------------------------
+    # 举报与回放审计
+    # ------------------------------------------------------------------
+    def _on_report_clicked(self) -> None:
+        if (
+            self._session is None
+            or self._auth_session is None
+            or self._session.snapshot is None
+            or not self._session.snapshot.is_game_over
+        ):
+            return
+        snapshot = self._session.snapshot
+        if self._report_panel is not None:
+            self._report_panel.close()
+        panel = ReportPanel(
+            snapshot.game_id,
+            self._session.opponent_username,
+            parent=self,
+        )
+        panel.submitted.connect(self._on_report_submit)
+        panel.closed.connect(self._on_report_panel_closed)
+        self._report_panel = panel
+        self._report_game_id = snapshot.game_id
+        self._report_awaiting_response = False
+        panel.show()
+        panel.raise_()
+        token = self._auth_session.access_token
+        if self._api_base_url:
+            self._report_client.fetch_audit(token, snapshot.game_id)
+        else:
+            panel.set_audit(0, ok=False)
+
+    def _on_report_submit(self, category: str, description: str) -> None:
+        if (
+            self._report_panel is None
+            or self._auth_session is None
+            or not self._report_game_id
+        ):
+            return
+        self._report_awaiting_response = True
+        if not self._report_client.submit_report(
+            self._auth_session.access_token,
+            self._report_game_id,
+            category,
+            description,
+        ):
+            self._report_awaiting_response = False
+            self._report_panel.set_result(
+                "无法提交举报，请检查连接", success=False
+            )
+
+    def _on_report_submitted(self, _data: object) -> None:
+        self._report_awaiting_response = False
+        if self._report_panel is None:
+            return
+        self._report_panel.set_result(
+            "举报已提交，管理员会结合回放审计处理。", success=True
+        )
+
+    def _on_report_audit_ready(self, data: object) -> None:
+        if self._report_panel is None or not isinstance(data, Mapping):
+            return
+        game_id = data.get("game_id")
+        if isinstance(game_id, str) and game_id != self._report_game_id:
+            return
+        raw_findings = data.get("findings")
+        findings = (
+            raw_findings if isinstance(raw_findings, list) else []
+        )
+        details = "；".join(
+            str(item.get("message", ""))
+            for item in findings[:3]
+            if isinstance(item, Mapping)
+        )
+        self._report_panel.set_audit(
+            len(findings),
+            ok=bool(data.get("ok", not findings)),
+            details=details,
+        )
+
+    def _on_report_failed(self, message: str) -> None:
+        if self._report_panel is None:
+            return
+        if self._report_awaiting_response:
+            self._report_awaiting_response = False
+            self._report_panel.set_result(
+                message or "举报提交失败", success=False
+            )
+        else:
+            self._report_panel.audit_label.setText(
+                "回放审计暂时不可用，举报仍可提交。"
+            )
+
+    def _on_report_panel_closed(self) -> None:
+        panel = self._report_panel
+        self._report_panel = None
+        self._report_game_id = ""
+        if panel is not None:
+            panel.deleteLater()
 
     # ------------------------------------------------------------------
     # 会话/界面同步
@@ -2842,8 +3018,10 @@ class OnlinePanel(InkBackdrop):
             leave=over,
             undo=not over,
             reject_undo=reject_undo,
+            report=over,
         )
         self.resign_button.setEnabled(not over and self._ws_connected)
+        self.report_button.setEnabled(over and self._ws_connected)
         self.leave_button.setEnabled(over and self._ws_connected)
         self.undo_reject_button.setEnabled(reject_undo and self._ws_connected)
         if not over:
@@ -2869,6 +3047,7 @@ class OnlinePanel(InkBackdrop):
 
     def _apply_snapshot_deadline(self, snapshot: GameSnapshot) -> None:
         """依据服务器时间计算本手倒计时，不在客户端自行判定超时胜负。"""
+        self._snapshot_monotonic = time.monotonic()
         if (
             not snapshot.is_game_over
             and snapshot.turn_deadline_ms is not None
@@ -3040,11 +3219,13 @@ class OnlinePanel(InkBackdrop):
         *,
         undo: bool,
         reject_undo: bool,
+        report: bool = False,
     ) -> None:
         self.undo_button.setVisible(undo)
         self.undo_reject_button.setVisible(reject_undo)
         self.resign_button.setVisible(resign)
         self.rematch_button.setVisible(rematch)
+        self.report_button.setVisible(report)
         self.leave_button.setVisible(leave)
 
     def _update_clock_label(self) -> None:
@@ -3072,6 +3253,10 @@ class OnlinePanel(InkBackdrop):
                 else "请回应悔棋请求"
             )
             return
+        time_control = snapshot.time_control
+        if time_control is not None and time_control.is_fischer:
+            self.clock_label.setText(self._fischer_clock_text(snapshot))
+            return
         if self._deadline_monotonic is None:
             self.clock_label.setText("等待服务器…")
             return
@@ -3080,6 +3265,39 @@ class OnlinePanel(InkBackdrop):
             self.clock_label.setText("本手时间已到，等待服务器判定…")
         else:
             self.clock_label.setText(f"本手倒计时：{int(remaining + 0.999)} 秒")
+
+    def _fischer_clock_text(self, snapshot: GameSnapshot) -> str:
+        """Fischer 双方余量：只减去走子方从快照以来的本地耗时。"""
+        black = snapshot.black_remaining_ms or 0
+        white = snapshot.white_remaining_ms or 0
+        if (
+            self._snapshot_monotonic is not None
+            and snapshot.turn_deadline_ms is not None
+        ):
+            elapsed_ms = int(
+                max(0.0, time.monotonic() - self._snapshot_monotonic)
+                * 1000
+            )
+            if snapshot.current_player is Player.BLACK:
+                black = max(0, black - elapsed_ms)
+            else:
+                white = max(0, white - elapsed_ms)
+        if self._session is not None and self._session.is_spectator:
+            return f"黑 {_format_clock_ms(black)} · 白 {_format_clock_ms(white)}"
+        your_color = (
+            self._session.snapshot.your_color
+            if self._session is not None
+            and self._session.snapshot is not None
+            else None
+        )
+        if your_color is Player.WHITE:
+            yours, opponent = white, black
+        else:
+            yours, opponent = black, white
+        return (
+            f"你 {_format_clock_ms(yours)} · "
+            f"对手 {_format_clock_ms(opponent)}"
+        )
 
     # ------------------------------------------------------------------
     # 关闭
@@ -3099,7 +3317,10 @@ class OnlinePanel(InkBackdrop):
         self._history_client.abort_all()
         self._live_client.abort_all()
         self._social_client.abort_all()
+        self._report_client.abort_all()
         self._close_social_windows()
+        if self._report_panel is not None:
+            self._report_panel.close()
         self._teardown_ws()
         if hasattr(self, "danmaku_overlay"):
             self.danmaku_overlay.clear()
