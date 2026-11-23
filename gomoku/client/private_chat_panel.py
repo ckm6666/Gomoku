@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import html
 from datetime import datetime
 from typing import Mapping, Optional, Sequence
 
@@ -12,13 +11,12 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
-    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
 from gomoku.client.avatar_widgets import AvatarView
-from gomoku.client.font_settings import current_font_scale
+from gomoku.client.chat_bubble_list import ChatBubbleList
 from gomoku.client.paper_panel import InkDivider, PaperPanel
 from gomoku.shared.social import MAX_DIRECT_MESSAGE_LENGTH
 
@@ -40,10 +38,16 @@ class PrivateChatPanel(PaperPanel):
             parent,
             seal_text="语",
             window_title=f"与 {username} 聊天",
-            min_width=480,
-            min_height=520,
+            min_width=520,
+            min_height=560,
         )
         self.friend_id = friend_id
+        # 对方最新的头像：消息里没带头像时用它兜底。
+        self._friend_avatar = avatar
+        self._friend_avatar_version = max(0, int(avatar_version))
+        # 自己的头像：消息里没带头像时用它兜底。
+        self._self_avatar = ""
+        self._self_avatar_version = 0
         self._seen_ids: set[str] = set()
         # 对方发来、已经显示在窗口里、但还没被服务端销账的消息。
         # 实时推送过来的消息服务端并不知道用户已经读过，得由客户端报上去，
@@ -79,9 +83,7 @@ class PrivateChatPanel(PaperPanel):
         self.content.addLayout(header)
         self.content.addWidget(InkDivider(self.card))
 
-        self.messages_view = QTextBrowser(self.card)
-        self.messages_view.setObjectName("chatMessages")
-        self.messages_view.setOpenExternalLinks(False)
+        self.messages_view = ChatBubbleList(self.card)
         self.content.addWidget(self.messages_view, 1)
 
         input_row = QHBoxLayout()
@@ -134,6 +136,8 @@ class PrivateChatPanel(PaperPanel):
         avatar_version: int = 0,
     ) -> None:
         self.name_label.setText(username)
+        self._friend_avatar = avatar
+        self._friend_avatar_version = max(0, int(avatar_version))
         self.avatar_view.set_avatar(
             avatar, self.friend_id, max(0, int(avatar_version))
         )
@@ -145,6 +149,19 @@ class PrivateChatPanel(PaperPanel):
     def set_send_enabled(self, enabled: bool) -> None:
         self.input.setEnabled(enabled)
         self.send_button.setEnabled(enabled)
+
+    def set_self_avatar(
+        self,
+        avatar: str = "",
+        avatar_version: int = 0,
+    ) -> None:
+        """记住自己的头像：自己发的消息旁边也要挂头像。
+
+        服务端通常会在消息里带回发送者的头像，但没有时用它兜底，
+        免得自己那一侧的气泡全顶着默认印章。
+        """
+        self._self_avatar = avatar
+        self._self_avatar_version = max(0, int(avatar_version))
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)
@@ -160,11 +177,9 @@ class PrivateChatPanel(PaperPanel):
         说不准。清空会把刚收到的实时消息抹掉，不去重又会把同一条消息
         显示两遍。这里按消息 id 合并，只补上还没出现过的。
         """
-        if not self._seen_ids and not self.messages_view.toPlainText():
-            self.messages_view.setHtml(
-                '<div style="color:#7A6A55;text-align:center;'
-                'padding:20px;">还没有聊天记录，打个招呼吧</div>'
-            )
+        if not self._seen_ids and self.messages_view.is_empty():
+            # 空状态由消息列表自己负责，这里只保证历史会重画。
+            self.messages_view.clear()
         added = False
         for message in messages:
             if not isinstance(message, Mapping):
@@ -248,23 +263,40 @@ class PrivateChatPanel(PaperPanel):
             if is_self
             else str(message.get("sender_name", "好友"))
         )
-        content = html.escape(str(message.get("content", "")))
+        content = str(message.get("content", ""))
         time_text = self._format_time(message)
-        align = "right" if is_self else "left"
-        bubble = "#E8D5B5" if is_self else "#EFE6D5"
-        meta_size = max(8, int(round(11 * current_font_scale())))
-        block = (
-            f'<div style="margin:6px 0;text-align:{align};">'
-            f'<span style="color:#7A6A55;font-size:{meta_size}px;">'
-            f"{html.escape(sender_name)} · {time_text}</span><br/>"
-            f'<span style="background:{bubble};padding:4px 8px;'
-            f'border-radius:6px;color:#2B2118;">{content}</span>'
-            "</div>"
+        avatar, avatar_version = self._message_avatar(message, is_self)
+        self.messages_view.append_message(
+            sender_name=sender_name,
+            content=content,
+            time_text=time_text,
+            is_self=is_self,
+            avatar=avatar,
+            user_id=sender_id,
+            avatar_version=avatar_version,
         )
-        self.messages_view.append(block)
         if scroll:
             self._scroll_to_bottom()
         return True
+
+    def _message_avatar(
+        self, message: Mapping, is_self: bool
+    ) -> tuple[str, int]:
+        """消息气泡旁头像用的头像 key 与版本号。
+
+        消息里带了发送者的头像就用它；没带时回落到好友头像或自己的
+        头像，免得整排消息都顶着默认印章。
+        """
+        raw = message.get("sender_avatar", "")
+        avatar = raw if isinstance(raw, str) else ""
+        version = message.get("sender_avatar_version", 0)
+        if not isinstance(version, int) or isinstance(version, bool):
+            version = 0
+        if avatar:
+            return avatar, max(0, version)
+        if is_self:
+            return self._self_avatar, self._self_avatar_version
+        return self._friend_avatar, self._friend_avatar_version
 
     @staticmethod
     def _format_time(message: Mapping) -> str:
@@ -285,8 +317,7 @@ class PrivateChatPanel(PaperPanel):
         return ""
 
     def _scroll_to_bottom(self) -> None:
-        bar = self.messages_view.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        self.messages_view.scroll_to_bottom()
 
     # ------------------------------------------------------------------
     # 关闭

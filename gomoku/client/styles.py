@@ -1552,12 +1552,51 @@ QScrollArea#socialScroll > QWidget > QWidget {
     background: transparent;
 }
 
-QTextBrowser#chatMessages {
+/* ---------------------- 私聊消息气泡 ---------------------- */
+QScrollArea#privateChatScroll {
     background-color: #FBF6EA;
     border: 1px solid #D9CBB3;
-    border-radius: 8px;
-    padding: 8px;
-    color: #2B2118;
+    border-radius: 10px;
+}
+
+QScrollArea#privateChatScroll > QWidget#qt_scrollarea_viewport {
+    background-color: #FBF6EA;
+    border-radius: 10px;
+}
+
+QWidget#privateChatBody {
+    background-color: #FBF6EA;
+}
+
+QLabel#privateChatEmpty {
+    color: #A89C8B;
+    font-size: 13px;
+    padding: 18px 10px;
+}
+
+/* 对方的消息：淡宣纸气泡，靠左显示。 */
+QFrame#chatBubble {
+    background-color: #F4EADA;
+    border: 1px solid #DCCDB2;
+    border-radius: 12px;
+}
+
+/* 自己的消息：淡金气泡，靠右显示。 */
+QFrame#chatBubbleSelf {
+    background-color: #F0E1BE;
+    border: 1px solid #C6A45F;
+    border-radius: 12px;
+}
+
+QLabel#chatBubbleMeta {
+    color: #8A7757;
+    font-size: 11px;
+}
+
+/* 正文比普通界面大一号，保证长文也好读。 */
+QLabel#chatBubbleText {
+    color: #241F18;
+    font-size: 15px;
 }
 
 QLineEdit#chatMessageInput {

@@ -476,6 +476,180 @@ class PrivateChatPanelTests(unittest.TestCase):
         panel.close()
 
 
+class PrivateChatBubbleTests(unittest.TestCase):
+    """私聊气泡：对方靠左、自己靠右，每条消息旁边都有头像。"""
+
+    def _panel(self) -> PrivateChatPanel:
+        return PrivateChatPanel("u2", "好友", "mei")
+
+    def _message(
+        self,
+        message_id: str,
+        *,
+        sender_id: str,
+        avatar: str,
+        content: str = "在吗",
+    ) -> dict:
+        return {
+            "id": message_id,
+            "sender_id": sender_id,
+            "sender_name": "好友" if sender_id == "u2" else "我",
+            "sender_avatar": avatar,
+            "sender_avatar_version": 0,
+            "content": content,
+            "sent_at_ms": 1_700_000_000_000,
+        }
+
+    @staticmethod
+    def _row_widgets(row: QWidget) -> list:
+        layout = row.layout()
+        return [
+            layout.itemAt(index).widget()
+            for index in range(layout.count())
+        ]
+
+    def test_other_message_is_on_the_left(self) -> None:
+        """对方的消息：头像在最左，气泡紧跟其后。"""
+        panel = self._panel()
+        try:
+            panel.set_history(
+                [self._message("m1", sender_id="u2", avatar="mei")], "me"
+            )
+            widgets = self._row_widgets(panel.messages_view._rows[0])
+            self.assertIsInstance(widgets[0], AvatarView)
+            self.assertEqual(widgets[1].objectName(), "chatBubble")
+            # 末尾是弹性空白：气泡不会顶到右边。
+            self.assertIsNone(widgets[2])
+        finally:
+            panel.close()
+
+    def test_own_message_is_on_the_right(self) -> None:
+        """自己的消息：气泡在右，头像挂在最右边。"""
+        panel = self._panel()
+        try:
+            panel.set_history(
+                [self._message("m1", sender_id="me", avatar="lan")], "me"
+            )
+            widgets = self._row_widgets(panel.messages_view._rows[0])
+            # 开头是弹性空白。
+            self.assertIsNone(widgets[0])
+            self.assertEqual(widgets[1].objectName(), "chatBubbleSelf")
+            self.assertIsInstance(widgets[2], AvatarView)
+        finally:
+            panel.close()
+
+    def test_every_message_has_an_avatar(self) -> None:
+        """每条消息旁边都要有头像，且用的是发送者自己的头像。"""
+        panel = self._panel()
+        try:
+            panel.set_history(
+                [
+                    self._message("m1", sender_id="u2", avatar="mei"),
+                    self._message("m2", sender_id="me", avatar="lan"),
+                ],
+                "me",
+            )
+            rows = panel.messages_view._rows
+            self.assertEqual(len(rows), 2)
+            for row in rows:
+                avatars = [
+                    widget
+                    for widget in self._row_widgets(row)
+                    if isinstance(widget, AvatarView)
+                ]
+                self.assertEqual(len(avatars), 1)
+            # 气泡里的头像用的是消息带的发送者头像。
+            first = [
+                widget
+                for widget in self._row_widgets(rows[0])
+                if isinstance(widget, AvatarView)
+            ][0]
+            self.assertEqual(first._avatar, "mei")
+            self.assertEqual(first._user_id, "u2")
+        finally:
+            panel.close()
+
+    def test_content_is_plain_text(self) -> None:
+        """聊天内容按纯文本显示，尖括号不会被当成标签。"""
+        panel = self._panel()
+        try:
+            panel.set_history(
+                [
+                    self._message(
+                        "m1", sender_id="u2", avatar="mei", content="<b>hi</b>"
+                    )
+                ],
+                "me",
+            )
+            labels = [
+                label
+                for label in panel.messages_view.findChildren(QLabel)
+                if label.objectName() == "chatBubbleText"
+            ]
+            self.assertEqual(len(labels), 1)
+            self.assertEqual(labels[0].text(), "<b>hi</b>")
+            self.assertEqual(
+                labels[0].textFormat(), Qt.TextFormat.PlainText
+            )
+        finally:
+            panel.close()
+
+    def test_own_message_falls_back_to_the_profile_avatar(self) -> None:
+        """消息里没带头像时，自己那一侧用自己的头像兜底。"""
+        panel = self._panel()
+        panel.set_self_avatar("song", avatar_version=3)
+        try:
+            panel.set_history(
+                [
+                    {
+                        "id": "m1",
+                        "sender_id": "me",
+                        "sender_name": "我",
+                        "content": "在吗",
+                        "sent_at_ms": 1_700_000_000_000,
+                    }
+                ],
+                "me",
+            )
+            avatar_view = [
+                widget
+                for widget in self._row_widgets(
+                    panel.messages_view._rows[0]
+                )
+                if isinstance(widget, AvatarView)
+            ][0]
+            self.assertEqual(avatar_view._avatar, "song")
+            self.assertEqual(avatar_view._avatar_version, 3)
+        finally:
+            panel.close()
+
+    def test_empty_state_and_clear(self) -> None:
+        """没有消息时显示空状态提示，来过消息后提示收起。"""
+        panel = self._panel()
+        try:
+            self.assertTrue(panel.messages_view.is_empty())
+            panel.set_history(
+                [self._message("m1", sender_id="u2", avatar="mei")], "me"
+            )
+            self.assertFalse(panel.messages_view.is_empty())
+            self.assertIn("在吗", panel.messages_view.toPlainText())
+            panel.messages_view.clear()
+            self.assertTrue(panel.messages_view.is_empty())
+        finally:
+            panel.close()
+
+    def test_bubble_font_is_larger_than_the_base_ui_font(self) -> None:
+        """气泡正文要比普通界面大一号，保证可读性。"""
+        from gomoku.client.styles import APP_STYLE
+
+        self.assertIn("QLabel#chatBubbleText", APP_STYLE)
+        block = APP_STYLE.split("QLabel#chatBubbleText", 1)[1]
+        size = int(
+            block.split("font-size:", 1)[1].split("px", 1)[0].strip()
+        )
+        self.assertGreaterEqual(size, 15)
+
+
 class OnlinePanelSocialTests(unittest.TestCase):
     def test_leaderboard_avatar_and_friends_badge(self) -> None:
         window = OnlinePanel()
