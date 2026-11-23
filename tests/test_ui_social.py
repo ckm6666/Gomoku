@@ -999,18 +999,12 @@ class OnlineResignConfirmationTests(unittest.TestCase):
 
 
 class RememberPasswordUiTests(unittest.TestCase):
-    def test_checkbox_has_visible_hint_text(self) -> None:
+    def test_checkbox_only_shows_short_label(self) -> None:
         panel = OnlinePanel()
         self.assertEqual(
             panel.remember_password_checkbox.text(), "记住密码"
         )
-        self.assertIn(
-            "自动填充", panel.remember_password_hint.text()
-        )
-        self.assertEqual(
-            panel.remember_password_hint.objectName(),
-            "rememberPasswordHint",
-        )
+        self.assertFalse(hasattr(panel, "remember_password_hint"))
         panel.close()
 
 

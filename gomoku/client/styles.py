@@ -180,11 +180,6 @@ QCheckBox#rememberPasswordCheck {
     spacing: 6px;
 }
 
-QLabel#rememberPasswordHint {
-    color: #756C5E;
-    font-size: 11px;
-}
-
 QLabel#onlineUndoStatus {
     color: #7A4A24;
     background-color: #F3E6D2;

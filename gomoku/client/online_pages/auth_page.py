@@ -77,22 +77,13 @@ def build_auth_page(panel: Any) -> QWidget:
         card_layout.addWidget(label)
         card_layout.addWidget(widget)
 
-    remember_row = QHBoxLayout()
-    remember_row.setSpacing(8)
     panel.remember_password_checkbox = QCheckBox("记住密码", card)
     panel.remember_password_checkbox.setObjectName("rememberPasswordCheck")
     panel.remember_password_checkbox.setToolTip(
         "密码使用 Windows 凭据保护（DPAPI）加密后保存在本机，"
         "仅当前 Windows 用户可解密。"
     )
-    panel.remember_password_hint = QLabel(
-        "账号密码加密保存在本机，下次启动自动填充", card
-    )
-    panel.remember_password_hint.setObjectName("rememberPasswordHint")
-    panel.remember_password_hint.setWordWrap(True)
-    remember_row.addWidget(panel.remember_password_checkbox)
-    remember_row.addWidget(panel.remember_password_hint, 1)
-    card_layout.addLayout(remember_row)
+    card_layout.addWidget(panel.remember_password_checkbox)
 
     buttons = QHBoxLayout()
     buttons.setSpacing(10)
