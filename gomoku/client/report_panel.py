@@ -6,7 +6,6 @@ from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QComboBox,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
@@ -15,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from gomoku.client.paper_panel import PaperPanel
+from gomoku.client.ui_theme import PaperComboBox
 
 #: 举报类别 → 服务端 category / 显示文案。
 REPORT_CATEGORIES: tuple[tuple[str, str], ...] = (
@@ -73,7 +73,7 @@ class ReportPanel(PaperPanel):
         category_row = QHBoxLayout()
         category_label = QLabel("违规类型", self.card)
         category_label.setObjectName("formLabel")
-        self.category_combo = QComboBox(self.card)
+        self.category_combo = PaperComboBox(self.card)
         for key, label in REPORT_CATEGORIES:
             self.category_combo.addItem(label, key)
         category_row.addWidget(category_label)

@@ -46,7 +46,7 @@ from gomoku.client.online_panel import (  # noqa: E402
 )
 from gomoku.client.paper_panel import PaperPanel  # noqa: E402
 from gomoku.client.private_chat_panel import PrivateChatPanel  # noqa: E402
-from gomoku.client.ui_theme import PaperCheckBox  # noqa: E402
+from gomoku.client.ui_theme import PaperCheckBox, PaperComboBox  # noqa: E402
 from gomoku.shared.rules import Player  # noqa: E402
 from gomoku.client.profile_panel import (  # noqa: E402
     AvatarPickerPanel,
@@ -1505,8 +1505,24 @@ class LobbyTimeControlUiTests(unittest.TestCase):
         self.assertEqual(session.created, [TimeControl.per_move(90)])
         panel.close()
 
+    def test_time_limit_combo_uses_paper_combo(self) -> None:
+        """时限下拉框必须用主题组合框。
+
+        原生组合框展开时，Qt 内部弹窗容器自带的系统边框会在米色列表外面
+        露出一圈黑框（应用级 QSS 命中不到那个容器）。
+        """
+        panel = OnlinePanel()
+        self.assertIsInstance(panel.turn_seconds_combo, PaperComboBox)
+        panel.close()
+
 
 class ReportAndReviewPanelTests(unittest.TestCase):
+    def test_report_category_combo_uses_paper_combo(self) -> None:
+        """举报类别下拉框同样要用主题组合框，避免展开时露出系统黑框。"""
+        panel = ReportPanel("game-abcdefgh", "对手")
+        self.assertIsInstance(panel.category_combo, PaperComboBox)
+        panel.deleteLater()
+
     def test_report_panel_submits_selected_category(self) -> None:
         panel = ReportPanel("game-abcdefgh", "对手")
         events: list[tuple[str, str]] = []

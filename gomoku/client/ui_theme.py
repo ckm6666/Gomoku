@@ -33,6 +33,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFrame,
     QStyle,
     QStyleOptionButton,
@@ -52,6 +53,7 @@ from gomoku.client.theme_palette import (
     GOLD,
     GOLD_DARK,
     INK,
+    INK_FAINT,
     INK_MUTED,
     INK_SOFT,
     PAPER,
@@ -989,6 +991,67 @@ class PaperCheckBox(QCheckBox):
             painter.drawPath(path)
 
 
+class PaperComboBox(QComboBox):
+    """水墨主题组合框：自绘下拉箭头，并去掉弹窗自带的系统黑框。
+
+    两处系统痕迹都要自己收拾干净：
+
+    * 应用 QSS 里 ``QComboBox::drop-down`` 一旦被样式化，Qt 就不再画原生
+      箭头（原生指示器只剩一条分隔线）。这里在原生绘制结束后用 QPainter
+      补一个轻量 V 形箭头，不依赖外部图片。
+    * 下拉弹窗的容器（``QComboBoxPrivateContainer``）是 Qt 内部创建的
+      QFrame，应用级 QSS 命中不到它：``QComboBoxPrivateContainer`` 与
+      ``QFrame`` 选择器都无效，只有 ``*`` 通配能部分覆盖，且原生阴影是
+      叠加在背景之上的半透明层。结果是米色列表外面套着一圈系统黑框
+      （``#131313``）。弹窗容器由 Qt 惰性创建，只能在 ``showPopup()``
+      之后拿到；给它挂一层 widget 级样式即可整体接管绘制，原生黑框
+      不再叠加。
+    """
+
+    #: 弹窗容器的局部样式：底色与列表一致（``#FBF7EE``），并去掉原生边框。
+    _POPUP_CONTAINER_QSS = (
+        "QFrame { background-color: #FBF7EE; border: none; }"
+    )
+
+    def showPopup(self) -> None:
+        """弹出列表后，替换掉弹窗容器的原生深色边框。"""
+        super().showPopup()
+        container = self.view().parentWidget()
+        if container is not None:
+            container.setStyleSheet(self._POPUP_CONTAINER_QSS)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        super().paintEvent(event)
+
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+            color = (
+                QColor(INK_MUTED)
+                if self.isEnabled()
+                else QColor(INK_FAINT)
+            )
+            pen = QPen(
+                color,
+                1.4,
+                Qt.PenStyle.SolidLine,
+                Qt.PenCapStyle.RoundCap,
+                Qt.PenJoinStyle.RoundJoin,
+            )
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+
+            center_x = self.width() - 11.0
+            center_y = self.height() / 2.0
+            arrow = QPainterPath(QPointF(center_x - 3.5, center_y - 1.8))
+            arrow.lineTo(QPointF(center_x, center_y + 1.8))
+            arrow.lineTo(QPointF(center_x + 3.5, center_y - 1.8))
+            painter.drawPath(arrow)
+        finally:
+            painter.end()
+
+
 class InkBackdrop(QWidget):
     """以水墨宣纸为背景的页面容器。"""
 
@@ -1141,6 +1204,7 @@ __all__ = [
     "MENU_BACKDROP_SPEC",
     "ONLINE_BACKDROP_SPEC",
     "PaperCheckBox",
+    "PaperComboBox",
     "RicePaperCard",
     "apply_app_theme",
     "assets_root",
