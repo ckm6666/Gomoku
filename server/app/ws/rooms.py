@@ -1257,24 +1257,14 @@ class RoomManager:
         self,
         conn: ClientConnection,
         request_id: Optional[str] = None,
-        turn_seconds: Optional[int] = None,
-        time_control: Optional[TimeControl] = None,
     ) -> None:
         """加入排位队列；排位赛固定每手 30 秒，不接受自定义时限。
 
-        客户端仍可能带着旧的 ``turn_seconds``/``time_control`` 字段，
-        这里只做格式校验以拒绝畸形协议，实际对局一律使用固定时限。
+        客户端仍可能带着旧的 ``turn_seconds``/``time_control`` 字段：
+        WebSocket 端点会先校验它们的格式（畸形协议直接报错），但实际
+        对局一律使用固定的 ``DEFAULT_TIME_CONTROL``。
         """
         if not self._is_current_connection(conn):
-            return
-        if turn_seconds is not None and (
-            not isinstance(turn_seconds, int)
-            or isinstance(turn_seconds, bool)
-            or not 5 <= turn_seconds <= 600
-        ):
-            await self._send_error(
-                conn, "每手时间必须在 5～600 秒", request_id
-            )
             return
         # 排位固定每手 30 秒：刻意忽略客户端的自定义选择。
         control = DEFAULT_TIME_CONTROL

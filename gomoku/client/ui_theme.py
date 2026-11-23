@@ -15,7 +15,7 @@ import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt
 from PySide6.QtGui import (
@@ -906,9 +906,21 @@ class PaperCheckBox(QCheckBox):
     Qt 原生勾选框的选中底色跟随系统强调色（Windows 上通常是蓝色），
     与宣纸主题冲突。这里保留 QCheckBox 的文本/焦点行为，只把指示器
     重绘成纸色方框，避免在 QSS 里引用图片资源。
+
+    原生指示器必须先被隐藏：不隐藏的话，它的圆角像素会从自绘方框的
+    四角漏出来，在宣纸底色上留下一圈系统灰边。隐藏方式是一条只针对
+    ``::indicator`` 的局部样式；应用级样式里按 objectName 设置的文字
+    颜色和字号不受影响。
     """
 
     _BOX_RADIUS = 3.0
+    _HIDE_NATIVE_INDICATOR = (
+        "QCheckBox::indicator { background: transparent; border: none; }"
+    )
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.setStyleSheet(self._HIDE_NATIVE_INDICATOR)
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)

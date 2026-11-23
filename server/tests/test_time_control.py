@@ -21,6 +21,7 @@ from gomoku.shared.protocol import (
     make_message,
     parse_game_state,
 )
+from gomoku.shared.rules import Player
 from gomoku.shared.time_control import TimeControl
 from server.app.ws.entities import Room
 from server.tests.helpers import ServerTestBase
@@ -241,6 +242,14 @@ class FischerMatchTests(ServerTestBase):
 class CasualRoomTimeControlTests(ServerTestBase):
     """自建房必须真正采用房主选择的时限。"""
 
+    def _receive_type(self, ws, expected: str, attempts: int = 10) -> dict:
+        for _ in range(attempts):
+            message = ws.receive_json()
+            if message["type"] == expected:
+                return message
+        self.fail(f"未收到期望消息 {expected}")
+        return {}
+
     def _register_access(self, username: str) -> str:
         response = self.register(username)
         self.assertEqual(response.status_code, 201, response.text)
@@ -329,10 +338,13 @@ class CasualRoomTimeControlTests(ServerTestBase):
                         {"room_code": created["payload"]["room_code"]},
                     )
                 )
+                host_state = None
                 for ws in (host, guest):
                     state = parse_game_state(
                         ws.receive_json()["payload"]
                     )
+                    if ws is host:
+                        host_state = state
                     self.assertTrue(state.time_control.is_fischer)
                     self.assertEqual(
                         state.time_control.main_seconds, 180
@@ -347,6 +359,35 @@ class CasualRoomTimeControlTests(ServerTestBase):
                     self.assertLessEqual(
                         state.black_remaining_ms or 0, 180_100
                     )
+
+                # 房主执黑先手：落子后验证加秒真的生效——黑方余量扣掉本手
+                # 耗时后加回 2 秒，仍不低于初始的 180 秒；白方尚未行动，
+                # 余量保持初始值。
+                self.assertIs(host_state.your_color, Player.BLACK)
+                host.send_json(
+                    make_message(
+                        CLIENT_MOVE_INTENT,
+                        {"row": 7, "col": 7},
+                        request_id="fischer-casual-move-1",
+                    )
+                )
+                host_after = parse_game_state(
+                    self._receive_type(host, SERVER_GAME_STATE)["payload"]
+                )
+                guest_after = parse_game_state(
+                    self._receive_type(guest, SERVER_GAME_STATE)["payload"]
+                )
+                self.assertEqual(host_after.move_no, 1)
+                self.assertEqual(guest_after.move_no, 1)
+                self.assertGreaterEqual(
+                    host_after.black_remaining_ms or 0, 180_000
+                )
+                self.assertGreaterEqual(
+                    guest_after.white_remaining_ms or 0, 179_000
+                )
+                self.assertLessEqual(
+                    guest_after.white_remaining_ms or 0, 180_100
+                )
 
 
 class ClockMathTests(ServerTestBase):

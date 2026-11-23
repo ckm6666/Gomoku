@@ -70,9 +70,11 @@ class RankedMatchTests(ServerTestBase):
                 )
 
                 # 即使请求的每手秒数不同，排位也立即配对并固定 30 秒。
+                # 双方都请求 15 秒：若服务端沿用入队者的设置，这里会得到
+                # 15 而不是 30，测试就能真正区分"固定 30 秒"和"沿用请求"。
                 second.send_json(
                     make_message(
-                        CLIENT_QUICK_MATCH, {"turn_seconds": 30}
+                        CLIENT_QUICK_MATCH, {"turn_seconds": 15}
                     )
                 )
                 self._receive_type(first, SERVER_MATCH_FOUND)

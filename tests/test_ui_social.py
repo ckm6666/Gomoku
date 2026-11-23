@@ -24,6 +24,8 @@ from PySide6.QtWidgets import (  # noqa: E402
     QFrame,
     QLabel,
     QPushButton,
+    QStyle,
+    QStyleOptionButton,
     QWidget,
 )
 
@@ -1032,6 +1034,43 @@ class RememberPasswordUiTests(unittest.TestCase):
                 ):
                     blue_pixels += 1
         self.assertEqual(blue_pixels, 0)
+        box.close()
+
+    def test_checkbox_does_not_leak_native_indicator_pixels(self) -> None:
+        """原生指示器必须完全隐藏。
+
+        如果只把自绘方框盖在原生指示器上，原生圆角处的灰色像素会从四角
+        漏出来，在宣纸底色上留下一圈系统灰边。主题色都是暖色（红通道
+        明显高于蓝通道），原生指示器是中性灰，据此判断是否泄漏。
+        """
+        box = PaperCheckBox("记住密码")
+        box.setChecked(True)
+        box.resize(120, 24)
+        box.show()
+        QT_APP.processEvents()
+        image = box.grab().toImage()
+
+        option = QStyleOptionButton()
+        box.initStyleOption(option)
+        rect = box.style().subElementRect(
+            QStyle.SubElement.SE_CheckBoxIndicator, option, box
+        )
+        self.assertFalse(rect.isEmpty())
+        background = image.pixelColor(
+            image.width() - 2, image.height() - 2
+        )
+        leaked = []
+        for y in range(rect.y(), rect.y() + rect.height()):
+            for x in range(rect.x(), rect.x() + rect.width()):
+                color = image.pixelColor(x, y)
+                if color == background:
+                    continue
+                spread = max(color.red(), color.green(), color.blue()) - min(
+                    color.red(), color.green(), color.blue()
+                )
+                if spread <= 4:
+                    leaked.append((x, y, color.name()))
+        self.assertEqual(leaked, [])
         box.close()
 
 

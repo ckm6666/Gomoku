@@ -181,7 +181,7 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 | `POST /api/v1/messages/{user_id}` | 发送私聊（`{"content": ...}`），在线时实时推送 |
 | `WS auth` | 首帧认证；可携带 `capabilities` 声明客户端能力，响应返回服务端 `capabilities` |
 | `WS create_room` | 自建房；`allow_spectators=false` 可关闭观战；`time_control` 可选 `per_move` 或 `fischer`，兼容旧字段 `turn_seconds` |
-| `WS quick_match` | 加入排位匹配队列；可选 `time_control`（或旧 `turn_seconds`），只与完全相同的设置配对 |
+| `WS quick_match` | 加入排位匹配队列；排位固定每手 30 秒，携带的 `time_control`（或旧 `turn_seconds`）只做格式校验、对局不采用 |
 | `WS cancel_match` | 离开排位队列 |
 | `WS queue_status` | 服务端返回 queued/idle、队列人数、当前积分/段位 |
 | `WS match_found` | 匹配成功，返回 game_id、执子颜色、对手昵称和双方赛前积分 |
@@ -293,7 +293,7 @@ Start-Process C:\Users\a1325\Desktop\Gomoku\dist\Gomoku.exe
 | `GOMOKU_JWT_SECRET` | 开发环境随机 | 至少 32 字符；生产必须固定 |
 | `GOMOKU_ACCESS_TOKEN_MINUTES` | `15` | access JWT 有效期 |
 | `GOMOKU_REFRESH_TOKEN_DAYS` | `30` | refresh token 有效期 |
-| `GOMOKU_TURN_SECONDS` | `30` | 每手倒计时，5～600 |
+| `GOMOKU_TURN_SECONDS` | `30` | 自建房未指定时限时的每手倒计时兜底，5～600；排位固定每手 30 秒，不受此变量影响 |
 | `GOMOKU_DISCONNECT_FORFEIT_SECONDS` | `20` | 掉线后等待重连的宽限时间，超时判逃跑，0～300 |
 | `GOMOKU_WS_AUTH_TIMEOUT` | `10` | WebSocket 首帧认证超时 |
 | `GOMOKU_WS_IDLE_TIMEOUT` | `75` | 客户端心跳间隔需短于此 |
