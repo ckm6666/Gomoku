@@ -153,6 +153,8 @@ class OnlinePanel(InkBackdrop):
         self._refresh_after_auth_refresh = False
         # 对话日志的展开状态（逻辑值，不受页面是否在前台影响）。
         self._chat_log_expanded = False
+        # 沙盘推演是否处于打开状态：打开时沙盘面板覆盖真实棋盘。
+        self._sandbox_open: bool = False
         # 用户偏好（对话日志展开状态）通过 QSettings 持久化。
         self._settings = QSettings()
 
@@ -2180,6 +2182,56 @@ class OnlinePanel(InkBackdrop):
         if self._session is not None and self._session.accepts_human_input:
             self._session.request_move(row, col)
 
+    # ------------------------------------------------------------------
+    # 沙盘推演
+    # ------------------------------------------------------------------
+    def _on_sandbox_toggled(self) -> None:
+        """「沙盘推演」按钮：打开或关闭沙盘。"""
+        if self._sandbox_open:
+            self._close_sandbox()
+        else:
+            self._open_sandbox()
+
+    def _open_sandbox(self) -> bool:
+        """打开沙盘：载入当前对局局面，并遮挡真实棋盘。
+
+        沙盘完全在本地运行，不会向服务器发送任何落子请求。
+        """
+        session = self._session
+        if session is None or session.snapshot is None:
+            # 还没有对局（或对局尚未开始），没有可推演的局面。
+            return False
+        self.sandbox_panel.load_position(session.view)
+        self.sandbox_panel.setVisible(True)
+        self._sandbox_open = True
+        self.sandbox_button.setText("退出沙盘")
+        # 真实棋盘被沙盘盖住，不能再接受点击。
+        self.board_widget.set_interaction_enabled(False)
+        return True
+
+    def _close_sandbox(self) -> None:
+        """关闭沙盘：恢复真实棋盘。"""
+        self._hide_sandbox()
+        # 整页刷新：真实棋盘的交互状态按会话重新计算。
+        self._sync_game_page()
+
+    def _hide_sandbox(self) -> None:
+        """隐藏沙盘并复位沙盘状态，但不触发整页刷新。"""
+        self.sandbox_panel.setVisible(False)
+        self._sandbox_open = False
+        self.sandbox_button.setText("沙盘推演")
+
+    def _sync_sandbox_button(
+        self, session: Optional[OnlineGameSession]
+    ) -> None:
+        """同步沙盘按钮的可用状态：没有对局时不可用。"""
+        has_game = session is not None and session.snapshot is not None
+        # 沙盘已经打开时按钮必须保持可用，否则用户会被困在沙盘里
+        # 无法退出（例如中途断线导致会话消失）。
+        self.sandbox_button.setEnabled(
+            (has_game and self._ws_connected) or self._sandbox_open
+        )
+
     def _on_undo_clicked(self) -> None:
         """正常时发起悔棋请求；对手请求待回应时，此按钮表示同意。"""
         if self._session is None:
@@ -2428,6 +2480,8 @@ class OnlinePanel(InkBackdrop):
 
     def _leave_game_page(self, message: str = "") -> None:
         """离开对局页：从对战广场进去观战的，回广场；其余回大厅。"""
+        # 沙盘不能跟着离开对局页：先收起来。
+        self._close_sandbox()
         if self._watching_from_plaza:
             self._watching_from_plaza = False
             self._show_plaza_page(message)
@@ -2437,6 +2491,8 @@ class OnlinePanel(InkBackdrop):
     def _sync_game_page(self) -> None:
         self._refresh_chat_controls()
         session = self._session
+        # 没有会话时按钮同样要禁用。
+        self._sync_sandbox_button(session)
         if session is None:
             return
         snapshot = session.snapshot
@@ -2766,8 +2822,13 @@ class OnlinePanel(InkBackdrop):
         if not self._ws_connected:
             self.game_error_label.setText("网络连接中断，正在尝试恢复")
         self.board_widget.set_view(session.view)
+        if self._sandbox_open:
+            # 真实对局推进了，把新局面同步给沙盘基线。
+            self.sandbox_panel.sync_base(session.view)
         self.board_widget.set_interaction_enabled(
-            self._ws_connected and session.accepts_human_input
+            self._ws_connected
+            and session.accepts_human_input
+            and not self._sandbox_open
         )
         self.board_widget.update()
         self._update_clock_label()
@@ -2842,6 +2903,7 @@ class OnlinePanel(InkBackdrop):
     def _sync_spectator_page(self, snapshot: GameSnapshot) -> None:
         """观战页：只读展示棋盘与双方信息，隐藏一切玩家专属的操作。"""
         session = self._session
+        self._sync_sandbox_button(session)
         rated = snapshot.rated
         self.room_title_label.setText(
             "观战 · 排位赛" if rated else "观战 · 自建房"
@@ -2911,6 +2973,9 @@ class OnlinePanel(InkBackdrop):
         # 观战者只读：棋盘不接受任何点击。
         if session is not None:
             self.board_widget.set_view(session.view)
+            if self._sandbox_open:
+                # 观战也是本地工具：真实局面推进时同步沙盘基线。
+                self.sandbox_panel.sync_base(session.view)
         self.board_widget.set_interaction_enabled(False)
         self.board_widget.update()
         self._update_clock_label()
@@ -3038,6 +3103,8 @@ class OnlinePanel(InkBackdrop):
         self._teardown_ws()
         if hasattr(self, "danmaku_overlay"):
             self.danmaku_overlay.clear()
+        # 沙盘面板是子控件，关闭时顺手收起，避免残留可见状态。
+        self._hide_sandbox()
 
 
 __all__ = ["OnlinePanel", "OnlinePlayerCard"]

@@ -25,6 +25,7 @@ from gomoku.client.chat_widgets import (
 from gomoku.client.danmaku import DanmakuOverlay
 from gomoku.client.online_pages.common import CHAT_INPUT_HINT, empty_view
 from gomoku.client.online_player_card import OnlinePlayerCard
+from gomoku.client.sandbox_panel import SandboxPanel
 from gomoku.shared.chat import MAX_COMMENT_LENGTH
 
 
@@ -90,6 +91,12 @@ def build_game_page(panel: Any) -> QWidget:
     board_grid.addWidget(panel.danmaku_overlay, 0, 0)
     # 让弹幕以棋面（居中的正方形）为活动范围，而不是控件留白。
     panel.danmaku_overlay.set_board_widget(panel.board_widget)
+
+    # 沙盘面板最后加入：与真实棋盘、弹幕叠放在同一个网格单元格中，
+    # 打开时盖住真实棋盘。隐藏状态下不占布局空间。
+    panel.sandbox_panel = SandboxPanel(panel.board_container)
+    board_grid.addWidget(panel.sandbox_panel, 0, 0)
+    panel.sandbox_panel.setVisible(False)
 
     left_column.addWidget(panel.board_container, 1)
 
@@ -179,6 +186,15 @@ def build_game_page(panel: Any) -> QWidget:
     actions = QHBoxLayout()
     actions.setSpacing(8)
     actions.addStretch(1)
+    # 沙盘推演放在底部操作栏：它是与对局并列的一种玩法，和悔棋、
+    # 认输这些操作按钮排在一起最容易找到。
+    panel.sandbox_button = QPushButton("沙盘推演", page)
+    panel.sandbox_button.setObjectName("undoButton")
+    panel.sandbox_button.setToolTip(
+        "在本地沙盘上自行推演，不影响真实对局"
+    )
+    # 还没有对局时按钮不可用（可见但禁用）。
+    panel.sandbox_button.setEnabled(False)
     panel.undo_button = QPushButton("请求悔棋", page)
     panel.undo_button.setObjectName("undoButton")
     panel.undo_reject_button = QPushButton("拒绝悔棋", page)
@@ -191,6 +207,7 @@ def build_game_page(panel: Any) -> QWidget:
     panel.leave_button = QPushButton("离开房间", page)
     panel.leave_button.setObjectName("undoButton")
     for button in (
+        panel.sandbox_button,
         panel.undo_button,
         panel.undo_reject_button,
         panel.resign_button,
@@ -202,6 +219,7 @@ def build_game_page(panel: Any) -> QWidget:
         actions.addWidget(button)
     layout.addLayout(actions)
 
+    panel.sandbox_button.clicked.connect(panel._on_sandbox_toggled)
     panel.undo_button.clicked.connect(panel._on_undo_clicked)
     panel.undo_reject_button.clicked.connect(panel._on_undo_declined)
     panel.resign_button.clicked.connect(panel._on_resign)
