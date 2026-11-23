@@ -71,6 +71,7 @@ from gomoku.client.online_player_card import OnlinePlayerCard
 from gomoku.client.online_pages.plaza_page import PlazaPage
 from gomoku.client.sessions.online import OnlineGameSession
 from gomoku.client.sessions.online_state import OnlineSessionPhase
+from gomoku.client.font_control import FontSizeButton
 from gomoku.client.sound_control import SoundButton
 from gomoku.shared.achievements import normalize_achievement_keys
 from gomoku.shared.avatar import normalize_avatar
@@ -356,6 +357,10 @@ class OnlinePanel(InkBackdrop):
         self.sound_button = SoundButton(self)
         utility_row.addWidget(
             self.sound_button, 0, Qt.AlignmentFlag.AlignVCenter
+        )
+        self.font_button = FontSizeButton(self)
+        utility_row.addWidget(
+            self.font_button, 0, Qt.AlignmentFlag.AlignVCenter
         )
         root.addLayout(utility_row)
 

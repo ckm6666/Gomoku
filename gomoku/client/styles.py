@@ -541,6 +541,49 @@ QMenu#soundMenu::separator {
     margin: 4px 8px;
 }
 
+/* ------------------------------ 字体大小 ------------------------------ */
+QToolButton#fontSizeButton {
+    background-color: #F3EADA;
+    border: 1px solid #C9B99F;
+    border-radius: 6px;
+}
+
+QToolButton#fontSizeButton:hover {
+    background-color: #EADCC8;
+    border-color: #B8934E;
+}
+
+QToolButton#fontSizeButton:pressed {
+    background-color: #E2D3BC;
+}
+
+QToolButton#fontSizeButton::menu-indicator {
+    image: none;
+    width: 0px;
+}
+
+QMenu#fontMenu {
+    background-color: #FBF7EE;
+    border: 1px solid #C9B99F;
+    border-radius: 6px;
+    padding: 4px;
+}
+
+QMenu#fontMenu::item {
+    color: #3F382F;
+    padding: 6px 14px;
+    border-radius: 3px;
+}
+
+QMenu#fontMenu::item:selected {
+    background-color: #F1E4CC;
+}
+
+QMenu#fontMenu::item:checked {
+    color: #9E3B2E;
+    font-weight: bold;
+}
+
 QWidget#volumeRow {
     background-color: transparent;
 }

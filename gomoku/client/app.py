@@ -17,6 +17,7 @@ from gomoku.client.constants import (
     APP_STORAGE_NAME,
     APP_VERSION,
 )
+from gomoku.client.font_settings import load_font_scale
 from gomoku.client.logging_setup import (
     initialize_logging,
     install_exception_hook,
@@ -81,7 +82,9 @@ def main() -> int:
     app.setStyle("Fusion")
 
     # 加载内置 OFL 字体并应用全局古风 QSS；失败时回退系统字体。
-    theme_families = apply_app_theme(app)
+    # 字号比例从 QSettings 读取，用户上次的选择在启动后继续生效。
+    font_scale = load_font_scale()
+    theme_families = apply_app_theme(app, font_scale=font_scale)
     app.setWindowIcon(create_app_icon())
 
     # 配置只从环境变量读取非敏感项；坏配置不应阻止离线/AI 模式启动。
