@@ -52,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.13", "3.14", "3.15"]
+        python-version: ["3.13", "3.14"]
     env:
       QT_QPA_PLATFORM: offscreen
       PYTHONUTF8: "1"
@@ -80,7 +80,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.13", "3.14", "3.15"]
+        python-version: ["3.13", "3.14"]
     env:
       PYTHONUTF8: "1"
     steps:
@@ -148,9 +148,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install --require-hashes -r requirements-dev.lock
       - name: Build with PyInstaller
-        run: python build.py --fast --server-url https://ci.invalid --update-url https://ci.invalid/update.json --no-auto-update-check
-      - name: Verify built exe
-        run: python tools/build_test.py --skip-build --server-url https://ci.invalid --update-url https://ci.invalid/update.json --no-auto-update-check
+        run: python build.py --fast
       - name: Upload exe
         uses: actions/upload-artifact@v4
         with:

@@ -18,10 +18,9 @@
 - **AI 复盘**：复盘页逐手分析推荐着法、评分损失、失误/败着标注与整局准确率；
 - 预置印章头像与本地图片上传头像、个人信息窗口、好友申请/列表、好友私聊，以及直接邀请好友开局的休闲自建房；
 - 排位成就系统与十三枚勋章：胜场、连胜、段位里程碑；对局双方卡片直接展示勋章；
-- **更新检测与自动更新**：主菜单"检查更新"、启动后自动检查、下载新版后重启即可完成替换；
 - 可打包为单个 `Gomoku.exe`。
 
-当前版本：**1.12.0**（新增更新检测与自动更新：主菜单"检查更新"、启动自动检查、下载后重启安装；1.11.0 加入 Fischer 总时长时钟、Glicko-2 与排位赛季、举报与回放审计、AI 复盘分析；1.10.0 加入对战广场与观战；1.9.0 加入自定义头像上传、成就/勋章系统与对局勋章展示）。
+当前版本：**1.11.0**（新增 Fischer 总时长时钟、Glicko-2 与排位赛季、举报与回放审计、AI 复盘分析；1.10.0 加入对战广场与观战；1.9.0 加入自定义头像上传、成就/勋章系统与对局勋章展示）。
 
 > 联机功能需要同时运行本项目的服务端；离线双人/AI 模式不需要服务器。
 > 当前仍是内测定位，注册需要用户名与密码。
@@ -321,10 +320,6 @@ Gomoku/
 │       ├── opening_book.py         # 小型手工开局库
 │       ├── ai_engine.py            # 自研 AI 搜索/评估
 │       ├── ai_worker.py            # AI 搜索/提示 QThread
-│       ├── updater.py              # 版本比较、更新清单解析与 SHA-256 校验
-│       ├── update_service.py       # 异步检查更新与下载更新包（QtNetwork）
-│       ├── update_dialog.py        # 更新提示/下载进度遮罩弹窗
-│       ├── update_installer.py     # Windows 自更新：生成并执行替换脚本
 │       └── sessions/
 │           ├── base.py             # GameSession 抽象
 │           ├── local.py            # 本地双人会话
@@ -352,7 +347,6 @@ Gomoku/
 │   │   ├── api/friends.py          # 好友申请/列表/删除
 │   │   ├── api/messages.py         # 好友私聊历史/发送/已读销账
 │   │   ├── api/games.py            # 最近对局/单局棋谱/参与者审计/对局列表（观战入口）
-│   │   ├── api/updates.py          # 客户端更新清单（公开接口，无需登录）
 │   │   └── ws/
 │   │       ├── entities.py         # 连接/房间/邀请/队列纯数据实体
 │   │       ├── limits.py           # 命令令牌桶与单 IP 连接配额
@@ -364,7 +358,7 @@ Gomoku/
 │   ├── requirements*.txt
 │   ├── manage.py                   # 管理员重置密码
 │   └── README.md                   # 服务端安装、部署、PostgreSQL、TLS 说明
-├── tests/                          # 客户端 444 项自动化测试
+├── tests/                          # 客户端 342 项自动化测试
 ├── requirements.txt                # 客户端运行依赖（人工维护的版本范围）
 ├── requirements.lock               # 客户端运行依赖锁定（含哈希）
 ├── requirements-tools.txt          # ruff / mypy / coverage 工具依赖
@@ -373,7 +367,6 @@ Gomoku/
 ├── requirements-dev.lock           # 开发/打包依赖锁定（含哈希）
 ├── pyproject.toml                  # ruff / mypy / coverage 配置
 ├── .github/workflows/ci.yml        # CI：lint、类型检查、双端测试、exe/镜像构建
-├── .github/workflows/release.yml   # Release：打标签构建 exe，产出 Gomoku-<版本>.exe + update.json 工作流产物
 ├── docker-compose.yml              # 服务端 + PostgreSQL 生产取向编排
 ├── server/Dockerfile               # 服务端生产镜像
 ├── README.md                       # 本文件
@@ -384,18 +377,11 @@ Gomoku/
 ## 环境要求
 
 - Windows 10 / 11（64 位）。
-- 客户端：Python 3.10+，推荐 3.11～3.15。
-- 当前验证环境：Windows 11、Python 3.15.2、PySide6-Essentials/Addons 6.12.0、PyInstaller 6.22.3。
-- 服务端：Python 3.10+（当前机器使用 3.15.2），FastAPI、Uvicorn、SQLAlchemy async、SQLite dev / PostgreSQL prod。
+- 客户端：Python 3.10+，推荐 3.11～3.14。
+- 当前验证环境：Windows 11、Python 3.14.7、PySide6-Essentials/Addons 6.12.0、PyInstaller 6.22.3。
+- 服务端：Python 3.10+（当前机器使用 3.14.7），FastAPI、Uvicorn、SQLAlchemy async、SQLite dev / PostgreSQL prod。
 - 客户端只使用官方 PySide6 包，不引入其他 GUI 库；AI、棋盘绘制和服务端通信均为自研代码。
 - 本地开发数据库为 SQLite；生产建议 PostgreSQL。
-- **Python 3.15 请用 `unittest` 跑测试，不要用 pytest**：CPython 3.15 引入了新的
-  `lazy` 导入语句（`concurrent.futures` 就用了它），而 pytest 的断言重写钩子
-  （`AssertionRewritingHook`）会让这个惰性占位对象永远不解析，
-  `concurrent.futures.ThreadPoolExecutor` 拿到的是不可调用的 `lazy_import` 对象，
-  凡是走到 `asyncio.run_in_executor` 的用例都会报
-  `TypeError: 'lazy_import' object is not callable`。本项目 CI 用的是
-  `unittest` + `coverage`（pytest 不在依赖锁文件里），不受影响。
 
 ## 客户端安装与运行
 
@@ -490,9 +476,6 @@ $env:GOMOKU_API_BASE_URL = "https://your-domain.example"
 $env:GOMOKU_WS_BASE_URL  = "wss://your-domain.example"
 .\.venv\Scripts\python.exe main.py
 ```
-
-`GOMOKU_API_BASE_URL` 同时也是客户端更新清单地址的来源，详见
-[更新检测与自动更新](#更新检测与自动更新)。
 
 生产必须使用 HTTPS 和 WSS，不要直接暴露开发 HTTP 服务；服务端应通过 Caddy/Nginx 终止 TLS。
 
@@ -631,7 +614,7 @@ server\.venv\Scripts\python.exe -m mypy gomoku/shared server/app
 ```
 
 GitHub Actions 会在 push/PR 时自动执行 ruff、mypy（shared + server）、
-Windows 客户端测试（Python 3.13/3.14/3.15）和 Linux 服务端测试（Python 3.13/3.14/3.15），
+Windows 客户端测试（Python 3.13/3.14）和 Linux 服务端测试（Python 3.13/3.14），
 并输出覆盖率、`dist/Gomoku.exe` 构建产物，以及 Docker 镜像启动/readiness
 smoke test；当前覆盖率基线约为客户端 71%、服务端 78%。
 
@@ -653,7 +636,7 @@ CI 安装依赖时使用带哈希的锁文件，避免同一提交在不同时�
 server\.venv\Scripts\python.exe -m pip install --require-hashes -r server\requirements-dev.lock
 ```
 
-客户端当前 **444 项**测试覆盖规则、AI、配置/协议、协议能力协商、联机阶段状态机、SGF 导入/导出、每日残局/连续通关、排位每手时间与 Fischer 时钟协议、本地/AI/在线会话、排位快照/匹配队列、
+客户端当前 **342 项**测试覆盖规则、AI、配置/协议、协议能力协商、联机阶段状态机、SGF 导入/导出、每日残局/连续通关、排位每手时间与 Fischer 时钟协议、本地/AI/在线会话、排位快照/匹配队列、
 程序化音频/MP3 解码/缓存/设置持久化、按钮点击滤波器、主菜单导航/返回确认、古风主题资源/
 绘制、终局与确认弹窗、双人模式设置栏和离屏 UI/QThread；在线悔棋请求/回滚快照/配额与
 冷却、认输二次确认、逃跑/认输胜利提示文案；表情/评论协议校验与清洗、在线会话发言冷却与信号路由、弹幕覆盖层绘制
@@ -665,7 +648,7 @@ server\.venv\Scripts\python.exe -m pip install --require-hashes -r server\requir
 基线隔离、落子/撤销/重置/切换执子方与胜负判定；沙盘面板：打开关闭、覆盖真实棋盘、
 撤销与回到当前局面、真实对局推进提示；以及沙盘与真实对局的隔离：沙盘落子绝不发往服务器）；
 以及 AI 复盘评分映射/标注阈值/逐手结构、举报浮层提交与审计摘要展示。
-服务端当前 **146 项**测试覆盖用户名 + 密码注册/登录/refresh 重放/登出、双 WebSocket 建房/邀请/加入/落子/拒绝/认输/再战、
+服务端当前 **121 项**测试覆盖用户名 + 密码注册/登录/refresh 重放/登出、双 WebSocket 建房/邀请/加入/落子/拒绝/认输/再战、
 五连终局和断线重连、悔棋请求的同意/拒绝与数据库回滚、悔棋次数/冷却、掉线宽限后的逃跑判负、
 Alembic 全新库/旧库兼容迁移与重复启动幂等、健康检查/请求 ID/Prometheus 指标、
 单 IP 连接数与 WS 命令限流、观战开关/人数上限、协议能力协商与限流器单元测试、排位每手时间与
@@ -718,7 +701,7 @@ pyinstaller --noconfirm --clean Gomoku.spec
 dist\Gomoku.exe
 ```
 
-双击即可启动离线模式。联机模式仍需要启动 `server`；exe 不会内置或自动启动服务端，开发默认连接本机 `127.0.0.1:8000`。远程服务器可以在打包时用 `--server-url` 烘焙进 exe，也可以通过环境变量配置后再启动 exe（环境变量优先于烘焙值）。
+双击即可启动离线模式。联机模式仍需要启动 `server`；exe 不会内置或自动启动服务端，开发默认连接本机 `127.0.0.1:8000`。远程服务器请通过环境变量配置后再启动 exe。
 
 构建注意：
 
@@ -733,235 +716,6 @@ dist\Gomoku.exe
 - **分发时请把 `gomoku/client/assets/THIRD_PARTY_NOTICES.md` 和字体目录中的 OFL 文本
   一并放到 exe 旁边**，以满足 OFL 字体再分发要求；
 - 生产 WSS/TLS 必须实际打包测试；本机开发使用 `ws://127.0.0.1` 只适合闭环测试。
-
-### 把配置烘焙进 exe
-
-打包时可以把联机地址、更新清单地址和启动自动检查开关直接写进 exe。
-`build.py` 会把这些参数写进 `build/build_info.json`（UTF-8、无 BOM），
-`Gomoku.spec` 再把它作为 `build_info.json` 打进 exe，运行时由
-`gomoku/client/build_info.py` 读出来：
-
-| 参数 | 作用 | 写入 exe 的键 |
-| --- | --- | --- |
-| `--server-url URL` | 烘焙联机 / API 基址，同时也是更新清单地址的推导来源 | `api_base_url` |
-| `--update-url URL` | 烘焙更新清单地址，优先级高于按 API 基址推导出来的地址 | `update_manifest_url` |
-| `--auto-update-check` | 烘焙「启动时自动检查更新 = 开」 | `auto_update_check`（`true`） |
-| `--no-auto-update-check` | 烘焙「启动时自动检查更新 = 关」 | `auto_update_check`（`false`） |
-
-例如打一个指向自己服务器、并且关闭启动自动检查的 exe：
-
-```powershell
-python build.py --server-url https://gomoku.example.com --no-auto-update-check
-```
-
-只有**显式传入**的参数才会写进 `build/build_info.json`
-（一个参数都不传时该文件是 `{}`），所以同一个打包流程既能出线上版、也能出纯离线版。
-
-**烘焙进去的值只是兜底**：运行时的取值顺序是
-
-```text
-环境变量 → exe 里烘焙的值 → 按 API 基址推导的地址 → 无
-```
-
-也就是说，用户机器上的 `GOMOKU_API_BASE_URL`、`GOMOKU_UPDATE_MANIFEST_URL`、
-`GOMOKU_AUTO_UPDATE_CHECK` 依然优先生效。已经分发出去的 exe 想换服务器地址时，
-不需要重新打包，让用户改一下环境变量就能重新指向。
-
-### 打包自检脚本 `tools/build_test.py`
-
-`tools/build_test.py` 会在打包之后自动验证产物是不是真的能用，一共四步：
-
-1. **构建**：用同样的参数调用 `python build.py`，流式打印打包日志；
-2. **校验烘焙配置**：读 `build/build_info.json`，确认里面的地址与开关和构建参数一致；
-3. **校验产物**：确认 `dist\Gomoku.exe` 存在且非空，并打印体积；
-4. **冒烟测试**：用 `QT_QPA_PLATFORM=offscreen` 离屏启动 exe，确认进程没有崩溃
-   （观察几秒后仍在运行），再检查日志里新追加的内容
-   （`%LOCALAPPDATA%\Gomoku\Gomoku\logs\gomoku.log`）：要有 `应用启动 version=…`、
-   符合预期的 `更新清单地址 …`，并且没有 `Traceback`。
-
-```powershell
-# 构建 + 自检
-python tools/build_test.py --server-url https://gomoku.example.com
-
-# 只自检已有产物（跳过构建），期望值从磁盘上已有的 build/build_info.json 推导
-python tools/build_test.py --skip-build --server-url https://gomoku.example.com
-```
-
-`--skip-build` 时不再重复构建，脚本改为以磁盘上已有的 `build/build_info.json` 为准推导期望值
-（如果同时传了参数，仍会拿参数做一次交叉校验），CI 就是这样复用来避免构建两次。
-其余开关：`--fast` 跳过 PyInstaller 的 `--clean`、`--skip-smoke` 只做前三步、
-`--timeout` / `--smoke-timeout` 分别限制构建与冒烟阶段的时长。
-
-## 更新检测与自动更新
-
-客户端内置更新检测：主菜单提供 **检查更新** 按钮，程序启动后也会自动检查一次
-（同一台机器两次自动检查之间至少间隔 6 小时，避免频繁请求服务端）；发现新版本后可以下载
-新的安装包，下载完成后重启程序即可完成更新。
-
-更新源是本项目自己的服务端，**不再使用 GitHub Release**：服务端托管构建好的安装包，
-客户端向服务端查询更新清单，再从服务端下载新版本。
-
-### 客户端
-
-| 变量 | 说明 | 默认值 |
-| --- | --- | --- |
-| `GOMOKU_API_BASE_URL` | 联机服务地址；同时决定更新清单地址 | 空（未配置时更新功能不可用） |
-| `GOMOKU_UPDATE_MANIFEST_URL` | 显式指定更新清单地址（覆盖按 API 基址推导的地址） | `<GOMOKU_API_BASE_URL>/api/v1/updates/latest` |
-| `GOMOKU_AUTO_UPDATE_CHECK` | 启动时是否自动检查更新（`1` 开启 / `0` 关闭） | `1` |
-
-```powershell
-$env:GOMOKU_API_BASE_URL = "https://your-domain.example"
-$env:GOMOKU_UPDATE_MANIFEST_URL = "https://your-domain.example/api/v1/updates/latest"
-$env:GOMOKU_AUTO_UPDATE_CHECK = "0"
-.\.venv\Scripts\python.exe main.py
-```
-
-说明：
-
-- 更新清单地址默认由联机服务地址推导为 `<GOMOKU_API_BASE_URL>/api/v1/updates/latest`；
-  只有当清单接口与联机接口不在同一个服务时，才需要显式设置 `GOMOKU_UPDATE_MANIFEST_URL`；
-- 未配置 `GOMOKU_API_BASE_URL`、也没有显式设置清单地址时，更新功能不可用，
-  客户端会提示“未配置更新服务器地址”；
-- `GOMOKU_AUTO_UPDATE_CHECK=0` 只关闭启动后的自动检查，主菜单的“检查更新”按钮始终可用；
-- 下载完成后会校验 SHA-256，校验通过才提示重启安装；
-- **更新清单地址与安装包下载地址都要求 HTTPS**（本机回环地址 `127.0.0.1` /
-  `localhost` 除外，方便开发自测连本机服务）。明文 HTTP 意味着中间人既能替换
-  清单、也能替换安装包，因此客户端会直接拒绝；
-- **清单里必须带 `sha256`**：没有摘要就无法证明下载到的二进制就是服务端发布的
-  那一个，客户端会拒绝安装并提示手动更新；
-- 联机对局进行中不会弹更新提示：更新遮罩会挡住棋盘输入，而服务器端的
-  Fischer 时钟不会跟着暂停，玩家会因为无法落子而超时判负。对局结束后再点
-  “检查更新”即可。
-
-更新清单地址也可以在**打包时烘焙进 exe**（见[打包成 exe](#打包成-exe)一节），
-运行时的取值顺序是：
-
-```text
-GOMOKU_UPDATE_MANIFEST_URL 环境变量 → exe 里烘焙的清单地址（--update-url）
-→ 按 API 基址推导的 <基址>/api/v1/updates/latest → 无
-```
-
-其中 API 基址同样先看环境变量 `GOMOKU_API_BASE_URL`，没有再看 exe 里烘焙的
-`--server-url`。排查问题时可以直接看启动日志里的这一行：
-
-```text
-更新清单地址 https://gomoku.example.com/api/v1/updates/latest
-```
-
-没有配置任何地址时，这行日志是 `更新清单地址 未配置`。
-在主菜单手动点“检查更新”失败时，弹出的提示也会带上本次尝试过的地址
-（例如 `检查更新失败（https://gomoku.example.com/api/v1/updates/latest）：…`），
-方便确认客户端到底连的是哪个地址。
-
-### 服务端更新接口
-
-服务端对外提供两个公开接口（不需要登录，客户端启动时可能还没有 token）：
-
-| 接口 | 说明 |
-| --- | --- |
-| `GET /api/v1/updates/latest` | 返回当前可用的更新清单 JSON |
-| `GET /api/v1/updates/download/{文件名}` | 下载安装包（例如 `Gomoku-1.12.0.exe`） |
-
-服务端有两种托管方式，通过环境变量二选一：
-
-| 变量 | 说明 |
-| --- | --- |
-| `GOMOKU_UPDATE_ARTIFACTS_DIR` | **推荐**。服务端托管构建产物的目录，服务端自行生成清单 |
-| `GOMOKU_UPDATE_MANIFEST_PATH` | 备选。指向一份 JSON 清单文件，服务端原样透传 |
-
-#### 方式一：托管产物目录（推荐）
-
-把 CI 构建产物放进该目录：
-
-```text
-GOMOKU_UPDATE_ARTIFACTS_DIR/
-├── Gomoku-1.12.0.exe
-└── update.json          # 可选：提供 notes / published_at
-```
-
-服务端读取目录中的安装包，**自行计算 SHA-256**、按自身对外地址**生成下载 URL**，
-并响应 `GET /api/v1/updates/latest`；客户端再通过
-`GET /api/v1/updates/download/Gomoku-1.12.0.exe` 下载安装包。
-工作流生成的 `update.json` 只含版本号与更新说明，可直接放进该目录作为可选的说明文件。
-
-```powershell
-$env:GOMOKU_UPDATE_ARTIFACTS_DIR = "C:\gomoku\updates"
-```
-
-#### 方式二：手工维护清单文件（备选）
-
-安装包放在 CDN 等其他位置时，用一份 JSON 清单描述它，服务端只负责原样透传
-（`version`、`url`、`sha256` 必填，且 `url` 必须是 HTTPS）：
-
-```powershell
-$env:GOMOKU_UPDATE_MANIFEST_PATH = "C:\gomoku\update.json"
-```
-
-### 更新清单格式
-
-服务端自建清单（由 `GOMOKU_UPDATE_ARTIFACTS_DIR` 生成，`url` / `sha256` / `size` 由服务端填充）：
-
-```json
-{
-  "version": "1.12.0",
-  "url": "https://your-domain.example/api/v1/updates/download/Gomoku-1.12.0.exe",
-  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "size": 12345678,
-  "notes": "更新说明",
-  "published_at": "2026-01-01T00:00:00Z"
-}
-```
-
-手工清单文件（`GOMOKU_UPDATE_MANIFEST_PATH`，`url` 与 `sha256` 需要自己填写）：
-
-```json
-{
-  "version": "1.12.0",
-  "url": "https://cdn.example.com/Gomoku-1.12.0.exe",
-  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "size": 12345678,
-  "notes": "更新说明",
-  "published_at": "2026-01-01T00:00:00Z"
-}
-```
-
-字段说明：
-
-| 字段 | 必填 | 说明 |
-| --- | --- | --- |
-| `version` | 是 | 版本号，与客户端当前版本比较，`v` 前缀可选 |
-| `url` | 是 | 安装包下载地址，必须是 HTTPS（本机回环地址除外） |
-| `sha256` | 是 | 安装包 SHA-256 十六进制摘要，下载后用于校验；缺失时客户端拒绝安装 |
-| `size` | 否 | 安装包字节数，用于显示下载进度 |
-| `notes` | 否 | 更新说明，展示在更新提示里 |
-| `published_at` | 否 | 发布时间（ISO-8601 UTC） |
-
-### 发布新版本
-
-1. 在仓库打标签并推送：`git tag vX.Y.Z && git push origin vX.Y.Z`；
-2. 推送标签会触发 `.github/workflows/release.yml`：构建 `dist/Gomoku.exe`，
-   改名为 `Gomoku-X.Y.Z.exe`，并生成只含 `version` / `notes` / `published_at` 的
-   `update.json`（不含 `url` 与 `sha256`，两者由服务端生成）；
-3. 工作流结束会得到名为 `gomoku-update-X.Y.Z` 的工作流产物，在 Actions 页面下载并解压；
-4. 把 `Gomoku-X.Y.Z.exe`（以及可选的 `update.json`）放进服务端的
-   `GOMOKU_UPDATE_ARTIFACTS_DIR` 目录；
-5. 服务端重新生成清单，客户端下次检查更新即可发现新版本；
-   需要补发布说明时，可以手动重跑工作流（`workflow_dispatch`）并在 `notes` 输入框中填写。
-
-> **发布产物必须带上服务地址。** 工作流会把服务地址烘焙进 exe（这样客户端才知道
-> 去哪儿检查更新）：地址取自 `workflow_dispatch` 的 `server-url` 输入框，或仓库变量
-> `GOMOKU_SERVER_URL`。两者都没配时工作流会给出告警，产出的 exe 将无法检查更新。
-
-> 不再使用 GitHub Release：安装包改由自家服务端托管，客户端只与自家服务端通信，
-> 不再依赖 GitHub 的可达性与下载限流，也便于统计真实客户端的版本分布。
-
-> **更新来源的可信度取决于服务端本身。** 清单与摘要都由同一个服务端下发，
-> 没有数字签名：一旦服务端被攻破，攻击者就能下发任意安装包。当前实现依靠
-> HTTPS + SHA-256 挡住传输链路上的篡改与中间人，挡不住服务端本身被攻破。
-> 需要更强的保证时，应在清单上增加签名（例如 minisign / Ed25519）并在客户端校验。
-
-> **覆盖安装只对打包后的 Windows exe 生效。** 开发方式（`python main.py`）运行时无法替换
-> 正在运行的程序，客户端只会把安装包下载下来，并提示用户手动替换。
 
 ## 日志与本地数据
 
@@ -1002,8 +756,6 @@ Authorization 头或 token。当前客户端 token 只保存在内存，关闭�
   Redis/房间路由。服务重启会作废未完成对局，不结算积分。
 - 生产必须固定高强度 `GOMOKU_JWT_SECRET`、使用 HTTPS/WSS、限制服务端访问并做好备份；
   开发默认 SQLite、单 Uvicorn worker。
-- 客户端自动更新要求更新清单与安装包都走 HTTPS（本机回环地址除外），并在安装前校验
-  SHA-256；清单与摘要同源且无数字签名，因此客户端的信任边界止于"服务端本身没有被攻破"。
 - 赛季、举报与回放审计已提供：赛季推进与归档、Glicko-2、玩家举报、参与者/管理员审计接口。
   审计只给出客观异常（序列/结果/时间特征），不自动判定作弊；举报处理结果需要管理员人工复核，
   当前不自动执行封号或禁赛。
