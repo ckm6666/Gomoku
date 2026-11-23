@@ -25,6 +25,7 @@ exe = EXE(
     a.datas,
     [],
     name='Gomoku',
+    icon='resources/app.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
