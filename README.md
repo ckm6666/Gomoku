@@ -32,13 +32,13 @@
 
 | 古风主菜单 | 水墨对局 |
 | --- | --- |
-| ![古风主菜单](_theme_menu.png) | ![水墨对局](_theme_game.png) |
+| ![古风主菜单](docs/images/_theme_menu.png) | ![水墨对局](docs/images/_theme_game.png) |
 | **胜利结算** | **联机大厅** |
-| ![胜利结算](_theme_result_win.png) | ![联机大厅](_theme_online_lobby.png) |
+| ![胜利结算](docs/images/_theme_result_win.png) | ![联机大厅](docs/images/_theme_online_lobby.png) |
 
 返回主菜单/重新开局确认框沿用同一主题：
 
-![古风确认弹窗](_theme_confirm_return.png)
+![古风确认弹窗](docs/images/_theme_confirm_return.png)
 
 ## 功能
 
@@ -390,6 +390,7 @@ Gomoku/
 ├── docker-compose.yml              # 服务端 + PostgreSQL 生产取向编排
 ├── server/Dockerfile               # 服务端生产镜像
 ├── README.md                       # 本文件
+├── docs/images/                    # README 界面预览截图（_theme_*.png）
 └── dist/
     └── Gomoku.exe                  # PyInstaller 产物
 ```
