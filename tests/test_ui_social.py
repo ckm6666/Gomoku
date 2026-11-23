@@ -37,6 +37,7 @@ from gomoku.client.achievement_widgets import (  # noqa: E402
 from gomoku.client.avatar_images import (  # noqa: E402
     prepare_avatar_image,
 )
+from gomoku.client.avatar_widgets import AvatarView  # noqa: E402
 from gomoku.client.auth import AuthSession, AuthUser  # noqa: E402
 from gomoku.client.friends_panel import FriendsPanel  # noqa: E402
 from gomoku.client.online_panel import (  # noqa: E402
@@ -231,6 +232,60 @@ class AvatarImageTests(unittest.TestCase):
             prepare_avatar_image("definitely-missing-avatar.png")
 
 
+class AvatarUnreadBadgeTests(unittest.TestCase):
+    """头像角落的未读红点：颜色、位置与条数。"""
+
+    @staticmethod
+    def _red_pixels(image: QImage) -> int:
+        """统计右上角区域里的朱砂红像素。"""
+        count = 0
+        for x in range(image.width() // 2, image.width()):
+            for y in range(0, image.height() // 2):
+                color = image.pixelColor(x, y)
+                if (
+                    color.red() > 150
+                    and color.green() < 110
+                    and color.blue() < 110
+                ):
+                    count += 1
+        return count
+
+    def test_badge_is_drawn_in_the_top_right_corner(self) -> None:
+        """有未读时头像右上角出现红色角标。"""
+        view = AvatarView("he", "u2", 36)
+        try:
+            self.assertEqual(view.unread, 0)
+            plain = self._red_pixels(view.grab().toImage())
+
+            view.set_unread(7)
+            self.assertEqual(view.unread, 7)
+            marked = self._red_pixels(view.grab().toImage())
+            self.assertGreater(marked, plain)
+        finally:
+            view.close()
+
+    def test_badge_disappears_when_read(self) -> None:
+        """未读清零后角标要收回去。"""
+        view = AvatarView("he", "u2", 36)
+        try:
+            view.set_unread(3)
+            marked = self._red_pixels(view.grab().toImage())
+            view.set_unread(0)
+            self.assertEqual(view.unread, 0)
+            self.assertLess(self._red_pixels(view.grab().toImage()), marked)
+        finally:
+            view.close()
+
+    def test_negative_unread_is_ignored(self) -> None:
+        """未读条数不会变成负数。"""
+        view = AvatarView("he", "u2", 36)
+        try:
+            view.set_unread(-5)
+            self.assertEqual(view.unread, 0)
+        finally:
+            view.close()
+
+
 class FriendsPanelTests(unittest.TestCase):
     def test_rows_and_actions(self) -> None:
         window = FriendsPanel()
@@ -274,6 +329,61 @@ class FriendsPanelTests(unittest.TestCase):
         buttons["聊天"].click()
         self.assertEqual(accepted, ["r1"])
         self.assertEqual(chats, [("u2", "好友")])
+        window.close()
+
+    def test_unread_count_rides_on_the_avatar_badge(self) -> None:
+        """未读条数挂在头像角落的红点上，而不是塞进行内的按钮堆。"""
+        window = FriendsPanel()
+        window.set_data(
+            {
+                "friends": [
+                    {
+                        "user_id": "u2",
+                        "username": "好友",
+                        "avatar": "he",
+                        "online": True,
+                        "unread": 4,
+                    }
+                ],
+                "incoming": [],
+                "outgoing": [],
+            }
+        )
+        avatars = [
+            view
+            for view in window.findChildren(AvatarView)
+            if view.unread
+        ]
+        self.assertEqual(len(avatars), 1)
+        self.assertEqual(avatars[0].unread, 4)
+        window.close()
+
+    def test_unread_marker_is_not_a_button(self) -> None:
+        """未读提示是状态标签，不能长得像行内按钮。"""
+        window = FriendsPanel()
+        window.set_data(
+            {
+                "friends": [
+                    {
+                        "user_id": "u2",
+                        "username": "好友",
+                        "avatar": "he",
+                        "online": True,
+                        "unread": 4,
+                    }
+                ],
+                "incoming": [],
+                "outgoing": [],
+            }
+        )
+        badges = [
+            label
+            for label in window.findChildren(QLabel)
+            if label.objectName() == "friendUnread"
+        ]
+        self.assertEqual(len(badges), 1)
+        self.assertEqual(badges[0].text(), "4 条未读")
+        self.assertNotIsInstance(badges[0], QPushButton)
         window.close()
 
     def test_search_results_add_friend(self) -> None:

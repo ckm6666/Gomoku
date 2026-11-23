@@ -48,13 +48,14 @@ from gomoku.client.sound_control import SoundButton  # noqa: E402
 
 QT_APP = QApplication.instance() or QApplication([])
 
-_SFX_KINDS = ("move", "start", "win", "lose", "draw")
+_SFX_KINDS = ("move", "start", "win", "lose", "draw", "tick")
 _EXPECTED_DURATION = {
     "move": 0.14,
     "start": 1.1,
     "win": 1.8,
     "lose": 1.9,
     "draw": 1.1,
+    "tick": 0.24,
 }
 
 

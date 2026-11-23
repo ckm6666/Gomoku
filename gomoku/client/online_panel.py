@@ -57,6 +57,7 @@ from gomoku.client.online_pages import (
 )
 from gomoku.client.online_pages.common import (
     CHAT_INPUT_HINT,
+    online_timeout_notice,
     online_victory_notice,
 )
 from gomoku.client.credential_store import (
@@ -92,6 +93,9 @@ logger = logging.getLogger(__name__)
 
 #: 对话日志展开状态在 QSettings 里的键名。
 SETTINGS_CHAT_LOG_VISIBLE = "chat_log_visible"
+
+#: 倒计时进入最后这么多秒时数字转红，并开始逐秒播放“咚”提示音。
+COUNTDOWN_URGENT_SECONDS = 10
 
 _EMPTY_BOARD: tuple[tuple[Cell, ...], ...] = tuple(
     tuple(None for _ in range(BOARD_SIZE)) for _ in range(BOARD_SIZE)
@@ -169,6 +173,11 @@ class OnlinePanel(InkBackdrop):
         self._last_snapshot: Optional[GameSnapshot] = None
         self._audio_game_id: Optional[str] = None
         self._deadline_monotonic: Optional[float] = None
+        # 当前这一手的标识（服务器截止时间 + 手数）：同一手内它是固定的，
+        # 变了就说明进入了新的一手，提示音的节拍要重新开始。
+        self._countdown_turn_key: Optional[tuple[int, int]] = None
+        # 已经响过“咚”提示音的秒数；同一秒只响一次。
+        self._countdown_beep_second: Optional[int] = None
         # 快照接收时刻，用于 Fischer 双方余量的本地平滑倒数。
         self._snapshot_monotonic: Optional[float] = None
         self._profile_user: Optional[dict] = None
@@ -178,6 +187,7 @@ class OnlinePanel(InkBackdrop):
         self._leaderboard_entries: list = []
         self._achievement_notice_game_id = ""
         self._victory_notice_game_id = ""
+        self._timeout_notice_game_id = ""
         self._auto_requeue = False
         self._refresh_after_auth_refresh = False
         # 对话日志的展开状态（逻辑值，不受页面是否在前台影响）。
@@ -2247,6 +2257,9 @@ class OnlinePanel(InkBackdrop):
         self._audio_game_id = None
         self.clock_label.setText("—")
         self._deadline_monotonic = None
+        self._countdown_turn_key = None
+        self._countdown_beep_second = None
+        self._hide_countdown()
         self.game_rating_label.clear()
         self.game_rating_label.setVisible(False)
         self._set_match_status("")
@@ -2704,6 +2717,7 @@ class OnlinePanel(InkBackdrop):
         if not self._closing:
             self._play_online_result_sound()
             QTimer.singleShot(0, self._show_online_victory_notice)
+            QTimer.singleShot(0, self._show_online_timeout_notice)
         if self._session is not None and not self._session.is_spectator:
             # 观战不会改变本人的段位，无需重新拉取资料。
             QTimer.singleShot(0, self._refresh_profile_data)
@@ -2727,6 +2741,38 @@ class OnlinePanel(InkBackdrop):
         title, message = notice
         overlay = NoticeOverlay(
             title, message, parent=self, seal_text="胜"
+        )
+        try:
+            overlay.exec()
+        finally:
+            overlay.deleteLater()
+
+    def _show_online_timeout_notice(self) -> None:
+        """超时判负后的提示弹窗：胜方与负方各弹一条。
+
+        超时的一方判负、对手获胜，双方都会看到弹窗，只是内容不同。
+        同一局只弹一次。
+        """
+        if self._closing or self._session is None:
+            return
+        snapshot = self._session.snapshot
+        notice = online_timeout_notice(snapshot)
+        if notice is None or snapshot is None:
+            return
+        if self._timeout_notice_game_id == snapshot.game_id:
+            return
+        if (
+            not self.isVisible()
+            or self.stack.currentWidget() is not self.game_page
+        ):
+            return
+        self._timeout_notice_game_id = snapshot.game_id
+        title, message = notice
+        seal = (
+            "胜" if snapshot.winner is snapshot.your_color else "负"
+        )
+        overlay = NoticeOverlay(
+            title, message, parent=self, seal_text=seal
         )
         try:
             overlay.exec()
@@ -2969,6 +3015,7 @@ class OnlinePanel(InkBackdrop):
             )
             self._set_game_pill("等待对手", result=False)
             self.clock_label.setText("等待好友加入…")
+            self._hide_countdown()
             self.move_label.setText("第 0 手")
             self.game_rating_label.clear()
             self.game_rating_label.setVisible(False)
@@ -3012,6 +3059,7 @@ class OnlinePanel(InkBackdrop):
         )
         if snapshot is None:
             self.clock_label.setText("—")
+            self._hide_countdown()
             self.move_label.setText("第 0 手")
             self.game_rating_label.clear()
             self.game_rating_label.setVisible(False)
@@ -3196,8 +3244,16 @@ class OnlinePanel(InkBackdrop):
                 snapshot.turn_deadline_ms - snapshot.server_now_ms
             ) / 1000.0
             self._deadline_monotonic = time.monotonic() + max(0.0, seconds)
+            # 同一手的截止时间与手数在服务器上是固定的：只有它们变了才
+            # 说明进入了新的一手，提示音的节拍要重新开始。
+            turn_key = (snapshot.turn_deadline_ms, snapshot.move_no)
+            if turn_key != self._countdown_turn_key:
+                self._countdown_turn_key = turn_key
+                self._countdown_beep_second = None
         else:
             self._deadline_monotonic = None
+            self._countdown_turn_key = None
+            self._countdown_beep_second = None
 
     def _set_chat_visibility(self, visible: bool) -> None:
         """整体显示或隐藏聊天控件。
@@ -3378,15 +3434,18 @@ class OnlinePanel(InkBackdrop):
             or self._session.snapshot is None
             or self.stack.currentWidget() is not self.game_page
         ):
+            self._hide_countdown()
             return
         snapshot = self._session.snapshot
         if not self._session.is_spectator:
             self._refresh_undo_controls()
         if snapshot.is_game_over:
             self.clock_label.setText("对局结束")
+            self._hide_countdown()
             return
         if not self._ws_connected:
             self.clock_label.setText("连接中断")
+            self._hide_countdown()
             return
         if self._session.undo_pending and not self._session.is_spectator:
             self.clock_label.setText(
@@ -3394,19 +3453,80 @@ class OnlinePanel(InkBackdrop):
                 if self._session.undo_requested_by_you
                 else "请回应悔棋请求"
             )
+            self._hide_countdown()
             return
         time_control = snapshot.time_control
         if time_control is not None and time_control.is_fischer:
             self.clock_label.setText(self._fischer_clock_text(snapshot))
+            self._hide_countdown()
             return
         if self._deadline_monotonic is None:
             self.clock_label.setText("等待服务器…")
+            self._hide_countdown()
             return
         remaining = self._deadline_monotonic - time.monotonic()
         if remaining <= 0:
             self.clock_label.setText("本手时间已到，等待服务器判定…")
-        else:
-            self.clock_label.setText(f"本手倒计时：{int(remaining + 0.999)} 秒")
+            self._hide_countdown()
+            return
+        self.clock_label.setText("本手倒计时")
+        self._show_countdown(int(remaining + 0.999), snapshot)
+
+    def _hide_countdown(self) -> None:
+        """没有可显示的倒计时：收起大号秒数。"""
+        label = getattr(self, "countdown_label", None)
+        if label is None:
+            return
+        label.setVisible(False)
+        self._set_countdown_urgent(False)
+
+    def _set_countdown_urgent(self, urgent: bool) -> None:
+        """切换倒计时的“最后 10 秒”红色状态。"""
+        label = getattr(self, "countdown_label", None)
+        if label is None:
+            return
+        value = "true" if urgent else "false"
+        if label.property("urgent") == value:
+            return
+        label.setProperty("urgent", value)
+        label.style().unpolish(label)
+        label.style().polish(label)
+        label.update()
+
+    def _show_countdown(self, seconds: int, snapshot: GameSnapshot) -> None:
+        """显示本手倒计时，并在最后几秒逐秒提示。"""
+        label = getattr(self, "countdown_label", None)
+        if label is None:
+            return
+        seconds = max(0, int(seconds))
+        label.setText(str(seconds))
+        self._set_countdown_urgent(seconds <= COUNTDOWN_URGENT_SECONDS)
+        label.setVisible(True)
+        self._maybe_beep_countdown(seconds, snapshot)
+
+    def _maybe_beep_countdown(
+        self, seconds: int, snapshot: GameSnapshot
+    ) -> None:
+        """最后 10 秒逐秒响一次“咚”。
+
+        只在自己的回合响：等对手落子时响提示音会让人误以为是自己要
+        超时了。同一秒只响一次；进入新的一手后重新开始计数。
+        """
+        if seconds > COUNTDOWN_URGENT_SECONDS:
+            return
+        if not self._countdown_is_mine(snapshot):
+            return
+        if self._countdown_beep_second == seconds:
+            return
+        self._countdown_beep_second = seconds
+        get_audio_manager().play_tick()
+
+    def _countdown_is_mine(self, snapshot: GameSnapshot) -> bool:
+        """当前这一手是否轮到自己（观战者不算）。"""
+        session = self._session
+        if session is None or session.is_spectator:
+            return False
+        return snapshot.current_player is snapshot.your_color
 
     def _fischer_clock_text(self, snapshot: GameSnapshot) -> str:
         """Fischer 双方余量：只减去走子方从快照以来的本地耗时。"""

@@ -44,8 +44,28 @@ def online_victory_notice(
     return None
 
 
+def online_timeout_notice(
+    snapshot: Optional[GameSnapshot],
+) -> Optional[tuple[str, str]]:
+    """超时判负时返回提示弹窗的标题与正文。
+
+    超时的一方判负，对手获胜，因此双方都会看到弹窗：胜方看到“对手
+    超时”，负方看到“本手超时”。不是超时结束的对局返回 None。
+    """
+    if snapshot is None or not snapshot.is_game_over:
+        return None
+    if snapshot.result_reason != "timeout":
+        return None
+    if snapshot.winner is None or snapshot.your_color is None:
+        return None
+    if snapshot.winner is snapshot.your_color:
+        return ("对手超时", "对手本手超时未落子，你获胜！")
+    return ("本手超时", "本手超时未落子，本局判负。")
+
+
 __all__ = [
     "CHAT_INPUT_HINT",
     "empty_view",
+    "online_timeout_notice",
     "online_victory_notice",
 ]

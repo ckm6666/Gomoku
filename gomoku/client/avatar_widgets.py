@@ -8,6 +8,7 @@ from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
+    QFontMetrics,
     QIcon,
     QImage,
     QPainter,
@@ -172,7 +173,7 @@ def avatar_icon(
 
 
 class AvatarView(QLabel):
-    """只读头像控件，可在右下角显示在线状态点。"""
+    """只读头像控件，可在右下角显示在线状态点、右上角挂未读红点。"""
 
     def __init__(
         self,
@@ -192,6 +193,7 @@ class AvatarView(QLabel):
         self._avatar_version = max(0, int(avatar_version))
         self._ring = ring
         self._online = online
+        self._unread = 0
         self.setFixedSize(self._size, self._size)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         avatar_image_cache().image_loaded.connect(self._on_image_loaded)
@@ -231,27 +233,84 @@ class AvatarView(QLabel):
         self._online = online
         self.update()
 
-    def paintEvent(self, event) -> None:  # noqa: N802 - Qt 接口
-        super().paintEvent(event)
-        if self._online is None:
+    @property
+    def unread(self) -> int:
+        """当前显示的未读条数（0 表示没有未读）。"""
+        return self._unread
+
+    def set_unread(self, count: int) -> None:
+        """在头像右上角挂一个红点，圆点里写未读消息条数。"""
+        try:
+            value = int(count)
+        except (TypeError, ValueError):
+            value = 0
+        value = max(0, value)
+        if value == self._unread:
             return
-        radius = max(3.0, self._size * 0.10)
-        center = QPointF(
-            self._size - radius - 1.5,
-            self._size - radius - 1.5,
+        self._unread = value
+        self.update()
+
+    def _draw_unread_badge(self, painter: QPainter) -> None:
+        """画未读红点：单个数字是圆点，多位数字是胶囊，角标写条数。"""
+        if self._unread <= 0:
+            return
+        text = "99+" if self._unread > 99 else str(self._unread)
+        radius = max(5.0, self._size * 0.20)
+        font = QFont()
+        font.setBold(True)
+        font.setPixelSize(max(8, int(radius * 1.15)))
+        painter.setFont(font)
+        metrics = QFontMetrics(font)
+        text_width = metrics.horizontalAdvance(text)
+        # 数字越长角标越宽，但始终保持贴住右上角。
+        width = max(radius * 2.0, text_width + radius * 0.9)
+        height = radius * 2.0
+        rect = QRectF(
+            self._size - width - 0.5,
+            0.5,
+            width,
+            height,
         )
-        painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(
             QPen(
                 QColor(PAPER_LIGHT),
-                max(1.0, self._size * 0.045),
+                max(1.0, self._size * 0.035),
             )
         )
-        painter.setBrush(
-            QColor("#4F8A5B" if self._online else "#A89C8B")
+        painter.setBrush(QColor("#C0392B"))
+        painter.drawRoundedRect(rect, height / 2.0, height / 2.0)
+        painter.setPen(QColor("#FBF7EE"))
+        painter.drawText(
+            rect,
+            Qt.AlignmentFlag.AlignCenter,
+            text,
         )
-        painter.drawEllipse(center, radius, radius)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        super().paintEvent(event)
+        if self._online is None and self._unread <= 0:
+            return
+        painter = QPainter(self)
+        if self._online is not None:
+            radius = max(3.0, self._size * 0.10)
+            center = QPointF(
+                self._size - radius - 1.5,
+                self._size - radius - 1.5,
+            )
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(
+                QPen(
+                    QColor(PAPER_LIGHT),
+                    max(1.0, self._size * 0.045),
+                )
+            )
+            painter.setBrush(
+                QColor("#4F8A5B" if self._online else "#A89C8B")
+            )
+            painter.drawEllipse(center, radius, radius)
+        # 未读红点画在右上角：在线点在右下角，两者互不遮挡。
+        self._draw_unread_badge(painter)
         painter.end()
 
 
