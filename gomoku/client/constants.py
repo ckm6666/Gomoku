@@ -14,9 +14,23 @@ from typing import Final
 # ---------------------------------------------------------------------------
 APP_NAME: Final[str] = "五子棋"
 APP_TITLE: Final[str] = "五子棋 · 本地对弈与联机排位"
-APP_VERSION: Final[str] = "1.12.0"
+APP_VERSION: Final[str] = "1.13.0"
 APP_ORGANIZATION: Final[str] = "Gomoku"
 APP_STORAGE_NAME: Final[str] = "Gomoku"
+
+# ---------------------------------------------------------------------------
+# 更新检查（GitHub Releases）
+# ---------------------------------------------------------------------------
+# 版本信息只从 GitHub Releases 检索：安装包也由用户从发布页下载，
+# 客户端不经过游戏服务端分发新版本，服务端挂了也不影响更新检查。
+#: GitHub Releases「最新版本」API，匿名访问有频率限制（60 次/小时/IP）。
+GITHUB_RELEASE_API_URL: Final[str] = (
+    "https://api.github.com/repos/ckm6666/Gomoku/releases/latest"
+)
+#: 打开浏览器时使用的发布列表页。
+GITHUB_RELEASES_PAGE_URL: Final[str] = (
+    "https://github.com/ckm6666/Gomoku/releases/latest"
+)
 
 # ---------------------------------------------------------------------------
 # 棋盘绘制（15×15 棋盘常用的五个星位，使用 0 起始行列坐标）

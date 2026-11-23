@@ -4,6 +4,9 @@
 读取；打包产物（PyInstaller）在未配置任何地址时回落到固定的公网入口，源码运行
 仍走开发默认（本机 127.0.0.1:8000）。硬编码的只有服务器地址，不含任何密钥；
 配置中不包含密码、access token 或 refresh token。
+
+唯一可选的凭据是 ``GOMOKU_GITHUB_TOKEN``：只用于「检查更新」时提升 GitHub
+API 的匿名频率限制，不参与任何游戏逻辑，也不会被写进日志。
 """
 
 from __future__ import annotations
@@ -92,6 +95,8 @@ class AppConfig:
     ws_base_url: Optional[str] = None
     request_timeout_seconds: float = 10.0
     log_level: str = "INFO"
+    #: 可选的 GitHub token，仅用于「检查更新」时放宽 API 频率限制。
+    github_token: str = ""
 
     def __post_init__(self) -> None:
         """补齐联机地址：打包产物回落公网入口，单侧配置按同源推导另一侧。
@@ -166,6 +171,8 @@ class AppConfig:
             ws_base_url=ws_url,
             request_timeout_seconds=timeout,
             log_level=log_level,
+            # 可选：只为「检查更新」放宽 GitHub API 的匿名频率限制。
+            github_token=source.get("GOMOKU_GITHUB_TOKEN", "").strip(),
         )
 
 
