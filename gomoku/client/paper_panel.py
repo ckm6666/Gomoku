@@ -180,6 +180,11 @@ class PaperPanel(QWidget):
     def show(self) -> None:  # noqa: D102 - Qt 接口
         self._place()
         super().show()
+        # 面板都是宿主下的兄弟控件，Qt 按创建顺序层叠：新建的卡片天然盖在
+        # 旧卡片之上，但复用的旧卡片重新显示时不会自动抬起（比如先点过
+        # 资料、后开好友页，再在好友页里点资料，资料卡就压在好友页底下）。
+        # 这里显式提到最前，保证“最后被打开的卡片在最上层”。
+        self.raise_()
 
     def close(self) -> bool:  # noqa: D102 - Qt 接口
         """关闭面板：隐藏并发出 ``closed``。"""

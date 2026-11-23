@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from PySide6.QtCore import QSettings, Qt  # noqa: E402
+from PySide6.QtCore import QPoint, QSettings, Qt  # noqa: E402
 from PySide6.QtGui import QColor, QImage  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
@@ -44,6 +44,7 @@ from gomoku.client.online_panel import (  # noqa: E402
     OnlinePanel,
     OnlinePlayerCard,
 )
+from gomoku.client.paper_panel import PaperPanel  # noqa: E402
 from gomoku.client.private_chat_panel import PrivateChatPanel  # noqa: E402
 from gomoku.client.ui_theme import PaperCheckBox  # noqa: E402
 from gomoku.shared.rules import Player  # noqa: E402
@@ -1103,6 +1104,50 @@ class SocialPanelIsInWindowTests(unittest.TestCase):
         panel.close()
         self.assertEqual(seen, [True])
         self.assertFalse(panel.isVisible())
+
+
+class PanelStackingOrderTests(unittest.TestCase):
+    """浮层卡片必须按“最后打开的在上层”排列。
+
+    好友页、资料卡、私聊都是同一个宿主下的兄弟控件：Qt 按创建顺序层叠，
+    复用的旧卡片重新显示时不会自动抬起。所以在好友页里点资料时，
+    资料卡会压在好友页底下。这里锁住这个顺序。
+    """
+
+    @staticmethod
+    def _top_panel(host: QWidget, point: QPoint):
+        """返回该位置上最上层的浮层面板。"""
+        child = host.childAt(point)
+        while child is not None and not isinstance(child, PaperPanel):
+            child = child.parentWidget()
+        return child
+
+    def test_profile_card_lands_above_friends_panel(self) -> None:
+        host = QWidget()
+        host.resize(1000, 700)
+        host.show()
+        # 先点过资料（资料卡先建），再打开好友页。
+        profile = ProfilePanel(host)
+        profile.show()
+        friends = FriendsPanel(host)
+        friends.show()
+        # 再在好友页里点资料：复用旧资料卡并重新显示。
+        profile.show()
+
+        top = self._top_panel(host, profile.geometry().center())
+        self.assertIs(top, profile)
+
+    def test_friends_panel_lands_above_profile_card(self) -> None:
+        host = QWidget()
+        host.resize(1000, 700)
+        host.show()
+        profile = ProfilePanel(host)
+        profile.show()
+        friends = FriendsPanel(host)
+        friends.show()
+
+        top = self._top_panel(host, friends.geometry().center())
+        self.assertIs(top, friends)
 
 
 class _FakeConfirmDialog:
