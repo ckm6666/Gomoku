@@ -7,7 +7,6 @@ from typing import Any
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QComboBox,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -21,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from gomoku.client.avatar_widgets import AvatarButton
-from gomoku.client.ui_theme import PaperCheckBox
+from gomoku.client.ui_theme import PaperCheckBox, PaperComboBox
 from gomoku.shared.time_control import time_control_presets
 
 
@@ -150,7 +149,7 @@ def build_lobby_page(panel: Any) -> QWidget:
     time_row = QHBoxLayout()
     time_label = QLabel("时限", card)
     time_label.setObjectName("formLabel")
-    panel.turn_seconds_combo = QComboBox(card)
+    panel.turn_seconds_combo = PaperComboBox(card)
     for control in time_control_presets():
         panel.turn_seconds_combo.addItem(control.label(), control)
     panel.turn_seconds_combo.setCurrentIndex(1)

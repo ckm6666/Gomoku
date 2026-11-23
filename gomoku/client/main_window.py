@@ -24,16 +24,11 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Callable, Optional, Sequence
 
-from PySide6.QtCore import QPointF, Qt, QTimer, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QCloseEvent,
-    QColor,
     QDesktopServices,
     QKeySequence,
-    QPainter,
-    QPainterPath,
-    QPaintEvent,
-    QPen,
     QShortcut,
 )
 from PySide6.QtWidgets import (
@@ -83,11 +78,11 @@ from gomoku.client.sessions import (
     PuzzleSession,
 )
 from gomoku.client.sound_control import SoundButton
-from gomoku.client.theme_palette import INK_FAINT, INK_MUTED
 from gomoku.client.ui_theme import (
     GAME_BACKDROP_SPEC,
     MENU_BACKDROP_SPEC,
     InkBackdrop,
+    PaperComboBox,
     RicePaperCard,
 )
 from gomoku.client.update_dialog import UpdateAvailableDialog
@@ -121,41 +116,6 @@ class GameMode(Enum):
             GameMode.AI: "人机对战",
             GameMode.PUZZLE: "残局挑战",
         }[self]
-
-
-class ThemedComboBox(QComboBox):
-    """在自定义 QSS 下仍显示下拉箭头的组合框。
-
-    Qt 的部分样式在完全覆盖 QComboBox 背景/边框后会隐藏原生下拉箭头。
-    这里在原生绘制结束后用 QPainter 补一个轻量 V 形箭头，不依赖外部图片。
-    """
-
-    def paintEvent(self, event: QPaintEvent) -> None:
-        super().paintEvent(event)
-
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        color = (
-            QColor(INK_MUTED) if self.isEnabled() else QColor(INK_FAINT)
-        )
-        pen = QPen(
-            color,
-            1.4,
-            Qt.PenStyle.SolidLine,
-            Qt.PenCapStyle.RoundCap,
-            Qt.PenJoinStyle.RoundJoin,
-        )
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-
-        center_x = self.width() - 11.0
-        center_y = self.height() / 2.0
-        arrow = QPainterPath(QPointF(center_x - 3.5, center_y - 1.8))
-        arrow.lineTo(QPointF(center_x, center_y + 1.8))
-        arrow.lineTo(QPointF(center_x + 3.5, center_y - 1.8))
-        painter.drawPath(arrow)
-        painter.end()
 
 
 class PlayerCard(QFrame):
@@ -774,7 +734,7 @@ class MainWindow(QMainWindow):
         bar_layout.setContentsMargins(12, 6, 12, 6)
         bar_layout.setSpacing(14)
 
-        self.difficulty_combo = ThemedComboBox(settings_bar)
+        self.difficulty_combo = PaperComboBox(settings_bar)
         self.difficulty_combo.setObjectName("difficultyCombo")
         self.difficulty_combo.setAccessibleName("AI 难度")
         self.difficulty_combo.setToolTip("人机模式下 AI 的棋力与搜索强度")
@@ -782,7 +742,7 @@ class MainWindow(QMainWindow):
             self.difficulty_combo.addItem(difficulty.label, difficulty)
         self.difficulty_combo.setMinimumWidth(78)
 
-        self.first_combo = ThemedComboBox(settings_bar)
+        self.first_combo = PaperComboBox(settings_bar)
         self.first_combo.setObjectName("firstPlayerCombo")
         self.first_combo.setAccessibleName("先手方")
         self.first_combo.setToolTip("玩家先手执黑；AI 先手时玩家执白")
