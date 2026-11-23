@@ -6,7 +6,6 @@ from typing import Any
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -16,6 +15,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from gomoku.client.ui_theme import PaperCheckBox
 
 
 def _centered_card_page(panel: Any, card: QFrame) -> QWidget:
@@ -77,7 +78,7 @@ def build_auth_page(panel: Any) -> QWidget:
         card_layout.addWidget(label)
         card_layout.addWidget(widget)
 
-    panel.remember_password_checkbox = QCheckBox("记住密码", card)
+    panel.remember_password_checkbox = PaperCheckBox("记住密码", card)
     panel.remember_password_checkbox.setObjectName("rememberPasswordCheck")
     panel.remember_password_checkbox.setToolTip(
         "密码使用 Windows 凭据保护（DPAPI）加密后保存在本机，"

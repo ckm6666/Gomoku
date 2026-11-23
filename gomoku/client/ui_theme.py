@@ -30,19 +30,30 @@ from PySide6.QtGui import (
     QPixmap,
     QRadialGradient,
 )
-from PySide6.QtWidgets import QApplication, QFrame, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QFrame,
+    QStyle,
+    QStyleOptionButton,
+    QWidget,
+)
 
 from gomoku.client.styles import APP_STYLE
 from gomoku.client.theme_palette import (
     CINNABAR,
     CINNABAR_DARK,
+    DISABLED_BG,
+    DISABLED_TEXT,
     GOLD,
+    GOLD_DARK,
     INK,
     INK_MUTED,
     INK_SOFT,
     PAPER,
     PAPER_DEEP,
     PAPER_LIGHT,
+    PAPER_MUTED,
 )
 
 logger = logging.getLogger(__name__)
@@ -887,6 +898,51 @@ def render_result_backdrop(
 
     painter.end()
     return pixmap
+
+
+class PaperCheckBox(QCheckBox):
+    """水墨主题勾选框：纸色方框 + 墨色勾，不使用系统蓝色高亮。
+
+    Qt 原生勾选框的选中底色跟随系统强调色（Windows 上通常是蓝色），
+    与宣纸主题冲突。这里保留 QCheckBox 的文本/焦点行为，只把指示器
+    重绘成纸色方框，避免在 QSS 里引用图片资源。
+    """
+
+    _BOX_RADIUS = 3.0
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        rect = self.style().subElementRect(
+            QStyle.SubElement.SE_CheckBoxIndicator, option, self
+        )
+        if rect.isEmpty():
+            return
+        box = QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5)
+        enabled = self.isEnabled()
+        border = GOLD_DARK if enabled and self.hasFocus() else PAPER_MUTED
+        fill = PAPER_LIGHT if enabled else DISABLED_BG
+        painter.setPen(QPen(QColor(border), 1.0))
+        painter.setBrush(QBrush(QColor(fill)))
+        painter.drawRoundedRect(box, self._BOX_RADIUS, self._BOX_RADIUS)
+        if self.isChecked():
+            pen = QPen(
+                QColor(INK_SOFT if enabled else DISABLED_TEXT), 1.8
+            )
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            path = QPainterPath()
+            x, y = box.x(), box.y()
+            width, height = box.width(), box.height()
+            path.moveTo(x + width * 0.24, y + height * 0.54)
+            path.lineTo(x + width * 0.43, y + height * 0.74)
+            path.lineTo(x + width * 0.78, y + height * 0.30)
+            painter.drawPath(path)
+        painter.end()
 
 
 class InkBackdrop(QWidget):

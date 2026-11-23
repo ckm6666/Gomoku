@@ -41,6 +41,7 @@ from gomoku.client.online_panel import (  # noqa: E402
     OnlinePlayerCard,
 )
 from gomoku.client.private_chat_panel import PrivateChatPanel  # noqa: E402
+from gomoku.client.ui_theme import PaperCheckBox  # noqa: E402
 from gomoku.shared.rules import Player  # noqa: E402
 from gomoku.client.profile_panel import (  # noqa: E402
     AvatarPickerPanel,
@@ -1006,6 +1007,32 @@ class RememberPasswordUiTests(unittest.TestCase):
         )
         self.assertFalse(hasattr(panel, "remember_password_hint"))
         panel.close()
+
+    def test_checkbox_uses_paper_colors_instead_of_system_blue(
+        self,
+    ) -> None:
+        panel = OnlinePanel()
+        self.assertIsInstance(
+            panel.remember_password_checkbox, PaperCheckBox
+        )
+        panel.close()
+        box = PaperCheckBox("记住密码")
+        box.setChecked(True)
+        box.show()
+        QT_APP.processEvents()
+        image = box.grab().toImage()
+        # 指示器在左侧；宣纸/墨色都不应出现明显偏蓝的像素。
+        blue_pixels = 0
+        for y in range(image.height()):
+            for x in range(min(24, image.width())):
+                color = image.pixelColor(x, y)
+                if (
+                    color.blue() > color.red() + 40
+                    and color.blue() > color.green() + 40
+                ):
+                    blue_pixels += 1
+        self.assertEqual(blue_pixels, 0)
+        box.close()
 
 
 class LobbyTimeControlUiTests(unittest.TestCase):

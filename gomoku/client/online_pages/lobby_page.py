@@ -7,7 +7,6 @@ from typing import Any
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -22,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from gomoku.client.avatar_widgets import AvatarButton
+from gomoku.client.ui_theme import PaperCheckBox
 from gomoku.shared.time_control import time_control_presets
 
 
@@ -139,7 +139,7 @@ def build_lobby_page(panel: Any) -> QWidget:
     friend_hint.setObjectName("hintLabel")
     friend_hint.setWordWrap(True)
 
-    panel.allow_spectators_checkbox = QCheckBox(
+    panel.allow_spectators_checkbox = PaperCheckBox(
         "允许观战（会出现在对战广场）", card
     )
     panel.allow_spectators_checkbox.setObjectName(
