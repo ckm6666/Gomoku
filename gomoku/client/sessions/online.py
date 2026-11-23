@@ -949,9 +949,15 @@ class OnlineGameSession(GameSession):
             self.error.emit("服务器返回了无效房间码")
             return
         self._room_code = code
-        self._time_control = time_control_from_snapshot(
-            payload.get("time_control"), payload.get("turn_seconds")
-        )
+        # 时限只用于界面展示：解析失败不应中断建房流程，权威快照里
+        # 还会再带一次真正的时限。
+        try:
+            self._time_control = time_control_from_snapshot(
+                payload.get("time_control"), payload.get("turn_seconds")
+            )
+        except ProtocolError as exc:
+            logger.warning("服务器房间时限非法：%s", exc)
+            self._time_control = None
         self._waiting = True
         self._active = False
         self._snapshot = None

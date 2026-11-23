@@ -410,6 +410,8 @@ class OnlinePanel(InkBackdrop):
         # 回到登录页就不该再刷新对战广场了。
         self._live_refresh_timer.stop()
         self.auth_status_label.setText("")
+        # 退出登录或被强制重新登录后，把已保存的密码重新填回去。
+        self._restore_saved_login()
         self._refresh_auth_availability()
 
     def _show_lobby_page(self, message: str = "") -> None:
@@ -1780,19 +1782,37 @@ class OnlinePanel(InkBackdrop):
             self.password_edit.setText(password)
         self.remember_password_checkbox.setChecked(remember)
 
-    def _save_saved_login(self, username: str) -> None:
-        """按复选框状态保存或清除登录凭据。"""
+    def _restore_saved_login(self) -> None:
+        """回到登录页时重新填入已保存的密码。
+
+        登录成功后密码框会被清空；不重新填入的话，用户退出登录或被强制
+        重新登录后还得再输一遍密码，尽管它已经安全地存在本机。
+        """
+        remember, _username, password = load_login(self._settings)
+        if not remember or not password:
+            return
+        if not self.password_edit.text():
+            self.password_edit.setText(password)
+
+    def _save_saved_login(self, username: str) -> str:
+        """按复选框状态保存或清除登录凭据。
+
+        返回一条给用户看的提示（没有则返回空串）：密码没能安全加密时
+        不能让界面继续显示“已记住”，否则用户会以为密码已经存好。
+        """
         if not self.remember_password_checkbox.isChecked():
             clear_login(self._settings)
-            return
+            return ""
         if not username:
-            return
+            return ""
         if not save_login(
             self._settings, username, self.password_edit.text()
         ):
             logger.warning(
                 "登录密码无法通过 DPAPI 安全保存，本次仅记住用户名"
             )
+            return "当前环境无法安全保存密码，本次仅记住用户名"
+        return ""
 
     def _on_remember_password_toggled(self, checked: bool) -> None:
         """取消勾选时立即删除已保存的凭据。"""
@@ -1821,10 +1841,13 @@ class OnlinePanel(InkBackdrop):
         self._logging_out = False
         self._reconnect_attempts = 0
         # 密码编辑框马上就要清空；先按用户的选择保存凭据。
-        self._save_saved_login(session.user.username)
+        warning = self._save_saved_login(session.user.username)
         self.password_edit.clear()
         self._clear_profile_ui()
-        self._set_auth_status("登录成功，正在连接游戏服务器…")
+        status = "登录成功，正在连接游戏服务器…"
+        if warning:
+            status = f"{status}（{warning}）"
+        self._set_auth_status(status)
         self._set_auth_form_busy(True)
         self._start_ws_session()
 

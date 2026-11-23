@@ -16,11 +16,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from PySide6.QtCore import Qt  # noqa: E402
+from PySide6.QtCore import QSettings, Qt  # noqa: E402
 from PySide6.QtGui import QColor, QImage  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
+    QCheckBox,
     QFrame,
     QLabel,
     QPushButton,
@@ -1010,6 +1011,35 @@ class RememberPasswordUiTests(unittest.TestCase):
         self.assertFalse(hasattr(panel, "remember_password_hint"))
         panel.close()
 
+    def test_saved_password_is_restored_after_logout(self) -> None:
+        """退出登录后要把已保存的密码重新填回去。
+
+        登录成功后密码框会被清空；不补回来的话，用户每次退出登录都得
+        再输一遍密码，尽管它已经安全地存在本机。
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            panel = OnlinePanel()
+            try:
+                # 用独立的 ini 存凭据，别写到开发机的真实设置里。
+                panel._settings = QSettings(
+                    os.path.join(directory, "settings.ini"),
+                    QSettings.Format.IniFormat,
+                )
+                panel.username_edit.setText("alice")
+                panel.password_edit.setText("s3cret-pass")
+                panel.remember_password_checkbox.setChecked(True)
+                panel._save_saved_login("alice")
+                # 登录成功会清空密码框。
+                panel.password_edit.clear()
+                self.assertEqual(panel.password_edit.text(), "")
+
+                panel._show_auth_page()
+                self.assertEqual(panel.password_edit.text(), "s3cret-pass")
+                self.assertEqual(panel.username_edit.text(), "alice")
+            finally:
+                panel.remember_password_checkbox.setChecked(False)
+                panel.close()
+
     def test_checkbox_uses_paper_colors_instead_of_system_blue(
         self,
     ) -> None:
@@ -1034,6 +1064,43 @@ class RememberPasswordUiTests(unittest.TestCase):
                 ):
                     blue_pixels += 1
         self.assertEqual(blue_pixels, 0)
+        box.close()
+
+    def test_checkbox_paints_its_own_indicator(self) -> None:
+        """自绘指示器必须真的生效。
+
+        只断言"没有蓝色像素"是不够的：应用固定使用 Fusion 风格，原生
+        指示器本来就是灰黑色，同样没有蓝色像素。这里直接比较自绘方框
+        与原生 QCheckBox 的渲染结果。
+        """
+        native = QCheckBox("记住密码")
+        native.setChecked(True)
+        native.resize(120, 24)
+        native.show()
+        QT_APP.processEvents()
+        native_image = native.grab().toImage()
+
+        box = PaperCheckBox("记住密码")
+        box.setChecked(True)
+        box.resize(120, 24)
+        box.show()
+        QT_APP.processEvents()
+        paper_image = box.grab().toImage()
+
+        differences = 0
+        for y in range(
+            min(native_image.height(), paper_image.height())
+        ):
+            for x in range(
+                min(24, native_image.width(), paper_image.width())
+            ):
+                if (
+                    native_image.pixelColor(x, y)
+                    != paper_image.pixelColor(x, y)
+                ):
+                    differences += 1
+        self.assertGreater(differences, 0)
+        native.close()
         box.close()
 
     def test_checkbox_does_not_leak_native_indicator_pixels(self) -> None:

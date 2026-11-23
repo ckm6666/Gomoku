@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -70,3 +72,67 @@ class CredentialStoreTests(unittest.TestCase):
         self.assertFalse(remember)
         self.assertEqual(username, "")
         self.assertEqual(password, "")
+
+    def test_undecryptable_password_is_treated_as_not_remembered(self) -> None:
+        """密文失效时不能显示"已记住"却拿不出密码。
+
+        例如 Windows 账户密钥轮换后，原来的 DPAPI 密文再也解不开。
+        """
+        self.settings.setValue("online/remember_password", True)
+        self.settings.setValue("online/saved_username", "alice")
+        self.settings.setValue("online/saved_password", "dpapi:bm90LWRwYXBp")
+        self.settings.sync()
+
+        remember, username, password = load_login(self.settings)
+        self.assertFalse(remember)
+        self.assertEqual(username, "alice")
+        self.assertEqual(password, "")
+        # 失效的密文要被删掉，别让界面下次继续误判。
+        self.assertEqual(
+            self.settings.value("online/saved_password", "", type=str), ""
+        )
+
+    def test_module_imports_without_wintypes(self) -> None:
+        """非 Windows 上 ctypes.wintypes 不可用，模块必须仍能导入。
+
+        ctypes.wintypes 在非 Windows 上会因为 VARIANT_BOOL 的 'v' 类型
+        直接抛 ValueError；如果在模块级无条件导入它，整个客户端在非
+        Windows 平台上都会启动失败。
+        """
+        code = textwrap.dedent(
+            """
+            import sys
+
+            sys.path.insert(0, {root!r})
+            from PySide6.QtCore import QSettings  # 先加载 Qt，避免受平台影响
+
+            sys.platform = "linux"
+
+            class Blocker:
+                \"\"\"模拟非 Windows 上 import ctypes.wintypes 直接失败。\"\"\"
+
+                def find_spec(self, fullname, path=None, target=None):
+                    if fullname == "ctypes.wintypes":
+                        raise ValueError("_type_ 'v' not supported")
+                    return None
+
+            sys.meta_path.insert(0, Blocker())
+
+            from gomoku.client.credential_store import (
+                protect_password,
+                unprotect_password,
+            )
+
+            assert protect_password("secret") is None
+            assert unprotect_password("dpapi:AAAA") is None
+            print("ok")
+            """
+        ).format(root=str(PROJECT_ROOT))
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ok", result.stdout)

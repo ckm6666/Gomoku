@@ -698,6 +698,42 @@ class OnlineSessionTests(unittest.TestCase):
             session.shutdown()
             transport.close()
 
+    def test_room_created_with_bad_time_control_still_opens_room(
+        self,
+    ) -> None:
+        """时限字段非法时不能中断建房流程。
+
+        时限只用于界面展示；真正的时限会在权威快照里再下发一次。
+        这里如果抛异常，room_created 就不会发出去，大厅会一直卡在
+        "正在创建自建房…"。
+        """
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        try:
+            self._authenticate(transport, session)
+            codes: list[str] = []
+            session.room_created.connect(codes.append)
+            transport.receive(
+                make_message(
+                    SERVER_ROOM_CREATED,
+                    {
+                        "room_code": "ABC123",
+                        "game_id": "game-abc",
+                        "your_color": "black",
+                        "black_name": "tester",
+                        "white_name": "",
+                        "turn_seconds": 30,
+                        # per_move 少了 turn_seconds，属于非法时限。
+                        "time_control": {"mode": "per_move"},
+                    },
+                )
+            )
+            self.assertEqual(codes, ["ABC123"])
+            self.assertIsNone(session.time_control)
+        finally:
+            session.shutdown()
+            transport.close()
+
     def test_snapshot_then_ack_updates_view(self) -> None:
         transport = FakeTransport()
         session = OnlineGameSession(transport)

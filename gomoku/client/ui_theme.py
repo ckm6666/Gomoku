@@ -924,15 +924,23 @@ class PaperCheckBox(QCheckBox):
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         option = QStyleOptionButton()
         self.initStyleOption(option)
         rect = self.style().subElementRect(
             QStyle.SubElement.SE_CheckBoxIndicator, option, self
         )
         if rect.isEmpty():
+            # 样式没有给出指示器区域：没有可画的自绘方框，直接返回。
             return
+        painter = QPainter(self)
+        try:
+            self._paint_indicator(painter, rect)
+        finally:
+            painter.end()
+
+    def _paint_indicator(self, painter: QPainter, rect: QRect) -> None:
+        """把指示器画成纸色方框 + 墨色勾。"""
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         box = QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5)
         enabled = self.isEnabled()
         border = GOLD_DARK if enabled and self.hasFocus() else PAPER_MUTED
@@ -954,7 +962,6 @@ class PaperCheckBox(QCheckBox):
             path.lineTo(x + width * 0.43, y + height * 0.74)
             path.lineTo(x + width * 0.78, y + height * 0.30)
             painter.drawPath(path)
-        painter.end()
 
 
 class InkBackdrop(QWidget):
@@ -1108,6 +1115,7 @@ __all__ = [
     "InkBackdrop",
     "MENU_BACKDROP_SPEC",
     "ONLINE_BACKDROP_SPEC",
+    "PaperCheckBox",
     "RicePaperCard",
     "apply_app_theme",
     "assets_root",

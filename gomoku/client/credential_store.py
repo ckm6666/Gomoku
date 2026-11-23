@@ -11,10 +11,16 @@ import base64
 import ctypes
 import logging
 import sys
-from ctypes import wintypes
 from typing import Optional, Tuple
 
 from PySide6.QtCore import QSettings
+
+if sys.platform == "win32":
+    from ctypes import wintypes
+else:  # pragma: no cover - 非 Windows 平台没有 DPAPI
+    # ctypes.wintypes 在非 Windows 上会因 VARIANT_BOOL 的 'v' 类型直接
+    # 抛 ValueError，模块级导入会让整个客户端无法启动；这里按需再取。
+    wintypes = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +35,15 @@ _CRYPTPROTECT_UI_FORBIDDEN = 0x01
 
 
 class _DataBlob(ctypes.Structure):
+    """DPAPI 的 DATA_BLOB。
+
+    ``cbData`` 用 ``c_uint32`` 而不是 ``wintypes.DWORD``：DWORD 在 Windows
+    上是 4 字节无符号长整型，用定宽类型表达才能让本模块在非 Windows 上
+    也能被导入。
+    """
+
     _fields_ = [
-        ("cbData", wintypes.DWORD),
+        ("cbData", ctypes.c_uint32),
         ("pbData", ctypes.POINTER(ctypes.c_byte)),
     ]
 
@@ -46,6 +59,8 @@ def _blob(data: bytes) -> Tuple[_DataBlob, ctypes.Array]:
 
 def _dpapi(data: bytes, *, protect: bool) -> bytes:
     """调用 Windows DPAPI 加密/解密；失败时抛 ``OSError``。"""
+    if wintypes is None:  # pragma: no cover - 非 Windows 平台
+        raise OSError("DPAPI 仅在 Windows 上可用")
     crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     crypt32.CryptProtectData.restype = wintypes.BOOL
@@ -149,11 +164,24 @@ def save_login(
 
 
 def load_login(settings: QSettings) -> Tuple[bool, str, str]:
-    """读取登录信息，返回 ``(是否记住, 用户名, 密码)``。"""
+    """读取登录信息，返回 ``(是否记住, 用户名, 密码)``。
+
+    密文失效时（Windows 账户密钥轮换、密文被从别的机器拷过来等）
+    按“没有保存密码”处理：删掉失效的密文并返回空密码，避免界面显示
+    “已记住”却拿不出密码。用户名是明文，仍可继续显示。
+    """
     remember = bool(settings.value(KEY_REMEMBER, False, type=bool))
     username = settings.value(KEY_USERNAME, "", type=str) or ""
     token = settings.value(KEY_PASSWORD, "", type=str) or ""
-    password = unprotect_password(token) if remember and token else ""
+    if not remember:
+        return False, "", ""
+    password = unprotect_password(token) if token else ""
+    if password is None:
+        password = ""
+    if token and not password:
+        settings.remove(KEY_PASSWORD)
+        settings.sync()
+        remember = False
     return remember, username, password
 
 
