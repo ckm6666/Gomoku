@@ -663,7 +663,7 @@ class UIAndAITests(unittest.TestCase):
         self.assertFalse(self.window.first_combo.isEnabled())
 
     def test_menu_is_initial_page_with_six_entries(self) -> None:
-        """启动默认显示主菜单，六个入口顺序固定。"""
+        """启动默认显示主菜单，六个对局入口与"检查更新"顺序固定。"""
         self.assertIs(
             self.window.stack.currentWidget(), self.window.menu_page
         )
@@ -672,6 +672,7 @@ class UIAndAITests(unittest.TestCase):
         self.assertEqual(
             [button.text() for button in buttons],
             [
+                "检查更新",
                 "联机对战",
                 "双人对战",
                 "人机对战",

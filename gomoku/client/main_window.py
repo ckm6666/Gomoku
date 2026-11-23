@@ -19,12 +19,14 @@
 from __future__ import annotations
 
 import logging
+import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Callable, Optional, Sequence
 
-from PySide6.QtCore import QPointF, Qt, QTimer
+from PySide6.QtCore import QPointF, QSettings, Qt, QTimer
 from PySide6.QtGui import (
     QCloseEvent,
     QColor,
@@ -64,7 +66,12 @@ from gomoku.client.constants import (
     WINDOW_MIN_WIDTH,
     WINDOW_SCREEN_MARGIN,
 )
-from gomoku.client.modal_overlay import ModalOverlay, NoticeOverlay
+from gomoku.client.modal_overlay import (
+    RESULT_ACCEPTED,
+    RESULT_REJECTED,
+    ModalOverlay,
+    NoticeOverlay,
+)
 from gomoku.client.online_panel import OnlinePanel
 from gomoku.client.puzzle_bank import load_puzzle_bank
 from gomoku.client.puzzle_page import PuzzlePage
@@ -79,6 +86,13 @@ from gomoku.client.sessions import (
 )
 from gomoku.client.sound_control import SoundButton
 from gomoku.client.theme_palette import INK_FAINT, INK_MUTED
+from gomoku.client.update_dialog import DownloadProgressDialog, UpdateDialog
+from gomoku.client.update_installer import (
+    current_executable_path,
+    is_self_update_supported,
+    schedule_install,
+)
+from gomoku.client.update_service import UpdateService
 from gomoku.client.ui_theme import (
     GAME_BACKDROP_SPEC,
     MENU_BACKDROP_SPEC,
@@ -230,6 +244,15 @@ class PlayerCard(QFrame):
 class MainWindow(QMainWindow):
     """应用主窗口。"""
 
+    #: QSettings 中保存"已忽略版本"的键。
+    _UPDATE_IGNORED_KEY = "update/ignored_version"
+    #: QSettings 中保存"最近一次自动检查时间"的键。
+    _UPDATE_LAST_CHECK_KEY = "update/last_check"
+    #: 自动检查的最小间隔（小时）。
+    _UPDATE_CHECK_INTERVAL_HOURS = 6
+    #: 启动后延迟多久做第一次自动检查（毫秒）。
+    _UPDATE_STARTUP_DELAY_MS = 3000
+
     def __init__(
         self,
         config: Optional[AppConfig] = None,
@@ -255,6 +278,22 @@ class MainWindow(QMainWindow):
         self._replay_return_page: Optional[QWidget] = None
         # 当前正在显示的窗口内模态层（终局弹窗/确认框），供测试定位。
         self._active_modal: Optional[ModalOverlay] = None
+
+        # 自动更新：服务、弹窗与节流状态。更新功能失败不得影响启动。
+        self.update_service: Optional[UpdateService] = None
+        self._update_dialog: Optional[UpdateDialog] = None
+        self._download_dialog: Optional[DownloadProgressDialog] = None
+        self._pending_download = None
+        self._update_check_is_manual = False
+        self._download_canceled = False
+        self._download_ready_path = ""
+        self._download_error_message = ""
+        self._startup_check_timer: Optional[QTimer] = None
+        self._settings: Optional[QSettings] = None
+        try:
+            self._settings = QSettings()
+        except Exception:
+            logger.warning("读取更新设置失败", exc_info=True)
 
         # 对局配置：默认保持本地双人，切到人机模式后默认中等难度。
         self._game_mode = GameMode.LOCAL
@@ -283,6 +322,7 @@ class MainWindow(QMainWindow):
         self._create_shortcuts()
         self._sync_ui()
         self._apply_initial_geometry()
+        self._create_update_service()
 
     # ------------------------------------------------------------------
     # 兼容访问与基础状态
@@ -539,6 +579,19 @@ class MainWindow(QMainWindow):
         utility_row = QHBoxLayout()
         utility_row.setContentsMargins(0, 0, 2, 0)
         utility_row.addStretch(1)
+        self.menu_update_button = QPushButton("检查更新", page)
+        self.menu_update_button.setObjectName("menuUpdateButton")
+        self.menu_update_button.setAccessibleName("检查更新")
+        self.menu_update_button.setToolTip("检查是否有新版本")
+        self.menu_update_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.menu_update_button.setMinimumHeight(30)
+        self.menu_update_button.setAutoDefault(False)
+        self.menu_update_button.clicked.connect(
+            lambda _checked=False: self._check_for_updates(manual=True)
+        )
+        utility_row.addWidget(
+            self.menu_update_button, 0, Qt.AlignmentFlag.AlignVCenter
+        )
         self.menu_sound_button = SoundButton(page)
         utility_row.addWidget(
             self.menu_sound_button, 0, Qt.AlignmentFlag.AlignVCenter
@@ -1561,6 +1614,370 @@ class MainWindow(QMainWindow):
     def active_modal(self) -> Optional[ModalOverlay]:
         """当前正在显示的窗口内模态层（测试用）。"""
         return self._active_modal
+
+    # ------------------------------------------------------------------
+    # 自动更新
+    # ------------------------------------------------------------------
+    def _create_update_service(self) -> None:
+        """创建更新服务；失败只记录日志，不阻断启动。
+
+        没有配置服务器地址（或更新清单地址）时不存在更新来源，
+        此时不创建服务，客户端也不会发起任何更新请求。
+        """
+        manifest_url = (self.config.update_manifest_url or "").strip()
+        if not manifest_url:
+            logger.info("未配置服务器地址，跳过更新服务初始化")
+            self.update_service = None
+            return
+        try:
+            service = UpdateService(
+                manifest_url,
+                APP_VERSION,
+                self.config.request_timeout_seconds,
+                parent=self,
+            )
+            self._connect_update_service(service)
+            self.update_service = service
+        except Exception:
+            logger.exception("初始化更新服务失败")
+
+    def _connect_update_service(self, service: UpdateService) -> None:
+        """把更新服务的信号接到主窗口的处理函数上。"""
+        service.update_available.connect(self._on_update_available)
+        service.up_to_date.connect(self._on_update_up_to_date)
+        service.check_failed.connect(self._on_update_check_failed)
+        service.download_progress.connect(self._on_update_download_progress)
+        service.download_ready.connect(self._on_update_download_ready)
+        service.download_failed.connect(self._on_update_download_failed)
+
+    def schedule_startup_update_check(self) -> None:
+        """启动后延迟几秒做一次自动更新检查（不打断首屏交互）。"""
+        try:
+            if self._startup_check_timer is not None:
+                return
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(self._UPDATE_STARTUP_DELAY_MS)
+            timer.timeout.connect(self._on_startup_update_check)
+            self._startup_check_timer = timer
+            timer.start()
+        except Exception:
+            logger.exception("安排启动自动检查更新失败")
+
+    def _on_startup_update_check(self) -> None:
+        """启动定时器触发：执行一次非手动检查。"""
+        self._startup_check_timer = None
+        self._check_for_updates(manual=False)
+
+    def _check_for_updates(self, manual: bool = False) -> None:
+        """检查是否有新版本；手动检查总是执行，自动检查受节流限制。"""
+        try:
+            self._update_check_is_manual = manual
+            service = self.update_service
+            if service is None:
+                if not (self.config.update_manifest_url or "").strip():
+                    # 没有更新来源：自动检查静默跳过，手动检查给出提示。
+                    logger.info("未配置服务器地址，跳过更新检查")
+                    if manual:
+                        self._show_update_message(
+                            "检查更新", "未配置服务器地址，无法检查更新"
+                        )
+                    return
+                logger.warning("更新服务不可用")
+                if manual:
+                    self._show_update_message(
+                        "检查更新", "更新功能不可用，请稍后再试"
+                    )
+                return
+            if not manual:
+                if not self.config.auto_check_updates:
+                    logger.info("自动检查更新已在配置中关闭")
+                    return
+                if self._checked_recently():
+                    logger.info("距上次自动检查不足 %s 小时，跳过",
+                                self._UPDATE_CHECK_INTERVAL_HOURS)
+                    return
+            service.check_for_update()
+        except Exception:
+            logger.exception("检查更新失败")
+            if manual:
+                self._show_update_message(
+                    "检查更新",
+                    f"检查更新失败（{self._update_address_text()}）：请稍后再试",
+                )
+
+    # ------------------------------------------------------------------
+    # 更新信号处理
+    # ------------------------------------------------------------------
+    def _on_update_available(self, info) -> None:
+        """发现新版本：弹出更新提示框。"""
+        try:
+            if not self._update_check_is_manual:
+                self._mark_checked()
+            ignored = self._ignored_update_version()
+            if ignored and info.version == ignored:
+                logger.info("版本 %s 已被忽略，不再提示", info.version)
+                return
+
+            dialog = UpdateDialog(
+                info, APP_VERSION, parent=self._overlay_host()
+            )
+            dialog.download_requested.connect(self._on_update_download_requested)
+            dialog.ignore_requested.connect(self._on_update_ignore_requested)
+            self._update_dialog = dialog
+            self._pending_download = None
+            self._active_modal = dialog
+            self._modal_dialog_open = True
+            try:
+                dialog.exec()
+            finally:
+                self._modal_dialog_open = False
+                self._active_modal = None
+                self._update_dialog = None
+                dialog.deleteLater()
+            pending = self._pending_download
+            self._pending_download = None
+            if pending is not None:
+                self._start_update_download(pending)
+        except Exception:
+            logger.exception("显示更新提示失败")
+
+    def _on_update_up_to_date(self, version: str) -> None:
+        """已是最新版本：手动检查时提示，自动检查只记录日志。"""
+        logger.info("当前已是最新版本 %s", version)
+        if self._update_check_is_manual:
+            self._show_update_message(
+                "检查更新", f"当前已是最新版本（{version}）"
+            )
+        else:
+            self._mark_checked()
+
+    def _on_update_check_failed(self, message: str) -> None:
+        """检查失败：手动检查时提示，自动检查只记录日志。"""
+        logger.warning("检查更新失败：%s", message)
+        if self._update_check_is_manual:
+            # 手动检查失败时把尝试过的地址一并显示，方便用户自查。
+            self._show_update_message(
+                "检查更新失败",
+                f"检查更新失败（{self._update_address_text()}）：{message}",
+            )
+        else:
+            self._mark_checked()
+
+    def _update_address_text(self) -> str:
+        """返回本次检查使用的更新清单地址（未配置时给出中文说明）。"""
+        url = (self.config.update_manifest_url or "").strip()
+        return url or "未配置服务器地址"
+
+    def _on_update_ignore_requested(self, info) -> None:
+        """用户选择忽略该版本：记住版本号，不再提示。"""
+        try:
+            self._save_setting(self._UPDATE_IGNORED_KEY, info.version)
+            logger.info("已忽略版本 %s", info.version)
+        except Exception:
+            logger.exception("保存忽略版本失败")
+
+    def _on_update_download_requested(self, info) -> None:
+        """用户在提示框里选择下载：记下请求，等提示框关闭后开始下载。"""
+        self._pending_download = info
+
+    # ------------------------------------------------------------------
+    # 下载与安装
+    # ------------------------------------------------------------------
+    def _start_update_download(self, info) -> None:
+        """开始下载更新包，并在窗口内的进度遮罩层显示下载进度。"""
+        service = self.update_service
+        if service is None:
+            return
+
+        self._download_canceled = False
+        self._download_ready_path = ""
+        self._download_error_message = ""
+
+        dialog: Optional[DownloadProgressDialog] = None
+        result = RESULT_REJECTED
+        try:
+            dialog = DownloadProgressDialog(parent=self._overlay_host())
+            dialog.cancel_requested.connect(self._on_update_download_cancel)
+            self._download_dialog = dialog
+            self._active_modal = dialog
+            self._modal_dialog_open = True
+            # 下载请求在模态循环内部发起：既保证信号能被处理，
+            # 也避免"信号先于 exec() 触发"导致遮罩层永远等不到关闭。
+            QTimer.singleShot(
+                0, lambda: self._begin_update_download(service, info, dialog)
+            )
+            dialog.exec()
+            result = dialog.result()
+        except Exception:
+            logger.exception("下载更新失败")
+            self._download_error_message = "开始下载更新失败，请重试"
+        finally:
+            self._modal_dialog_open = False
+            self._active_modal = None
+            self._download_dialog = None
+            if dialog is not None:
+                dialog.deleteLater()
+
+        # 用户按 Esc 关掉进度层时下载仍在后台继续，这里补一次取消。
+        if result != RESULT_ACCEPTED and not self._download_canceled:
+            self._on_update_download_cancel()
+
+        # 遮罩层收起后再提示，避免两层遮罩叠加。
+        ready_path = self._download_ready_path
+        self._download_ready_path = ""
+        error_message = self._download_error_message
+        self._download_error_message = ""
+        if ready_path:
+            self._install_downloaded_update(ready_path)
+        elif error_message and not self._download_canceled:
+            self._show_update_message("下载更新失败", error_message)
+
+    def _begin_update_download(
+        self, service: UpdateService, info, dialog: DownloadProgressDialog
+    ) -> None:
+        """在模态循环内真正发起下载请求。"""
+        if self._download_dialog is not dialog or self._download_canceled:
+            return
+        try:
+            service.download(info)
+        except Exception:
+            logger.exception("发起更新下载失败")
+            self._download_error_message = "开始下载更新失败，请重试"
+            dialog.accept()
+
+    def _on_update_download_progress(self, received: int, total: int) -> None:
+        """转发下载进度到进度遮罩层。"""
+        dialog = self._download_dialog
+        if dialog is None:
+            return
+        try:
+            dialog.set_progress(received, total)
+        except Exception:
+            logger.exception("更新下载进度失败")
+
+    def _on_update_download_cancel(self) -> None:
+        """用户取消下载：中止请求并结束进度遮罩层。"""
+        self._download_canceled = True
+        service = self.update_service
+        if service is not None:
+            try:
+                service.cancel()
+            except Exception:
+                logger.exception("取消更新下载失败")
+        dialog = self._download_dialog
+        if dialog is not None:
+            dialog.reject()
+
+    def _on_update_download_failed(self, message: str) -> None:
+        """下载失败：记录原因并结束进度遮罩层。"""
+        logger.warning("下载更新失败：%s", message)
+        self._download_error_message = message
+        dialog = self._download_dialog
+        if dialog is not None:
+            dialog.accept()
+
+    def _on_update_download_ready(self, info, path: str) -> None:
+        """下载完成：记录文件路径并结束进度遮罩层。"""
+        self._download_ready_path = path
+        dialog = self._download_dialog
+        if dialog is not None:
+            dialog.accept()
+
+    def _install_downloaded_update(self, path: str) -> None:
+        """安装已下载的更新包：支持自更新时重启安装，否则提示手动替换。"""
+        try:
+            executable = current_executable_path()
+            if is_self_update_supported() and executable is not None:
+                scheduled = schedule_install(
+                    Path(path), executable, os.getpid(), restart=True
+                )
+                if scheduled:
+                    self._show_update_message(
+                        "更新已下载", "更新已下载，重启后生效，正在退出…"
+                    )
+                    # 先走正常的关闭流程（停掉会话线程），再退出事件循环；
+                    # 否则残留的非守护线程会拖住进程退出，
+                    # 安装脚本也就等不到进程结束。
+                    self.close()
+                    app = QApplication.instance()
+                    if app is not None:
+                        app.quit()
+                    return
+                self._show_update_message(
+                    "更新已下载",
+                    f"自动安装失败，更新已下载到 {path}，"
+                    "请手动替换程序文件后重新运行",
+                )
+                return
+            self._show_update_message(
+                "更新已下载",
+                f"更新已下载到 {path}，请手动替换程序文件后重新运行",
+            )
+        except Exception:
+            logger.exception("安装更新失败")
+            self._show_update_message(
+                "更新已下载",
+                f"更新已下载到 {path}，请手动替换程序文件后重新运行",
+            )
+
+    def _show_update_message(self, title: str, message: str) -> None:
+        """显示一条更新相关提示（沿用窗口内提示遮罩，不弹原生消息框）。"""
+        try:
+            self._show_notice(title, message)
+        except Exception:
+            logger.exception("显示更新提示失败")
+
+    # ------------------------------------------------------------------
+    # 更新设置
+    # ------------------------------------------------------------------
+    def _ignored_update_version(self) -> str:
+        """读取用户忽略的版本号。"""
+        return self._read_setting(self._UPDATE_IGNORED_KEY)
+
+    def _checked_recently(self) -> bool:
+        """最近一次自动检查是否发生在节流窗口内。"""
+        raw = self._read_setting(self._UPDATE_LAST_CHECK_KEY)
+        if not raw:
+            return False
+        try:
+            last = datetime.fromisoformat(raw)
+        except ValueError:
+            return False
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return now - last < timedelta(hours=self._UPDATE_CHECK_INTERVAL_HOURS)
+
+    def _mark_checked(self) -> None:
+        """记录本次检查时间，用于自动检查节流。"""
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self._save_setting(self._UPDATE_LAST_CHECK_KEY, stamp)
+
+    def _read_setting(self, key: str) -> str:
+        """读取一条更新设置。"""
+        settings = self._settings
+        if settings is None:
+            return ""
+        try:
+            value = settings.value(key, "")
+        except Exception:
+            logger.warning("读取设置 %s 失败", key, exc_info=True)
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        return str(value).strip() if value else ""
+
+    def _save_setting(self, key: str, value: str) -> None:
+        """写入一条更新设置。"""
+        settings = self._settings
+        if settings is None:
+            return
+        try:
+            settings.setValue(key, value)
+            settings.sync()
+        except Exception:
+            logger.warning("保存设置 %s 失败", key, exc_info=True)
 
     # ------------------------------------------------------------------
     # 状态同步

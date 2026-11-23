@@ -104,6 +104,7 @@ def main() -> int:
         config.online_configured,
         log_path,
     )
+    logger.info("更新清单地址 %s", config.update_manifest_url or "未配置")
     logger.info(
         "主题字体 families=%s body_fonts=%s assets=%s",
         theme_families,
@@ -118,6 +119,8 @@ def main() -> int:
 
     window = MainWindow(config=config)
     window.show()
+    # 启动后延迟几秒做一次自动更新检查，不影响首屏交互。
+    window.schedule_startup_update_check()
     return app.exec()
 
 

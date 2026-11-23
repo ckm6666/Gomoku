@@ -148,7 +148,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install --require-hashes -r requirements-dev.lock
       - name: Build with PyInstaller
-        run: python build.py --fast
+        run: python build.py --fast --server-url https://ci.invalid --update-url https://ci.invalid/update.json --no-auto-update-check
+      - name: Verify built exe
+        run: python tools/build_test.py --skip-build --server-url https://ci.invalid --update-url https://ci.invalid/update.json --no-auto-update-check
       - name: Upload exe
         uses: actions/upload-artifact@v4
         with:
