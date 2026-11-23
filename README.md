@@ -624,7 +624,7 @@ server\.venv\Scripts\python.exe -m mypy gomoku/shared server/app
 ```
 
 GitHub Actions 会在 push/PR 时自动执行 ruff、mypy（shared + server）、
-Windows 客户端测试（Python 3.13/3.14）和 Linux 服务端测试（Python 3.13/3.14），
+Windows 客户端测试（Python 3.14）和 Linux 服务端测试（Python 3.14），
 并输出覆盖率、`dist/Gomoku.exe` 构建产物，以及 Docker 镜像启动/readiness
 smoke test；当前覆盖率基线约为客户端 71%、服务端 78%。
 

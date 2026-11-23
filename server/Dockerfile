@@ -4,7 +4,7 @@
 # 镜像同时安装 SQLite 与 PostgreSQL 驱动；生产推荐通过环境变量连接
 # PostgreSQL。运行参数和密钥只通过环境变量注入，不写入镜像。
 
-FROM python:3.13-slim
+FROM python:3.14-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
