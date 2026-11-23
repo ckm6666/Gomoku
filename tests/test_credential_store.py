@@ -92,39 +92,40 @@ class CredentialStoreTests(unittest.TestCase):
             self.settings.value("online/saved_password", "", type=str), ""
         )
 
-    def test_module_imports_without_wintypes(self) -> None:
-        """非 Windows 上 ctypes.wintypes 不可用，模块必须仍能导入。
+    def test_non_windows_platform_does_not_save_password(self) -> None:
+        """非 Windows 平台不保存密码，只记住用户名。
 
-        ctypes.wintypes 在非 Windows 上会因为 VARIANT_BOOL 的 'v' 类型
-        直接抛 ValueError；如果在模块级无条件导入它，整个客户端在非
-        Windows 平台上都会启动失败。
+        模块必须在非 Windows 上也能导入（客户端在 Linux/macOS 上仍要能
+        启动），只是不能保存密码。
         """
         code = textwrap.dedent(
             """
+            import os
             import sys
+            import tempfile
 
             sys.path.insert(0, {root!r})
-            from PySide6.QtCore import QSettings  # 先加载 Qt，避免受平台影响
+            from PySide6.QtCore import QSettings
 
             sys.platform = "linux"
 
-            class Blocker:
-                \"\"\"模拟非 Windows 上 import ctypes.wintypes 直接失败。\"\"\"
-
-                def find_spec(self, fullname, path=None, target=None):
-                    if fullname == "ctypes.wintypes":
-                        raise ValueError("_type_ 'v' not supported")
-                    return None
-
-            sys.meta_path.insert(0, Blocker())
-
             from gomoku.client.credential_store import (
+                load_login,
                 protect_password,
+                save_login,
                 unprotect_password,
             )
 
             assert protect_password("secret") is None
             assert unprotect_password("dpapi:AAAA") is None
+
+            path = os.path.join(tempfile.mkdtemp(), "settings.ini")
+            settings = QSettings(path, QSettings.Format.IniFormat)
+            assert save_login(settings, "alice", "secret") is False
+            remember, username, password = load_login(settings)
+            assert remember is True
+            assert username == "alice"
+            assert password == ""
             print("ok")
             """
         ).format(root=str(PROJECT_ROOT))

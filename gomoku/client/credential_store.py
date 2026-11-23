@@ -11,16 +11,10 @@ import base64
 import ctypes
 import logging
 import sys
+from ctypes import wintypes
 from typing import Optional, Tuple
 
 from PySide6.QtCore import QSettings
-
-if sys.platform == "win32":
-    from ctypes import wintypes
-else:  # pragma: no cover - 非 Windows 平台没有 DPAPI
-    # ctypes.wintypes 在非 Windows 上会因 VARIANT_BOOL 的 'v' 类型直接
-    # 抛 ValueError，模块级导入会让整个客户端无法启动；这里按需再取。
-    wintypes = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +31,9 @@ _CRYPTPROTECT_UI_FORBIDDEN = 0x01
 class _DataBlob(ctypes.Structure):
     """DPAPI 的 DATA_BLOB。
 
-    ``cbData`` 用 ``c_uint32`` 而不是 ``wintypes.DWORD``：DWORD 在 Windows
-    上是 4 字节无符号长整型，用定宽类型表达才能让本模块在非 Windows 上
-    也能被导入。
+    ``cbData`` 用定宽的 ``c_uint32`` 而不是 ``wintypes.DWORD``：DWORD 在
+    Windows 上是 4 字节，但 ``wintypes.DWORD`` 实际是 ``c_ulong``，在
+    LP64 平台（Linux/macOS）上会是 8 字节，结构体布局就错了。
     """
 
     _fields_ = [
@@ -59,8 +53,6 @@ def _blob(data: bytes) -> Tuple[_DataBlob, ctypes.Array]:
 
 def _dpapi(data: bytes, *, protect: bool) -> bytes:
     """调用 Windows DPAPI 加密/解密；失败时抛 ``OSError``。"""
-    if wintypes is None:  # pragma: no cover - 非 Windows 平台
-        raise OSError("DPAPI 仅在 Windows 上可用")
     crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     crypt32.CryptProtectData.restype = wintypes.BOOL
