@@ -29,7 +29,11 @@ from gomoku.shared.rules import Move, Player  # noqa: E402
 QT_APP = QApplication.instance() or QApplication([])
 
 
-def _record(winner: Player | None = Player.BLACK) -> GameRecord:
+def _record(
+    winner: Player | None = Player.BLACK,
+    *,
+    rule_mode: str = "freestyle",
+) -> GameRecord:
     moves = (
         Move(7, 3, Player.BLACK),
         Move(9, 3, Player.WHITE),
@@ -50,6 +54,7 @@ def _record(winner: Player | None = Player.BLACK) -> GameRecord:
         result_reason="five",
         black_name="黑棋",
         white_name="白棋",
+        rule_mode=rule_mode,
     )
 
 
@@ -122,6 +127,20 @@ class ReplayPanelTests(unittest.TestCase):
         try:
             self.assertIn("暂无", panel.move_info_label.text())
             self.assertFalse(panel.next_button.isEnabled())
+        finally:
+            panel.shutdown()
+
+    def test_renju_record_shows_rule_in_metadata(self) -> None:
+        """连珠棋谱在复盘元信息里标明规则；自由规则不追加。"""
+        panel = ReplayPanel([_record(rule_mode="renju")])
+        try:
+            self.assertIn("连珠", panel.meta_label.text())
+        finally:
+            panel.shutdown()
+
+        panel = ReplayPanel([_record()])
+        try:
+            self.assertNotIn("连珠", panel.meta_label.text())
         finally:
             panel.shutdown()
 

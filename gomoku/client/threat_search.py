@@ -28,6 +28,8 @@ from gomoku.shared.rules import (
     BOARD_SIZE,
     Player,
     find_winning_line,
+    in_bounds,
+    would_win,
 )
 
 Move = tuple[int, int]
@@ -110,39 +112,8 @@ class ThreatLine:
 # ---------------------------------------------------------------------------
 
 
-def _in_bounds(row: int, col: int) -> bool:
-    return 0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE
-
-
 def _copy_board(board: Sequence[Sequence[Player | None]]) -> list[list[Player | None]]:
     return [list(row) for row in board]
-
-
-def _would_win_at(
-    board: Sequence[Sequence[Player | None]],
-    row: int,
-    col: int,
-    player: Player,
-) -> bool:
-    """在空点落子是否立即五连；不修改棋盘。"""
-    if not _in_bounds(row, col) or board[row][col] is not None:
-        return False
-
-    for dr, dc in DIRECTIONS:
-        count = 1
-        r, c = row + dr, col + dc
-        while _in_bounds(r, c) and board[r][c] is player:
-            count += 1
-            r += dr
-            c += dc
-        r, c = row - dr, col - dc
-        while _in_bounds(r, c) and board[r][c] is player:
-            count += 1
-            r -= dr
-            c -= dc
-        if count >= 5:
-            return True
-    return False
 
 
 def _winning_points_through(
@@ -163,12 +134,12 @@ def _winning_points_through(
             if step == 0:
                 continue
             r, c = row + dr * step, col + dc * step
-            if not _in_bounds(r, c) or board[r][c] is not None:
+            if not in_bounds(r, c) or board[r][c] is not None:
                 continue
             point = (r, c)
             if point in seen:
                 continue
-            if _would_win_at(board, r, c, player):
+            if would_win(board, r, c, player):
                 seen.add(point)
                 points.append(point)
     return points
@@ -182,7 +153,7 @@ def _winning_points(
     return [
         (row, col)
         for row, col in neighbor_empty_cells(board)
-        if _would_win_at(board, row, col, player)
+        if would_win(board, row, col, player)
     ]
 
 
@@ -204,7 +175,7 @@ def _open_four_points_through(
             if step == 0:
                 continue
             r, c = row + dr * step, col + dc * step
-            if not _in_bounds(r, c) or board[r][c] is not None:
+            if not in_bounds(r, c) or board[r][c] is not None:
                 continue
             point = (r, c)
             if point in seen:
@@ -226,7 +197,7 @@ def _is_open_four_point(
     player: Player,
 ) -> bool:
     """该空点落子后是否形成活四（两个及以上成五点）。"""
-    if not _in_bounds(row, col) or board[row][col] is not None:
+    if not in_bounds(row, col) or board[row][col] is not None:
         return False
     board[row][col] = player
     try:
@@ -397,7 +368,7 @@ def verify_forced_line(
     turn = attacker
 
     for index, (row, col) in enumerate(line):
-        if not _in_bounds(row, col) or board[row][col] is not None:
+        if not in_bounds(row, col) or board[row][col] is not None:
             return False
 
         if turn is defender:
@@ -603,7 +574,7 @@ def verify_double_threat(
     """独立验证“落子后所有守方应手都无法化解双威胁”。"""
     board = _copy_board(board_snapshot)
     row, col = move
-    if not _in_bounds(row, col) or board[row][col] is not None:
+    if not in_bounds(row, col) or board[row][col] is not None:
         return False
 
     board[row][col] = attacker
@@ -692,7 +663,7 @@ def analyze_point(
     player: Player,
 ) -> Threat:
     """分析在空点落子后形成的最高威胁等级。"""
-    if not _in_bounds(row, col) or board_snapshot[row][col] is not None:
+    if not in_bounds(row, col) or board_snapshot[row][col] is not None:
         return Threat(ThreatKind.NONE, (row, col), (), ())
 
     board = _copy_board(board_snapshot)

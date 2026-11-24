@@ -207,14 +207,22 @@ def clear_refresh_token(settings: QSettings) -> None:
 def save_login(
     settings: QSettings, username: str, password: str
 ) -> bool:
-    """保存登录信息；返回密码是否已安全加密保存。"""
-    settings.setValue(KEY_REMEMBER, True)
-    settings.setValue(KEY_USERNAME, username)
+    """保存登录信息；返回密码是否已安全加密保存。
+
+    密码没能安全加密时（例如非 Windows 平台或 DPAPI 不可用），必须把
+    ``KEY_REMEMBER`` 一并写成 False：只删密码却留着“记住密码”标志，
+    下次启动界面会继续显示“已记住”，而自动登录根本拿不出密码。
+    用户名仍然保留，方便用户少输一次。
+    """
     token = protect_password(password)
     if token is None:
+        settings.setValue(KEY_REMEMBER, False)
+        settings.setValue(KEY_USERNAME, username)
         settings.remove(KEY_PASSWORD)
         settings.sync()
         return False
+    settings.setValue(KEY_REMEMBER, True)
+    settings.setValue(KEY_USERNAME, username)
     settings.setValue(KEY_PASSWORD, token)
     settings.sync()
     return True
@@ -226,12 +234,15 @@ def load_login(settings: QSettings) -> Tuple[bool, str, str]:
     密文失效时（Windows 账户密钥轮换、密文被从别的机器拷过来等）
     按“没有保存密码”处理：删掉失效的密文并返回空密码，避免界面显示
     “已记住”却拿不出密码。用户名是明文，仍可继续显示。
+
+    没有勾选“记住密码”时同样回填用户名：密码存不下来的场景下降级为
+    “仅记住用户名”，界面据此把复选框保持为未勾选。
     """
     remember = bool(settings.value(KEY_REMEMBER, False, type=bool))
     username = settings.value(KEY_USERNAME, "", type=str) or ""
     token = settings.value(KEY_PASSWORD, "", type=str) or ""
     if not remember:
-        return False, "", ""
+        return False, username, ""
     password = unprotect_password(token) if token else ""
     if password is None:
         password = ""

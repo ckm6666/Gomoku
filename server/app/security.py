@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import secrets
 import time
 import unicodedata
@@ -17,6 +18,8 @@ from argon2.exceptions import VerifyMismatchError
 
 from gomoku.shared.errors import ProtocolError
 from server.app.config import Settings
+
+logger = logging.getLogger(__name__)
 
 _PASSWORD_HASHER = PasswordHasher()
 
@@ -34,6 +37,27 @@ _verify_pool = ThreadPoolExecutor(
 _hash_pool = ThreadPoolExecutor(
     max_workers=_HASH_MAX_WORKERS, thread_name_prefix="pw-hash"
 )
+
+
+def shutdown_password_pools(wait: bool = False) -> None:
+    """关闭密码哈希/校验线程池。
+
+    线程池是进程级单例，只有在进程退出前才应该调用本函数——关闭之后
+    ``hash_password`` / ``verify_password`` 会直接抛
+    ``RuntimeError: cannot schedule new futures after shutdown``。
+    关闭失败只记调试日志并带上异常栈：退出阶段的清理失败不应该
+    掩盖真正的错误，但也不能悄无声息地消失。
+    """
+    for name, pool in (
+        ("verify", _verify_pool),
+        ("hash", _hash_pool),
+    ):
+        try:
+            pool.shutdown(wait=wait)
+        except Exception:
+            logger.debug(
+                "关闭密码线程池失败：%s", name, exc_info=True
+            )
 
 
 def normalize_username(raw: str) -> tuple[str, str]:
@@ -193,4 +217,5 @@ __all__ = [
     "generate_refresh_token",
     "create_access_token",
     "decode_access_token",
+    "shutdown_password_pools",
 ]

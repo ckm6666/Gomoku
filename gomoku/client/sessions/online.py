@@ -75,8 +75,15 @@ from gomoku.shared.protocol import (
     make_move_intent,
     parse_game_state,
     parse_message,
+    rule_mode_from_payload,
 )
-from gomoku.shared.rules import BOARD_SIZE, Cell, Player
+from gomoku.shared.rules import (
+    BOARD_SIZE,
+    Cell,
+    Player,
+    RuleMode,
+    parse_rule_mode,
+)
 from gomoku.shared.social import (
     SocialError,
     parse_direct_message,
@@ -163,6 +170,9 @@ class OnlineGameSession(GameSession):
         # 当前房间/对局的时限设置；等待房间由 room_created 下发，
         # 对局开始后以权威快照为准。
         self._time_control: Optional[TimeControl] = None
+        # 当前房间/对局的规则模式；等待房间由 room_created 下发，
+        # 对局开始后以权威快照为准。旧服务端不下发时保持自由规则。
+        self._rule_mode: RuleMode = RuleMode.FREESTYLE
         self._waiting = False
         self._your_color: Optional[Player] = None
         self._game_id: Optional[str] = None
@@ -259,6 +269,11 @@ class OnlineGameSession(GameSession):
     def time_control(self) -> Optional[TimeControl]:
         """当前房间/对局的时限；未知时为 None。"""
         return self._time_control
+
+    @property
+    def rule_mode(self) -> RuleMode:
+        """当前房间/对局的规则模式；未知时按自由规则处理。"""
+        return self._rule_mode
 
     @property
     def waiting_for_opponent(self) -> bool:
@@ -506,11 +521,14 @@ class OnlineGameSession(GameSession):
         turn_seconds: Optional[int] = None,
         *,
         time_control: Optional[TimeControl] = None,
+        rule_mode: RuleMode = RuleMode.FREESTYLE,
     ) -> bool:
         if not self._authenticated or self._closed:
             return False
         payload: dict[str, Any] = {
-            "allow_spectators": bool(allow_spectators)
+            "allow_spectators": bool(allow_spectators),
+            # 规则模式随建房请求提交；旧服务端会忽略未知字段。
+            "rule_mode": parse_rule_mode(rule_mode).value,
         }
         if time_control is not None:
             payload["time_control"] = time_control.to_payload()
@@ -796,6 +814,7 @@ class OnlineGameSession(GameSession):
         self._view = _empty_view()
         self._room_code = ""
         self._time_control = None
+        self._rule_mode = RuleMode.FREESTYLE
         self._waiting = False
         self._your_color = None
         self._game_id = None
@@ -958,6 +977,15 @@ class OnlineGameSession(GameSession):
         except ProtocolError as exc:
             logger.warning("服务器房间时限非法：%s", exc)
             self._time_control = None
+        # 规则模式同样只用于界面展示与本地提示：字段缺失或非法时退回
+        # 自由规则，绝不能中断建房流程；权威快照还会再带一次真正的规则。
+        try:
+            self._rule_mode = rule_mode_from_payload(
+                payload.get("rule_mode")
+            )
+        except ProtocolError as exc:
+            logger.warning("服务器房间规则模式非法：%s", exc)
+            self._rule_mode = RuleMode.FREESTYLE
         self._waiting = True
         self._active = False
         self._snapshot = None
@@ -1027,6 +1055,8 @@ class OnlineGameSession(GameSession):
         # 观战者的快照没有执子颜色（your_color 为 None），由 is_spectator 标记。
         self._spectating = bool(snapshot.is_spectator)
         self._snapshot = snapshot
+        # 对局开始后以权威快照里的规则为准（排位固定自由规则）。
+        self._rule_mode = snapshot.rule_mode
         self._active = True
         self._waiting = False
         self._disconnected = False
@@ -1228,6 +1258,7 @@ class OnlineGameSession(GameSession):
         self._spectating = False
         self._room_code = ""
         self._time_control = None
+        self._rule_mode = RuleMode.FREESTYLE
         self._waiting = False
         self._active = False
         self._snapshot = None

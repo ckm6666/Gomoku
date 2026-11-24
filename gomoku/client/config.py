@@ -22,14 +22,38 @@ from gomoku.shared.errors import ConfigurationError
 #: 打包后（PyInstaller）默认连接的公网入口，由 Tailscale Funnel 代理维护者
 #: 本机的 8000 端口。源码运行时仍走开发默认（127.0.0.1:8000），环境变量可覆盖。
 _PUBLIC_API_BASE_URL = "https://gomoku-host.taild407ad.ts.net"
-#: 与 GOMOKU_WS_BASE_URL 同语义：只含 scheme + host，"/api/v1/ws" 由客户端拼接。
+#: 与 GOMOKU_WS_BASE_URL 同语义：只含 scheme + host，WS 路径由客户端拼接。
 _PUBLIC_WS_BASE_URL = "wss://gomoku-host.taild407ad.ts.net"
 
 _API_TO_WS_SCHEME = {"https": "wss", "http": "ws"}
 _WS_TO_API_SCHEME = {"wss": "https", "ws": "http"}
 
+#: 服务端接口的版本号；升级到 v2 时只改这一处。
+API_VERSION = "v1"
+
+#: 所有 REST 接口的统一路径前缀。
+API_PREFIX = f"/api/{API_VERSION}"
+
+
+def api_path(*parts: str) -> str:
+    """把路径片段拼成带版本前缀的接口路径。
+
+    斜杠会被统一规范化，调用方写 ``"auth/login"`` 或 ``"/auth/login"``
+    得到的结果完全一致::
+
+        api_path("auth", "login")   # "/api/v1/auth/login"
+        api_path("/auth/login")     # "/api/v1/auth/login"
+
+    升级接口版本时只需要改 :data:`API_VERSION`，不必逐个文件改字符串。
+    """
+    segments = [part.strip("/") for part in parts if part and part.strip("/")]
+    if not segments:
+        return API_PREFIX
+    return f"{API_PREFIX}/" + "/".join(segments)
+
+
 #: 服务端 WebSocket 路径；客户端只需要主机部分，路径在这里统一拼接。
-WS_PATH = "/api/v1/ws"
+WS_PATH = f"{API_PREFIX}/ws"
 
 #: 开发环境在未配置地址时使用的本机服务端地址。
 DEV_API_BASE_URL = "http://127.0.0.1:8000"
@@ -45,8 +69,17 @@ _VALID_LOG_LEVELS = {
 }
 
 
-def _optional_url(value: str, schemes: set[str], field: str) -> Optional[str]:
-    """校验并规范化可选的 HTTP/WS 服务地址。"""
+def _optional_url(
+    value: str,
+    schemes: set[str],
+    field: str,
+) -> Optional[str]:
+    """校验并规范化可选的 HTTP/WS 服务地址。
+
+    地址只允许形如 ``scheme://host:port``：带了路径的话，客户端拼上
+    ``/api/v1/...`` 之后会得到一个服务端根本不提供的地址，属于配置错误，
+    这里直接拒绝并点名是哪个环境变量填错了。
+    """
     value = value.strip()
     if not value:
         return None
@@ -55,6 +88,11 @@ def _optional_url(value: str, schemes: set[str], field: str) -> Optional[str]:
     if parsed.scheme not in schemes or not parsed.netloc:
         allowed = "/".join(sorted(schemes))
         raise ConfigurationError(f"{field} 必须是 {allowed} URL")
+    if parsed.path.strip("/"):
+        raise ConfigurationError(
+            f"{field} 不能包含路径（当前为 {parsed.path}），"
+            "只能填写形如 scheme://host:port 的地址"
+        )
     return value.rstrip("/")
 
 
@@ -182,6 +220,9 @@ def resolve_endpoints(config: AppConfig) -> tuple[str, str]:
     返回 ``(api_base_url, ws_url)``：WebSocket 地址已带上 ``/api/v1/ws`` 路径。
     开发环境在完全没有配置地址时回落到本机服务端；打包产物此时已经带上内置
     的公网入口，不会再回落到本机。
+
+    WS 基址带路径时直接报错：拼出来的 ``wss://host/foo/api/v1/ws`` 服务端
+    从来不提供，报配置错误比让连接莫名其妙失败要好。
     """
     api = (config.api_base_url or "").rstrip("/")
     ws_base = (config.ws_base_url or "").rstrip("/")
@@ -195,15 +236,23 @@ def resolve_endpoints(config: AppConfig) -> tuple[str, str]:
         return api, ""
     if ws_base.endswith(WS_PATH):
         return api, ws_base
+    if urlparse(ws_base).path.strip("/"):
+        raise ConfigurationError(
+            "GOMOKU_WS_BASE_URL 不能包含路径，"
+            f"只能是形如 wss://host:port 的地址（当前为 {ws_base}）"
+        )
     return api, ws_base + WS_PATH
 
 
 __all__ = [
+    "API_PREFIX",
+    "API_VERSION",
     "AppConfig",
     "DEFAULT_API_BASE_URL",
     "DEFAULT_WS_BASE_URL",
     "DEV_API_BASE_URL",
     "WS_PATH",
+    "api_path",
     "derive_api_base_url",
     "derive_ws_base_url",
     "resolve_endpoints",

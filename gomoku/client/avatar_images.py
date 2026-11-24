@@ -242,10 +242,17 @@ def configure_avatar_images(api_base_url: str) -> None:
     avatar_image_cache().configure(api_base_url)
 
 
+def reset_for_tests() -> None:
+    """丢弃进程级头像缓存单例；仅供测试隔离使用。"""
+    global _cache
+    _cache = None
+
+
 __all__ = [
     "AvatarImageError",
     "AvatarImageCache",
     "avatar_image_cache",
     "configure_avatar_images",
     "prepare_avatar_image",
+    "reset_for_tests",
 ]

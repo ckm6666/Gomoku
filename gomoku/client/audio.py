@@ -23,7 +23,7 @@ import threading
 import wave
 from array import array
 from pathlib import Path
-from typing import Final, Literal, Optional
+from typing import Callable, Final, Literal, Mapping, Optional
 
 from PySide6.QtCore import (
     QEvent,
@@ -32,6 +32,7 @@ from PySide6.QtCore import (
     QSettings,
     QStandardPaths,
     Qt,
+    QThread,
     QTimer,
     QUrl,
     Signal,
@@ -61,6 +62,9 @@ except ImportError:  # pragma: no cover - 仅在缺少 QtMultimedia 的裁剪环
 
 logger = logging.getLogger(__name__)
 
+#: 尚未结束的解码线程：保留引用，避免 QThread 在运行中被析构。
+_orphaned_decode_threads: list["_AudioDecoderThread"] = []
+
 SoundKind = Literal["move", "start", "win", "lose", "draw", "tick", "bgm"]
 
 SAMPLE_RATE: Final[int] = 22050
@@ -68,6 +72,9 @@ SAMPLE_WIDTH: Final[int] = 2  # 16-bit PCM
 CHANNELS: Final[int] = 1
 AUDIO_CACHE_VERSION: Final[str] = "1"
 BGM_DURATION_SECONDS: Final[float] = 30.0
+
+#: 单个音频素材的解码超时时间（毫秒）。
+DECODE_TIMEOUT_MS: Final[int] = 15_000
 
 DEFAULT_BGM_VOLUME: Final[int] = 35
 DEFAULT_SFX_VOLUME: Final[int] = 70
@@ -595,34 +602,41 @@ def _trim_pcm16_silence(
     return samples[start:end]
 
 
-def decode_audio_to_wav_bytes(source: Path) -> Optional[bytes]:
-    """用 Qt 多媒体解码任意受支持音频（如 MP3）为单声道 16-bit WAV。
+def _decode_audio_bytes(
+    source: Path,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> Optional[bytes]:
+    """在当前线程里把素材解码为单声道 16-bit WAV 字节。
 
-    解码结果会裁掉首尾静音，保持素材原有音量；在主线程通过局部事件循环
-    等待解码完成，调用方应只在首次生成缓存时使用。
+    要求当前线程已经运行事件循环（``QThread.run`` 里即是）。解码器由
+    本线程创建，信号也在本线程投递——``QAudioDecoder`` 是 QObject，
+    不能跨线程创建或使用。
+
+    ``cancel_check`` 返回 True 时提前放弃解码（用于退出时打断后台任务）。
     """
-    if (
-        not _QT_MULTIMEDIA_AVAILABLE
-        or QAudioDecoder is None
-        or QGuiApplication.instance() is None
-    ):
-        return None
-
-    source_path = Path(source)
-    if not source_path.is_file():
-        return None
-
     decoder = QAudioDecoder()
-    decoder.setSource(QUrl.fromLocalFile(str(source_path)))
+    decoder.setSource(QUrl.fromLocalFile(str(source)))
     fragments: list[tuple[array, int]] = []
     errors: list[str] = []
-    state = {"timed_out": False}
+    state = {"timed_out": False, "cancelled": False}
     loop = QEventLoop()
     timeout = QTimer()
     timeout.setSingleShot(True)
     timeout.timeout.connect(
         lambda: (state.__setitem__("timed_out", True), loop.quit())
     )
+
+    # 轮询取消标志：QThread.requestInterruption() 不会打断事件循环，
+    # 需要定时器主动把循环退出。
+    poll = QTimer()
+    poll.setInterval(200)
+
+    def on_poll() -> None:
+        if cancel_check is not None and cancel_check():
+            state["cancelled"] = True
+            loop.quit()
+
+    poll.timeout.connect(on_poll)
 
     def collect_buffers() -> None:
         while decoder.bufferAvailable():
@@ -641,20 +655,26 @@ def decode_audio_to_wav_bytes(source: Path) -> Optional[bytes]:
     decoder.finished.connect(loop.quit)
     decoder.error.connect(on_error)
 
-    timeout.start(15_000)
+    timeout.start(DECODE_TIMEOUT_MS)
+    if cancel_check is not None:
+        poll.start()
     decoder.start()
     loop.exec()
     timeout.stop()
+    poll.stop()
     try:
         decoder.stop()
     except RuntimeError:
         pass
 
+    if state["cancelled"]:
+        logger.info("解码音频被取消：%s", source)
+        return None
     if state["timed_out"]:
-        logger.warning("解码音频超时：%s", source_path)
+        logger.warning("解码音频超时：%s", source)
         return None
     if errors:
-        logger.warning("解码音频失败：%s（%s）", source_path, errors[0])
+        logger.warning("解码音频失败：%s（%s）", source, errors[0])
         return None
     if not fragments:
         return None
@@ -671,6 +691,63 @@ def decode_audio_to_wav_bytes(source: Path) -> Optional[bytes]:
     if not merged:
         return None
     return _pcm16_wav_bytes(merged, sample_rate)
+
+
+class _AudioDecoderThread(QThread):
+    """在工作线程里完成一次音频解码。
+
+    ``QAudioDecoder`` 必须在创建它的线程里创建和使用，所以解码器由本
+    线程创建，本线程内部用一个局部事件循环等待解码结束；调用方不会
+    因为解码而在自己的线程里嵌套事件循环。
+    """
+
+    def __init__(
+        self, source: Path, parent: Optional[QObject] = None
+    ) -> None:
+        super().__init__(parent)
+        self._source = Path(source)
+        self._data: Optional[bytes] = None
+
+    @property
+    def data(self) -> Optional[bytes]:
+        """解码结果；失败时为 None。"""
+        return self._data
+
+    def run(self) -> None:
+        self._data = _decode_audio_bytes(
+            self._source, self.isInterruptionRequested
+        )
+
+
+def decode_audio_to_wav_bytes(source: Path) -> Optional[bytes]:
+    """用 Qt 多媒体解码任意受支持音频（如 MP3）为单声道 16-bit WAV。
+
+    解码结果会裁掉首尾静音，保持素材原有音量。解码本身跑在独立的工作
+    线程里：``QAudioDecoder`` 必须在创建它的线程内使用，而调用方不应该
+    为了解码而嵌套事件循环把界面卡住。
+
+    需要“不阻塞”的调用方（启动流程）应使用 :class:`_AssetDecodeWorker`。
+    """
+    if (
+        not _QT_MULTIMEDIA_AVAILABLE
+        or QAudioDecoder is None
+        or QGuiApplication.instance() is None
+    ):
+        return None
+
+    source_path = Path(source)
+    if not source_path.is_file():
+        return None
+
+    thread = _AudioDecoderThread(source_path)
+    thread.start()
+    if not thread.wait(DECODE_TIMEOUT_MS + 5000):
+        # 理论上不会走到这里（解码自带超时），但仍要保留线程引用，
+        # 避免 QThread 在运行中被析构。
+        logger.warning("解码音频超时：%s", source_path)
+        _orphaned_decode_threads.append(thread)
+        return None
+    return thread.data
 
 
 # ---------------------------------------------------------------------------
@@ -738,6 +815,17 @@ def ensure_decoded_wav(
     if data is None:
         return None
 
+    return _write_decoded_cache(kind, source_path, directory, data)
+
+
+def _write_decoded_cache(
+    kind: str,
+    source: Path,
+    directory: Path,
+    data: bytes,
+) -> Optional[Path]:
+    """把解码结果原子地写入缓存目录，返回缓存文件路径。"""
+    path = _decoded_cache_path(kind, source, directory)
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         temporary.write_bytes(data)
@@ -751,6 +839,60 @@ def ensure_decoded_wav(
         if not _is_valid_mono_wav(path):
             return None
     return path
+
+
+class _AssetDecodeWorker(QThread):
+    """在后台线程里解码内置音频素材并写入缓存。
+
+    启动流程不能被解码阻塞：解码在这个线程里完成，完成后把缓存路径
+    回报给主线程，由主线程装进音效池。
+    """
+
+    #: 解码完成：参数为（音效种类, 缓存文件路径）。
+    decoded = Signal(str, str)
+    #: 解码失败：参数为（音效种类, 素材文件名）。
+    failed = Signal(str, str)
+
+    def __init__(
+        self,
+        kind: str,
+        source: Path,
+        cache_dir: Optional[Path] = None,
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._kind = kind
+        self._source = Path(source)
+        self._cache_dir = cache_dir
+
+    def run(self) -> None:
+        source_path = self._source
+        try:
+            directory = (
+                Path(self._cache_dir)
+                if self._cache_dir is not None
+                else default_cache_dir()
+            )
+            directory.mkdir(parents=True, exist_ok=True)
+            path = _decoded_cache_path(self._kind, source_path, directory)
+            if not _is_valid_mono_wav(path):
+                data = _decode_audio_bytes(
+                    source_path, self.isInterruptionRequested
+                )
+                if data is None:
+                    self.failed.emit(self._kind, source_path.name)
+                    return
+                path = _write_decoded_cache(
+                    self._kind, source_path, directory, data
+                )
+        except Exception:
+            logger.exception("解码音频素材失败：%s", source_path)
+            self.failed.emit(self._kind, source_path.name)
+            return
+        if path is None:
+            self.failed.emit(self._kind, source_path.name)
+        else:
+            self.decoded.emit(self._kind, str(path))
 
 
 # ---------------------------------------------------------------------------
@@ -897,6 +1039,8 @@ class AudioManager(QObject):
         self._pending_oneshots: set[str] = set()
         self._error_logged: set[str] = set()
         self._click_filter: Optional[QObject] = None
+        # 后台解码内置素材的线程：解码不能阻塞启动。
+        self._decode_workers: list[_AssetDecodeWorker] = []
 
         self._bgm_file_ready.connect(
             self._on_bgm_file_ready,
@@ -965,16 +1109,26 @@ class AudioManager(QObject):
 
         if len(effects) > 1:
             # 落子/按钮音效允许短时间重叠，用轮换池避免互相打断。
-            effect = effects[self._sfx_pool_index % len(effects)]
+            index = self._sfx_pool_index % len(effects)
             self._sfx_pool_index = (self._sfx_pool_index + 1) % len(effects)
+            effect = effects[index]
         else:
             effect = effects[0]
 
         status = effect.status()
+        if status != QSoundEffect.Status.Ready:
+            # 轮到的实例还没加载好：池子里可能已经有别的实例就绪，
+            # 逐个查看所有实例，不要只看第 0 个。
+            for other in effects:
+                if other.status() == QSoundEffect.Status.Ready:
+                    other.play()
+                    return
         if status == QSoundEffect.Status.Ready:
             effect.play()
-        elif status == QSoundEffect.Status.Loading and kind != "move":
-            # 首次加载尚未完成时，就绪后补播一次；落子音效跳过避免积压。
+        elif status == QSoundEffect.Status.Loading:
+            # 首次加载尚未完成时，就绪后补播一次。
+            # _pending_oneshots 按音效种类去重，天然有界：同一种音效最多
+            # 挂起一次，不会因为连续落子而堆积。
             self._pending_oneshots.add(kind)
 
     # ------------------------------------------------------------------
@@ -1035,29 +1189,19 @@ class AudioManager(QObject):
     # 设备与资源
     # ------------------------------------------------------------------
     def _prepare_effects(self) -> None:
+        """准备音效池。
+
+        程序化合成音效很轻量，直接生成；内置 MP3 素材的解码放到后台
+        线程——``QAudioDecoder`` 必须在创建它的线程里使用，而首次运行
+        或缓存失效时的解码可能耗时十几秒，不能把启动过程卡住。
+        """
         effect_paths: dict[str, Path] = {}
 
-        # 落子音效：优先使用用户提供的 MP3，解码失败则回退到合成音效。
-        move_source = find_audio_asset(ASSET_MOVE)
-        move_path = (
-            self._decode_asset("move", move_source)
-            if move_source is not None
-            else None
-        )
-        if move_path is None:
-            try:
-                move_path = ensure_cached_wav("move", self._cache_dir)
-            except Exception:
-                logger.exception("生成落子音效失败，已跳过")
-        if move_path is not None:
-            effect_paths["move"] = move_path
-
-        # 按钮点击音效：素材缺失时静默跳过（不影响其它音效）。
-        button_source = find_audio_asset(ASSET_BUTTON)
-        if button_source is not None:
-            button_path = self._decode_asset("button", button_source)
-            if button_path is not None:
-                effect_paths["button"] = button_path
+        # 落子音效：先用程序化合成音效兜底，MP3 解码完成后再替换。
+        try:
+            effect_paths["move"] = ensure_cached_wav("move", self._cache_dir)
+        except Exception:
+            logger.exception("生成落子音效失败，已跳过")
 
         for kind in ("start", "win", "lose", "draw", "tick"):
             try:
@@ -1065,6 +1209,19 @@ class AudioManager(QObject):
             except Exception:
                 logger.exception("生成音效 %s 失败，已跳过", kind)
 
+        self._install_effects(effect_paths)
+
+        # 内置素材在后台线程解码：解码不阻塞启动，完成后再装进音效池。
+        for kind, asset in (("move", ASSET_MOVE), ("button", ASSET_BUTTON)):
+            source = find_audio_asset(asset)
+            if source is not None:
+                self._schedule_asset_decode(kind, source)
+
+        self._apply_volumes()
+        self._prepare_bgm()
+
+    def _install_effects(self, effect_paths: Mapping[str, Path]) -> None:
+        """按素材路径创建音效池实例。"""
         pool_sizes = {"move": 3, "button": 2}
         for kind, path in effect_paths.items():
             effects: list[QSoundEffect] = []
@@ -1073,33 +1230,66 @@ class AudioManager(QObject):
                 effect.setVolume(0.0)
                 effect.setSource(QUrl.fromLocalFile(str(path)))
                 effect.statusChanged.connect(
-                    lambda *args, k=kind: self._on_effect_status_changed(k)
+                    lambda *args, k=kind, e=effect: (
+                        self._on_effect_status_changed(k, e)
+                    )
                 )
                 effects.append(effect)
             self._effects[kind] = effects
 
-        self._apply_volumes()
-        self._prepare_bgm()
+    def _schedule_asset_decode(self, kind: str, source: Path) -> None:
+        """在后台线程解码内置素材，完成后回调装进音效池。"""
+        worker = _AssetDecodeWorker(kind, source, self._cache_dir, self)
+        worker.decoded.connect(self._on_asset_decoded)
+        worker.failed.connect(self._on_asset_decode_failed)
+        worker.finished.connect(
+            lambda w=worker: self._forget_decode_worker(w)
+        )
+        self._decode_workers.append(worker)
+        worker.start()
 
-    def _decode_asset(self, kind: str, source: Path) -> Optional[Path]:
+    def _forget_decode_worker(self, worker: _AssetDecodeWorker) -> None:
+        """回收已经结束的解码线程。"""
         try:
-            path = ensure_decoded_wav(kind, source, self._cache_dir)
-        except Exception:
-            logger.exception("解码音频素材失败：%s", source)
-            return None
-        if path is None:
-            logger.warning(
-                "无法将 %s 解码为 WAV，回退到合成音效", source.name
-            )
-        return path
+            self._decode_workers.remove(worker)
+        except ValueError:
+            pass
 
-    def _on_effect_status_changed(self, kind: str) -> None:
+    def _on_asset_decoded(self, kind: str, path: str) -> None:
+        """后台解码完成：把真实素材装进音效池。"""
+        if self._shutting_down or not self._available:
+            return
+        file_path = Path(path)
+        effects = self._effects.get(kind)
+        if not effects:
+            self._install_effects({kind: file_path})
+        else:
+            for effect in effects:
+                effect.setSource(QUrl.fromLocalFile(str(file_path)))
+        self._apply_volumes()
+
+    def _on_asset_decode_failed(self, kind: str, name: str) -> None:
+        """后台解码失败：保留程序化合成音效即可，不打扰用户。"""
+        logger.warning("无法将 %s 解码为 WAV，继续使用合成音效", name)
+
+    def _on_effect_status_changed(
+        self, kind: str, effect: QSoundEffect
+    ) -> None:
+        """某个音效实例的状态变化。
+
+        状态回调必须带上具体实例：音效池里同时有好几个实例，只看第 0
+        个会漏掉“第二个实例还没加载好”的情况。
+        """
         effects = self._effects.get(kind)
         if not effects:
             return
-        status = effects[0].status()
+        status = effect.status()
         if status == QSoundEffect.Status.Error:
-            if kind not in self._error_logged:
+            # 只有全部实例都失败才算这个音效不可用。
+            if all(
+                other.status() == QSoundEffect.Status.Error
+                for other in effects
+            ) and kind not in self._error_logged:
                 self._error_logged.add(kind)
                 logger.warning("音效 %s 加载失败，已静默跳过", kind)
             return
@@ -1109,7 +1299,7 @@ class AudioManager(QObject):
         ):
             self._pending_oneshots.discard(kind)
             if not self._shutting_down and not self._muted:
-                effects[0].play()
+                effect.play()
 
     def _prepare_bgm(self) -> None:
         # 优先使用用户提供的 MP3 BGM（长音频适合流式播放和原生循环）。
@@ -1266,6 +1456,22 @@ class AudioManager(QObject):
         self._shutting_down = True
         self._pending_oneshots.clear()
         self._stop_all()
+        self._stop_decode_workers()
+
+    def _stop_decode_workers(self) -> None:
+        """打断并等待后台解码线程，避免退出时线程仍在运行。"""
+        workers = list(self._decode_workers)
+        for worker in workers:
+            try:
+                worker.requestInterruption()
+            except RuntimeError:
+                continue
+        for worker in workers:
+            try:
+                if not worker.wait(3000):
+                    logger.warning("音频解码线程未能在超时前结束")
+            except RuntimeError:
+                continue
 
     # ------------------------------------------------------------------
     # UI 点击音效
@@ -1324,6 +1530,15 @@ def get_audio_manager() -> AudioManager:
     return _manager
 
 
+def reset_for_tests() -> None:
+    """关闭并丢弃应用级音频管理器；仅供测试隔离使用。"""
+    global _manager
+    manager = _manager
+    _manager = None
+    if manager is not None:
+        manager.shutdown()
+
+
 __all__ = [
     "ASSET_BGM",
     "ASSET_BUTTON",
@@ -1347,5 +1562,6 @@ __all__ = [
     "find_cached_wav",
     "get_audio_manager",
     "initialize_audio",
+    "reset_for_tests",
     "synthesize_sound",
 ]

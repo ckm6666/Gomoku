@@ -66,7 +66,7 @@ from gomoku.client.constants import (
 )
 from gomoku.client.board_view import BoardView
 from gomoku.client.ui_theme import make_seal_pixmap, paint_corner_ornament
-from gomoku.shared.rules import BOARD_SIZE, Player
+from gomoku.shared.rules import BOARD_SIZE, Player, in_bounds
 
 
 class BoardWidget(QWidget):
@@ -209,9 +209,11 @@ class BoardWidget(QWidget):
 
         self._draw_stone_shadows(painter)
         self._draw_stones(painter)
+        # 最后落子标记先画：胜利连线随后覆盖在它上面，连线才不会被
+        # 红点挡住中心（终局时标记还会缩小，两者都能看清）。
+        self._draw_last_move_marker(painter)
         self._draw_winning_line(painter)
         self._draw_hover_preview(painter)
-        self._draw_last_move_marker(painter)
         self._draw_hint_marker(painter)
         painter.end()
 
@@ -331,7 +333,7 @@ class BoardWidget(QWidget):
         col = int(round(col_float))
         row = int(round(row_float))
 
-        if not (0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE):
+        if not in_bounds(row, col):
             return None
 
         center = self._point_for(row, col)
@@ -676,6 +678,9 @@ class BoardWidget(QWidget):
             return
 
         radius = max(2.0, self._spacing * 0.075)
+        if len(self._view.winning_line) >= 2:
+            # 终局时胜利连线才是主角：把标记缩小一半，免得盖住连线中心。
+            radius *= 0.5
         center = self._point_for(last_move.row, last_move.col)
         painter.setPen(QPen(QColor(255, 250, 239, 150), max(0.8, radius * 0.24)))
         painter.setBrush(QBrush(QColor(LAST_MOVE_COLOR)))

@@ -45,14 +45,31 @@ class IpConnectionLimiter:
         connection_id: str,
         replacing_id: Optional[str] = None,
     ) -> bool:
+        """登记连接占用的 IP 配额。
+
+        替换旧连接（重连）时先判断"净增量"是否放得下：替换同一 IP 下的
+        旧连接不增加占用，否则净增 1。只有确认新连接放得下之后才释放旧
+        连接的配额——否则旧配额已经释放、新连接又被拒绝，用户会两头
+        落空，等于完全没有连接。
+        """
         if connection_id in self._connection_ips:
             return True
+        key = ip or "unknown"
+        connections = self._ip_connections.get(key)
+        current = len(connections) if connections is not None else 0
+        replacing = (
+            replacing_id is not None
+            and replacing_id != connection_id
+            and connections is not None
+            and replacing_id in connections
+        )
+        net_increment = 0 if replacing else 1
+        if current + net_increment > self._max_per_ip:
+            # 放不下就保持旧连接的原状：它继续占用配额，用户至少还在线。
+            return False
         if replacing_id is not None and replacing_id != connection_id:
             self.release(replacing_id)
-        key = ip or "unknown"
         connections = self._ip_connections.setdefault(key, set())
-        if len(connections) >= self._max_per_ip:
-            return False
         connections.add(connection_id)
         self._connection_ips[connection_id] = key
         return True

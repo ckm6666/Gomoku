@@ -107,6 +107,17 @@ QLabel#onlineRoomTitle {
     font-weight: bold;
 }
 
+/* 对局规则小标签：只在连珠模式下显示，紧跟房间标题。 */
+QLabel#gameRuleLabel {
+    color: #6B4725;
+    background-color: #F1E4CC;
+    border: 1px solid #B8934E;
+    border-radius: 8px;
+    padding: 2px 10px;
+    font-size: 12px;
+    font-weight: bold;
+}
+
 QLabel#onlineClock {
     color: #5A4A38;
     background-color: #F3EADA;

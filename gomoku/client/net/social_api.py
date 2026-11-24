@@ -1,20 +1,26 @@
-"""好友、公开资料、私聊消息与头像更新的异步 REST 客户端。"""
+"""好友、公开资料、私聊消息与头像更新的异步 REST 客户端。
+
+所有成功响应统一发 ``response_ready(kind, data)``；``kind`` 形如
+``user:<id>``、``friends``、``messages:<id>``，界面据此分发。
+
+地址拼接、Bearer 头、超时、JSON 解析与 reply 生命周期都由
+:class:`~gomoku.client.net.json_api.JsonApiClient` 统一处理，这里只保留
+社交相关的 endpoint、信号与响应映射。
+"""
 
 from __future__ import annotations
 
-import json
 from typing import Any, Mapping, Optional, Sequence
 from urllib.parse import quote
 
-from PySide6.QtCore import QByteArray, QObject, QUrl, Signal
-from PySide6.QtNetwork import (
-    QNetworkAccessManager,
-    QNetworkReply,
-    QNetworkRequest,
-)
+from PySide6.QtCore import QObject, Signal
+from PySide6.QtNetwork import QNetworkReply
+
+from gomoku.client.config import api_path
+from gomoku.client.net.json_api import JsonApiClient, ReplyOutcome
 
 
-class SocialHTTPClient(QObject):
+class SocialHTTPClient(JsonApiClient):
     """一个轻量的社交 REST 客户端。
 
     所有成功响应统一发 ``response_ready(kind, data)``；``kind`` 形如
@@ -26,16 +32,18 @@ class SocialHTTPClient(QObject):
     unauthorized = Signal(str)  # kind
     busy_changed = Signal(bool)
 
+    missing_base_url_message = "未配置联机服务器"
+    invalid_url_message = "联机服务器地址无效"
+    malformed_payload_message = "服务器响应格式异常"
+    default_error_message = "请求失败"
+
     def __init__(
         self,
         api_base_url: Optional[str],
         timeout_seconds: float = 10.0,
         parent: Optional[QObject] = None,
     ) -> None:
-        super().__init__(parent)
-        self._api_base_url = (api_base_url or "").rstrip("/")
-        self._timeout_seconds = timeout_seconds
-        self._manager = QNetworkAccessManager(self)
+        super().__init__(api_base_url, timeout_seconds, parent=parent)
         # 每个在途请求都有自己的令牌：同一 kind 的多个写请求（例如连续
         # 发两条私聊）可以同时在飞，不会互相顶掉。
         self._replies: dict[int, tuple[str, QNetworkReply]] = {}
@@ -54,7 +62,7 @@ class SocialHTTPClient(QObject):
         return self._start(
             f"user:{user_id}",
             "GET",
-            f"/api/v1/users/{quote(user_id, safe='')}",
+            api_path("users", quote(user_id, safe="")),
             access_token,
         )
 
@@ -62,7 +70,7 @@ class SocialHTTPClient(QObject):
         return self._start(
             "avatar",
             "PATCH",
-            "/api/v1/users/me/avatar",
+            api_path("users", "me", "avatar"),
             access_token,
             {"avatar": avatar},
         )
@@ -73,7 +81,7 @@ class SocialHTTPClient(QObject):
         return self._start(
             "avatar",
             "PUT",
-            "/api/v1/users/me/avatar-image",
+            api_path("users", "me", "avatar-image"),
             access_token,
             {"image": image_data_url},
         )
@@ -82,7 +90,7 @@ class SocialHTTPClient(QObject):
         return self._start(
             "avatar",
             "DELETE",
-            "/api/v1/users/me/avatar-image",
+            api_path("users", "me", "avatar-image"),
             access_token,
         )
 
@@ -90,12 +98,14 @@ class SocialHTTPClient(QObject):
         return self._start(
             "search",
             "GET",
-            f"/api/v1/users/search?q={quote(query, safe='')}",
+            api_path("users", "search") + f"?q={quote(query, safe='')}",
             access_token,
         )
 
     def fetch_friends(self, access_token: str) -> bool:
-        return self._start("friends", "GET", "/api/v1/friends", access_token)
+        return self._start(
+            "friends", "GET", api_path("friends"), access_token
+        )
 
     def send_friend_request(
         self, access_token: str, user_id: str
@@ -103,7 +113,7 @@ class SocialHTTPClient(QObject):
         return self._start(
             "friend_request",
             "POST",
-            "/api/v1/friends/requests",
+            api_path("friends", "requests"),
             access_token,
             {"user_id": user_id},
         )
@@ -114,7 +124,9 @@ class SocialHTTPClient(QObject):
         return self._start(
             "friend_accept",
             "POST",
-            f"/api/v1/friends/requests/{quote(request_id, safe='')}/accept",
+            api_path(
+                "friends", "requests", quote(request_id, safe=""), "accept"
+            ),
             access_token,
         )
 
@@ -124,7 +136,9 @@ class SocialHTTPClient(QObject):
         return self._start(
             "friend_decline",
             "POST",
-            f"/api/v1/friends/requests/{quote(request_id, safe='')}/decline",
+            api_path(
+                "friends", "requests", quote(request_id, safe=""), "decline"
+            ),
             access_token,
         )
 
@@ -132,7 +146,7 @@ class SocialHTTPClient(QObject):
         return self._start(
             "friend_remove",
             "DELETE",
-            f"/api/v1/friends/{quote(user_id, safe='')}",
+            api_path("friends", quote(user_id, safe="")),
             access_token,
         )
 
@@ -143,7 +157,8 @@ class SocialHTTPClient(QObject):
         return self._start(
             f"messages:{user_id}",
             "GET",
-            f"/api/v1/messages/{quote(user_id, safe='')}?limit={bounded}",
+            api_path("messages", quote(user_id, safe=""))
+            + f"?limit={bounded}",
             access_token,
         )
 
@@ -168,7 +183,7 @@ class SocialHTTPClient(QObject):
         return self._start(
             f"messages_read:{user_id}",
             "POST",
-            f"/api/v1/messages/{quote(user_id, safe='')}/read",
+            api_path("messages", quote(user_id, safe=""), "read"),
             access_token,
             {"message_ids": ids},
         )
@@ -179,7 +194,7 @@ class SocialHTTPClient(QObject):
         return self._start(
             f"message_send:{user_id}",
             "POST",
-            f"/api/v1/messages/{quote(user_id, safe='')}",
+            api_path("messages", quote(user_id, safe="")),
             access_token,
             {"content": content},
         )
@@ -188,7 +203,7 @@ class SocialHTTPClient(QObject):
         for token in list(self._replies):
             _kind, reply = self._replies.pop(token)
             reply.abort()
-            reply.deleteLater()
+            self.discard(reply)
         self._latest_get.clear()
         self.busy_changed.emit(False)
 
@@ -206,13 +221,10 @@ class SocialHTTPClient(QObject):
         if not access_token:
             self.failed.emit(kind, "登录状态失效，请重新登录")
             return False
-        if not self._api_base_url:
-            self.failed.emit(kind, "未配置联机服务器")
-            return False
 
-        url = QUrl(f"{self._api_base_url}{path}")
-        if url.scheme() not in ("http", "https") or not url.host():
-            self.failed.emit(kind, "联机服务器地址无效")
+        url, error = self.prepare_url(path)
+        if url is None:
+            self.failed.emit(kind, error)
             return False
 
         old_token = self._latest_get.get(kind) if method == "GET" else None
@@ -221,36 +233,13 @@ class SocialHTTPClient(QObject):
             stale = self._replies.pop(old_token, None)
             if stale is not None:
                 stale[1].abort()
-                stale[1].deleteLater()
+                self.discard(stale[1])
 
-        request = QNetworkRequest(url)
-        request.setRawHeader(
-            QByteArray(b"Authorization"),
-            QByteArray(f"Bearer {access_token}".encode("utf-8")),
+        reply = self.send_request(
+            method, url, token=access_token, payload=payload
         )
-        request.setTransferTimeout(int(self._timeout_seconds * 1000))
-        data = QByteArray()
-        if payload is not None:
-            request.setHeader(
-                QNetworkRequest.KnownHeaders.ContentTypeHeader,
-                "application/json",
-            )
-            data = QByteArray(
-                json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            )
-
-        if method == "GET":
-            reply = self._manager.get(request)
-        elif method == "POST":
-            reply = self._manager.post(request, data)
-        elif method in ("PATCH", "PUT"):
-            reply = self._manager.sendCustomRequest(
-                request, method.encode("ascii"), data
-            )
-        elif method == "DELETE":
-            reply = self._manager.deleteResource(request)
-        else:
-            self.failed.emit(kind, "不支持的请求方法")
+        if reply is None:
+            self.failed.emit(kind, self.unsupported_method_message)
             return False
 
         self._next_token += 1
@@ -268,70 +257,30 @@ class SocialHTTPClient(QObject):
         entry = self._replies.pop(token, None)
         if entry is None:
             # 已经被作废（例如同 kind 的新 GET 顶掉了它）：直接丢弃。
-            self._discard(reply)
+            self.discard(reply)
             return
         kind, _reply = entry
         if self._latest_get.get(kind) == token:
             self._latest_get.pop(kind, None)
         self.busy_changed.emit(bool(self._replies))
 
-        try:
-            status = reply.attribute(
-                QNetworkRequest.Attribute.HttpStatusCodeAttribute
-            )
-            raw = bytes(reply.readAll())
-            data: Any = {}
-            if raw:
-                try:
-                    data = json.loads(raw.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    data = {}
-            success = (
-                reply.error() == QNetworkReply.NetworkError.NoError
-                or (isinstance(status, int) and 200 <= status < 300)
-            )
-            if success:
-                if not isinstance(data, Mapping):
-                    data = {}
-                self.response_ready.emit(kind, dict(data))
-                return
+        self.handle_reply(
+            reply,
+            on_success=lambda data: self.response_ready.emit(
+                kind, dict(data)
+            ),
+            on_error=lambda outcome: self._on_error(kind, outcome),
+        )
 
-            message = self._extract_error(data) or "请求失败"
-            if status == 401:
-                # 401 交给令牌刷新处理：刷新成功后请求会被重放，这里再报
-                # 一遍错只会把“未提供认证凭据”推成红色错误提示。
-                self.unauthorized.emit(kind)
-                return
-            self.failed.emit(kind, message)
-        except RuntimeError:
-            # 宿主窗口已经销毁，reply 也跟着没了。槽函数里抛出的异常
-            # 会让 PySide 直接中止整个进程，这里必须静默收场。
+    def _on_error(self, kind: str, outcome: ReplyOutcome) -> None:
+        if outcome.status == 401:
+            # 401 交给令牌刷新处理：刷新成功后请求会被重放，这里再报
+            # 一遍错只会把“未提供认证凭据”推成红色错误提示。
+            self.unauthorized.emit(kind)
             return
-        finally:
-            self._discard(reply)
-
-    @staticmethod
-    def _discard(reply: QNetworkReply) -> None:
-        """安全地销毁 reply：它可能已经随宿主窗口一起没了。"""
-        try:
-            reply.deleteLater()
-        except RuntimeError:
-            pass
-
-    @staticmethod
-    def _extract_error(data: Any) -> str:
-        if isinstance(data, Mapping):
-            detail = data.get("detail")
-            if isinstance(detail, str):
-                return detail
-            if isinstance(detail, list):
-                parts = [
-                    item.get("msg", "")
-                    for item in detail
-                    if isinstance(item, Mapping)
-                ]
-                return "；".join(part for part in parts if part)
-        return ""
+        self.failed.emit(
+            kind, outcome.error_message or self.default_error_message
+        )
 
 
 __all__ = ["SocialHTTPClient"]

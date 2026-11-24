@@ -47,7 +47,7 @@ from gomoku.client.online_panel import (  # noqa: E402
 from gomoku.client.paper_panel import PaperPanel  # noqa: E402
 from gomoku.client.private_chat_panel import PrivateChatPanel  # noqa: E402
 from gomoku.client.ui_theme import PaperCheckBox, PaperComboBox  # noqa: E402
-from gomoku.shared.rules import Player  # noqa: E402
+from gomoku.shared.rules import Player, RuleMode  # noqa: E402
 from gomoku.client.profile_panel import (  # noqa: E402
     AvatarPickerPanel,
     ProfilePanel,
@@ -1479,6 +1479,7 @@ class LobbyTimeControlUiTests(unittest.TestCase):
 
         def __init__(self) -> None:
             self.created: list[object] = []
+            self.created_rule_modes: list[RuleMode] = []
 
         def supports(self, capability: str) -> bool:
             return True
@@ -1489,8 +1490,10 @@ class LobbyTimeControlUiTests(unittest.TestCase):
             turn_seconds: int | None = None,
             *,
             time_control: object = None,
+            rule_mode: RuleMode = RuleMode.FREESTYLE,
         ) -> bool:
             self.created.append(time_control)
+            self.created_rule_modes.append(rule_mode)
             return True
 
     def test_casual_time_control_selection_is_sent(self) -> None:
@@ -1514,6 +1517,91 @@ class LobbyTimeControlUiTests(unittest.TestCase):
         panel = OnlinePanel()
         self.assertIsInstance(panel.turn_seconds_combo, PaperComboBox)
         panel.close()
+
+
+class LobbyRuleModeUiTests(unittest.TestCase):
+    """自建房规则选择：默认自由规则，选中连珠时随建房请求提交。"""
+
+    class _FakeSession:
+        is_authenticated = True
+        in_room = False
+        queued = False
+        room_code = None
+
+        def __init__(self) -> None:
+            self.rule_modes: list[RuleMode] = []
+
+        def supports(self, capability: str) -> bool:
+            return True
+
+        def create_room(
+            self,
+            allow_spectators: bool,
+            turn_seconds: int | None = None,
+            *,
+            time_control: object = None,
+            rule_mode: RuleMode = RuleMode.FREESTYLE,
+        ) -> bool:
+            self.rule_modes.append(rule_mode)
+            return True
+
+    def test_rule_mode_combo_lists_both_modes(self) -> None:
+        panel = OnlinePanel()
+        try:
+            self.assertIsInstance(panel.rule_mode_combo, PaperComboBox)
+            self.assertEqual(panel.rule_mode_combo.count(), 2)
+            self.assertIs(
+                panel.rule_mode_combo.itemData(0), RuleMode.FREESTYLE
+            )
+            self.assertIs(panel.rule_mode_combo.itemData(1), RuleMode.RENJU)
+            # 默认自由规则，与既有建房行为一致。
+            self.assertEqual(panel.rule_mode_combo.currentIndex(), 0)
+        finally:
+            panel.close()
+
+    def test_default_create_room_sends_freestyle(self) -> None:
+        panel = OnlinePanel()
+        session = self._FakeSession()
+        panel._session = session  # type: ignore[assignment]
+        try:
+            panel._on_create_room()
+            self.assertEqual(session.rule_modes, [RuleMode.FREESTYLE])
+        finally:
+            panel.close()
+
+    def test_selected_renju_rule_is_sent(self) -> None:
+        panel = OnlinePanel()
+        session = self._FakeSession()
+        panel._session = session  # type: ignore[assignment]
+        try:
+            panel.rule_mode_combo.setCurrentIndex(1)
+            panel._on_create_room()
+            self.assertEqual(session.rule_modes, [RuleMode.RENJU])
+        finally:
+            panel.close()
+
+    def test_recent_games_table_marks_renju(self) -> None:
+        """最近对局表用悬停提示标出连珠对局，不新增列。"""
+        panel = OnlinePanel()
+        try:
+            panel._fill_recent_games(
+                [
+                    {
+                        "game_id": "game-renju",
+                        "rated": False,
+                        "opponent_username": "对手",
+                        "result": "win",
+                        "move_no": 9,
+                        "ended_at": "2026-01-01T00:00:00",
+                        "rule_mode": "renju",
+                    }
+                ],
+                1,
+            )
+            item = panel.recent_games_table.item(0, 3)
+            self.assertIn("连珠", item.toolTip())
+        finally:
+            panel.close()
 
 
 class ReportAndReviewPanelTests(unittest.TestCase):

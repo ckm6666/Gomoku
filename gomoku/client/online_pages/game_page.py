@@ -40,6 +40,11 @@ def build_game_page(panel: Any) -> QWidget:
     top = QHBoxLayout()
     panel.room_title_label = QLabel("自建房", page)
     panel.room_title_label.setObjectName("onlineRoomTitle")
+    # 规则标签：只在连珠模式下显示，放在房间标题后面作为小标签。
+    panel.game_rule_label = QLabel("", page)
+    panel.game_rule_label.setObjectName("gameRuleLabel")
+    panel.game_rule_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    panel.game_rule_label.setVisible(False)
     panel.invite_friend_button = QPushButton("邀请好友", page)
     panel.invite_friend_button.setObjectName("smallButton")
     panel.invite_friend_button.setCursor(
@@ -51,6 +56,7 @@ def build_game_page(panel: Any) -> QWidget:
     panel.connection_label.setObjectName("onlineStatus")
     panel.connection_label.setAlignment(Qt.AlignmentFlag.AlignRight)
     top.addWidget(panel.room_title_label)
+    top.addWidget(panel.game_rule_label)
     top.addWidget(panel.invite_friend_button)
     top.addStretch(1)
     top.addWidget(panel.connection_label)
@@ -252,7 +258,6 @@ def build_game_page(panel: Any) -> QWidget:
     panel.chat_log_toggle_button.toggled.connect(
         panel._on_chat_log_toggled
     )
-    # 对话日志默认收起：棋盘可以占满整行，需要时再点开。
-    panel._apply_chat_log_visibility(panel._load_chat_log_visible())
-    panel._refresh_chat_controls()
+    # 对话日志默认收起；初始可见性与聊天控件状态在控制器构造后由
+    # OnlinePanel 统一同步（见 OnlinePanel.__init__）。
     return page

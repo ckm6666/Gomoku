@@ -52,8 +52,12 @@ class LocalRecordStore:
     def path(self) -> Path:
         return self._directory / _RECORDS_FILENAME
 
-    def append(self, record: GameRecord) -> None:
-        """追加一条棋谱；写入失败时记录日志但不向 UI 抛异常。"""
+    def append(self, record: GameRecord) -> bool:
+        """追加一条棋谱；返回是否写入成功。
+
+        写入失败时记录日志并返回 False——调用方必须把失败告诉用户，
+        否则用户会以为棋谱已经保存，实际却什么都没落盘。
+        """
         try:
             self._directory.mkdir(parents=True, exist_ok=True)
             line = json.dumps(
@@ -65,8 +69,9 @@ class LocalRecordStore:
                 handle.write(line + "\n")
         except OSError:
             logger.exception("写入本地棋谱失败 path=%s", self.path)
-            return
+            return False
         self._prune_if_needed()
+        return True
 
     def list_recent(self, limit: int = 50) -> tuple[GameRecord, ...]:
         """按创建时间倒序返回最近棋谱。"""

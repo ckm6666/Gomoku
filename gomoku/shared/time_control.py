@@ -76,16 +76,40 @@ class TimeControl:
 
     @classmethod
     def per_move(cls, seconds: int) -> "TimeControl":
-        return cls(mode=MODE_PER_MOVE, turn_seconds=int(seconds))
+        """构造每手限时。
+
+        工厂方法不做 ``int()`` 之类的静默转换：``"30"``、``30.9`` 这类
+        输入会被拒绝，保证客户端与服务端对同一配置得到完全相同的数值。
+        """
+        return cls(
+            mode=MODE_PER_MOVE,
+            turn_seconds=_require_int(
+                seconds,
+                "每手时间",
+                PER_MOVE_MIN_SECONDS,
+                PER_MOVE_MAX_SECONDS,
+            ),
+        )
 
     @classmethod
     def fischer(
         cls, main_seconds: int, increment_seconds: int = 0
     ) -> "TimeControl":
+        """构造 Fischer 时限；参数规则与 :meth:`per_move` 一致。"""
         return cls(
             mode=MODE_FISCHER,
-            main_seconds=int(main_seconds),
-            increment_seconds=int(increment_seconds),
+            main_seconds=_require_int(
+                main_seconds,
+                "总时长",
+                FISCHER_MIN_MAIN_SECONDS,
+                FISCHER_MAX_MAIN_SECONDS,
+            ),
+            increment_seconds=_require_int(
+                increment_seconds,
+                "加秒",
+                FISCHER_MIN_INCREMENT_SECONDS,
+                FISCHER_MAX_INCREMENT_SECONDS,
+            ),
         )
 
     @property
@@ -188,14 +212,17 @@ def time_control_presets() -> Sequence[TimeControl]:
 def time_control_from_snapshot(
     value: Any, fallback_turn_seconds: Optional[int]
 ) -> Optional[TimeControl]:
-    """兼容旧服务端：没有 time_control 时用每手秒数推导。"""
+    """兼容旧服务端：没有 time_control 时用每手秒数推导。
+
+    旧字段与新字段采用同一套严格策略：非整数或越界的值一律抛
+    ``ProtocolError``，不再静默退化成“没有时限”。这样两个字段不会
+    出现“旧字段静默忽略、新字段整包拒绝”的不一致行为。只想用于展示
+    的调用方（例如处理 ``room_created`` 的客户端）应自行捕获并降级。
+    """
     if value is None:
         if fallback_turn_seconds is None:
             return None
-        try:
-            return TimeControl.per_move(fallback_turn_seconds)
-        except ProtocolError:
-            return None
+        return TimeControl.per_move(fallback_turn_seconds)
     return TimeControl.from_payload(value)
 
 

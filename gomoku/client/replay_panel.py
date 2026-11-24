@@ -98,6 +98,11 @@ def _result_text(record: GameRecord) -> str:
     return f"{name or ('黑棋' if record.winner.value == 'black' else '白棋')}胜"
 
 
+def _rule_mode_suffix(record: GameRecord) -> str:
+    """连珠棋谱追加规则标记；自由规则是默认值，不额外显示。"""
+    return " · 连珠" if record.rule_mode == "renju" else ""
+
+
 def _format_time(value: str) -> str:
     try:
         parsed = datetime.fromisoformat(value)
@@ -455,6 +460,7 @@ class ReplayPanel(InkBackdrop):
         self.meta_label.setText(
             f"{_mode_label(record.mode)} · {_result_text(record)} · "
             f"{_format_time(record.created_at)} · {len(record.moves)} 手"
+            f"{_rule_mode_suffix(record)}"
         )
         try:
             self._timeline = ReplayTimeline.from_record(record)

@@ -1,19 +1,26 @@
-"""举报提交与对局回放审计的异步 HTTP 客户端。"""
+"""举报提交与对局回放审计的异步 HTTP 客户端。
+
+地址拼接、Bearer 头、超时、JSON 解析与 reply 生命周期都由
+:class:`~gomoku.client.net.json_api.JsonApiClient` 统一处理，这里只保留
+举报相关的 endpoint、信号与响应映射。
+"""
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, Mapping, Optional
 from urllib.parse import quote
 
-from PySide6.QtCore import QByteArray, QObject, QUrl, Signal
-from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
+from PySide6.QtCore import QObject, Signal
+from PySide6.QtNetwork import QNetworkReply
+
+from gomoku.client.config import api_path
+from gomoku.client.net.json_api import JsonApiClient, ReplyOutcome
 
 logger = logging.getLogger(__name__)
 
 
-class ReportHTTPClient(QObject):
+class ReportHTTPClient(JsonApiClient):
     """提交举报、读取自己提交的举报与对局审计。"""
 
     submitted = Signal(object)  # 服务端返回的举报对象
@@ -22,16 +29,18 @@ class ReportHTTPClient(QObject):
     unauthorized = Signal()
     busy_changed = Signal(bool)
 
+    missing_base_url_message = "未配置联机服务器"
+    invalid_url_message = "联机服务器地址无效"
+    malformed_payload_message = "服务器返回的数据格式异常"
+    default_error_message = "请求失败，请稍后再试"
+
     def __init__(
         self,
         api_base_url: Optional[str],
         timeout_seconds: float = 10.0,
         parent: Optional[QObject] = None,
     ) -> None:
-        super().__init__(parent)
-        self._api_base_url = (api_base_url or "").rstrip("/")
-        self._timeout_seconds = timeout_seconds
-        self._manager = QNetworkAccessManager(self)
+        super().__init__(api_base_url, timeout_seconds, parent=parent)
         self._replies: dict[str, QNetworkReply] = {}
 
     @property
@@ -47,7 +56,7 @@ class ReportHTTPClient(QObject):
     ) -> bool:
         return self._start(
             "report",
-            "/api/v1/reports",
+            api_path("reports"),
             access_token,
             method="POST",
             payload={
@@ -60,7 +69,7 @@ class ReportHTTPClient(QObject):
     def fetch_audit(self, access_token: str, game_id: str) -> bool:
         return self._start(
             f"audit:{game_id}",
-            f"/api/v1/games/{quote(game_id, safe='')}/audit",
+            api_path("games", quote(game_id, safe=""), "audit"),
             access_token,
             method="GET",
         )
@@ -70,7 +79,7 @@ class ReportHTTPClient(QObject):
             reply = self._replies.pop(kind, None)
             if reply is not None:
                 reply.abort()
-                reply.deleteLater()
+                self.discard(reply)
         self.busy_changed.emit(False)
 
     # ------------------------------------------------------------------
@@ -88,38 +97,24 @@ class ReportHTTPClient(QObject):
         if not access_token:
             self.failed.emit("登录状态失效，请重新登录")
             return False
-        if not self._api_base_url:
-            self.failed.emit("未配置联机服务器")
-            return False
-        url = QUrl(f"{self._api_base_url}{path}")
-        if url.scheme() not in ("http", "https") or not url.host():
-            self.failed.emit("联机服务器地址无效")
+
+        url, error = self.prepare_url(path)
+        if url is None:
+            self.failed.emit(error)
             return False
 
         old_reply = self._replies.pop(kind, None)
         if old_reply is not None:
             old_reply.abort()
-            old_reply.deleteLater()
+            self.discard(old_reply)
 
-        request = QNetworkRequest(url)
-        request.setRawHeader(
-            QByteArray(b"Authorization"),
-            QByteArray(f"Bearer {access_token}".encode("utf-8")),
+        reply = self.send_request(
+            method, url, token=access_token, payload=payload
         )
-        request.setTransferTimeout(int(self._timeout_seconds * 1000))
-        if method == "POST":
-            request.setHeader(
-                QNetworkRequest.KnownHeaders.ContentTypeHeader,
-                "application/json",
-            )
-            body = QByteArray(
-                json.dumps(
-                    payload or {}, ensure_ascii=False
-                ).encode("utf-8")
-            )
-            reply = self._manager.post(request, body)
-        else:
-            reply = self._manager.get(request)
+        if reply is None:
+            self.failed.emit(self.unsupported_method_message)
+            return False
+
         self._replies[kind] = reply
         reply.finished.connect(
             lambda reply=reply, kind=kind: self._on_finished(reply, kind)
@@ -129,55 +124,29 @@ class ReportHTTPClient(QObject):
 
     def _on_finished(self, reply: QNetworkReply, kind: str) -> None:
         if reply is not self._replies.get(kind):
-            reply.deleteLater()
+            self.discard(reply)
             return
         self._replies.pop(kind, None)
         self.busy_changed.emit(bool(self._replies))
-        try:
-            status = reply.attribute(
-                QNetworkRequest.Attribute.HttpStatusCodeAttribute
-            )
-            raw = bytes(reply.readAll())
-            data: Any = None
-            if raw:
-                try:
-                    data = json.loads(raw.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    data = None
-            if (
-                reply.error() == QNetworkReply.NetworkError.NoError
-                or (isinstance(status, int) and 200 <= status < 300)
-            ):
-                if not isinstance(data, Mapping):
-                    self.failed.emit("服务器返回的数据格式异常")
-                    return
-                if kind == "report":
-                    self.submitted.emit(dict(data))
-                else:
-                    self.audit_ready.emit(dict(data))
-                return
-            if status == 401:
-                self.unauthorized.emit()
-            self.failed.emit(
-                self._extract_error(data) or "请求失败，请稍后再试"
-            )
-        finally:
-            reply.deleteLater()
 
-    @staticmethod
-    def _extract_error(data: Any) -> str:
-        if not isinstance(data, Mapping):
-            return ""
-        detail = data.get("detail")
-        if isinstance(detail, str):
-            return detail[:300]
-        if isinstance(detail, list) and detail:
-            first = detail[0]
-            if isinstance(first, Mapping):
-                message = first.get("msg")
-                if isinstance(message, str):
-                    return message[:300]
-        return ""
+        self.handle_reply(
+            reply,
+            on_success=lambda data: self._on_success(kind, data),
+            on_error=self._on_error,
+        )
+
+    def _on_success(self, kind: str, data: Mapping[str, Any]) -> None:
+        if kind == "report":
+            self.submitted.emit(dict(data))
+        else:
+            self.audit_ready.emit(dict(data))
+
+    def _on_error(self, outcome: ReplyOutcome) -> None:
+        if outcome.status == 401:
+            self.unauthorized.emit()
+        self.failed.emit(
+            outcome.error_message or self.default_error_message
+        )
 
 
 __all__ = ["ReportHTTPClient"]

@@ -8,6 +8,11 @@
 默认备份 ``server/data/gomoku.db`` 到 ``server/data/backups/``。
 如果设置了 ``GOMOKU_DATABASE_URL`` 且指向 PostgreSQL，请改用 ``pg_dump``。
 备份使用 SQLite 在线备份 API，服务端运行中也可以安全执行。
+
+**时间戳策略**：备份文件名里的时间戳统一使用 **UTC**（形如
+``gomoku-20260101-120000-000000Z.db``，末尾 ``Z`` 表示 UTC），与服务端
+日志的 UTC 策略一致。这样同一批备份在任何时区排出来的顺序都相同，
+也不会因为夏令时/换时区出现重复或错序的文件名。
 """
 
 from __future__ import annotations
@@ -16,22 +21,21 @@ import argparse
 import os
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    # 让脚本能直接 `python tools/backup_server_data.py` 运行：
+    # 从仓库根目录导入服务端的数据库 URL 解析（无第三方依赖）。
+    sys.path.insert(0, str(ROOT))
+
+from server.app.config import sqlite_path_from_url  # noqa: E402
+
 DEFAULT_DB = ROOT / "server" / "data" / "gomoku.db"
 DEFAULT_OUT_DIR = ROOT / "server" / "data" / "backups"
 BACKUP_PREFIX = "gomoku-"
-
-
-def sqlite_path_from_url(url: str) -> Optional[Path]:
-    """把 SQLite 数据库 URL 转成文件路径；非 SQLite 返回 None。"""
-    for prefix in ("sqlite+aiosqlite:///", "sqlite:///"):
-        if url.startswith(prefix):
-            return Path(url[len(prefix) :]).expanduser()
-    return None
 
 
 def resolve_database(explicit: Optional[str]) -> Path:
@@ -55,7 +59,8 @@ def backup_database(db_path: Path, out_dir: Path) -> Path:
     if not db_path.exists():
         raise FileNotFoundError(f"数据库不存在：{db_path}")
     out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    # 统一用 UTC 打戳，末尾 Z 标明时区。
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%fZ")
     dest = out_dir / f"{BACKUP_PREFIX}{stamp}.db"
     source = sqlite3.connect(str(db_path), timeout=15)
     try:

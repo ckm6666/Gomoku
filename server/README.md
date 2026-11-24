@@ -1,10 +1,18 @@
 # Gomoku Online Server（自建房 + 排位匹配版）
 
+> [!IMPORTANT]
+> **服务端必须单 worker 运行（`--workers 1`）。** 房间、匹配队列、断线重连宽限
+> 等状态全部保存在**进程内存**里，多 worker（多进程）之间互不可见：同一批玩家
+> 可能被分到不同进程的队列、建好的房间在别的进程查不到、观战与重连会找不到
+> 房间。要横向扩容必须先把这些状态外置（Redis 等），当前实现不支持。
+
 FastAPI + WebSocket + SQLAlchemy 的联机服务端，提供：
 
 - 用户名 + 密码账号注册、登录、refresh token 轮换、登出；
 - 公开排位快速匹配队列（按积分接近配对、随机黑白，排位固定每手 30 秒）；
 - 自建房每手倒计时与 **Fischer 总时长/加秒**，服务器权威扣除与加秒；
+- 自建房规则模式：**自由五子棋**（默认）或**连珠**（黑棋长连/双四/双三禁手，
+  白棋不受限制）；排位匹配固定自由规则，规则模式随对局持久化并可复盘；
 - **Glicko-2** 积分（积分/RD/波动率）与段位、排行榜、个人资料与最近排位战绩；
 - **排位赛季**：当前赛季信息、到期归档 `season_ratings`、积分软重置、历史赛季排行榜；
 - 预置头像与自定义图片头像（JPEG/PNG 校验、体积/尺寸限制、按版本长缓存）、公开资料与用户搜索；
@@ -86,6 +94,26 @@ $env:GOMOKU_JWT_SECRET = "replace-with-a-long-random-development-secret-32chars+
 server\.venv\Scripts\python.exe -m uvicorn server.app.main:app --host 127.0.0.1 --port 8000
 ```
 
+### 单 worker 约束（必须遵守）
+
+房间、匹配队列、邀请与断线重连宽限状态全部保存在**进程内存**里，因此服务端
+**只能启动一个 worker**：
+
+```powershell
+# 正确
+server\.venv\Scripts\python.exe -m uvicorn server.app.main:app --workers 1
+
+# 错误：房间在别的进程里，互相看不见
+server\.venv\Scripts\python.exe -m uvicorn server.app.main:app --workers 4
+```
+
+多 worker/多实例时会出现：玩家排位匹配到另一个进程的队列、建好的房间查不到、
+观战与断线重连找不到房间、邀请跨进程丢失。服务端启动时如果检测到
+`WEB_CONCURRENCY > 1` 会打印告警。要横向扩容必须先把房间与队列状态外置
+（Redis 等），当前实现没有做。
+
+PostgreSQL 也不能解决这个问题：数据库只存对局与棋谱，不存在线房间状态。
+
 健康检查：
 
 ```powershell
@@ -126,6 +154,10 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
   积分最接近的玩家，随机分配黑白并立即开局。
 - 排位赛固定每手 30 秒（客户端提交的时限设置会被忽略）；自建房可选每手倒计时或
   Fischer 总时长/加秒。认输/超时/五连/平局都由服务器裁决。
+- 自建房可传 `rule_mode`：`freestyle`（默认）或 `renju`。连珠模式下黑棋的长连、
+  双四、双三落子会被服务器拒绝（`move_rejected`，原因“连珠禁手”），白棋不受限制；
+  规则模式写入 `games.rule_mode`（迁移 `0003_game_rule_mode`），终局、再战、观战、
+  最近对局与单局详情都会携带。
 - 终局由服务器执行一次 **Glicko-2** 结算：
   - 起始 1200 分，最低 100；初始 RD 100、波动率 0.06；
   - 每局根据双方积分/RD/波动率与期望得分更新；平局按 0.5 分；
@@ -223,6 +255,13 @@ server\.venv\Scripts\python.exe -m server.manage reset-password --username 用�
 ## 数据库兼容与迁移
 
 - 开发默认 SQLite（`server/data/gomoku.db`），生产可切换 PostgreSQL。
+- SQLite 连接统一开启 **WAL 日志模式**、**5 秒忙等待**（`busy_timeout`）与
+  `synchronous=NORMAL`：读写不再互斥，落子写库撞上写锁时最多等 5 秒而不是
+  立刻抛 `database is locked`。内存数据库（`:memory:`）不支持 WAL，会自动
+  跳过并继续工作。
+- `GOMOKU_DATABASE_URL` 支持 `sqlite+aiosqlite:///路径` 与 `sqlite:///路径`
+  两种写法（同步写法会自动换成异步驱动），服务端、迁移脚本与
+  `tools/backup_server_data.py` 共用同一份解析逻辑，同一个 URL 永远指向同一个文件。
 - 启动时由 [`server/app/migrations.py`](app/migrations.py) 执行 Alembic：
   - 全新数据库执行基线迁移 `0001_baseline`，再执行
     `0002_seasons_glicko_reports`（赛季/Glicko-2/时限/举报）；
@@ -315,6 +354,8 @@ Start-Process C:\Users\a1325\Desktop\Gomoku\dist\Gomoku.exe
 | `GOMOKU_WS_COMMAND_WINDOW_SECONDS` | `10` | 命令令牌桶补充窗口，1～3600 秒 |
 | `GOMOKU_TRUST_PROXY_HEADERS` | `0` | 位于可信反向代理后时设为 1，读取 X-Forwarded-For/X-Real-IP |
 | `GOMOKU_SEASON_LENGTH_DAYS` | `90` | 排位赛季长度，1～3650 天 |
+| `GOMOKU_ROOM_CODE_LENGTH` | `8` | 房间码长度，4～16 |
+| `GOMOKU_ROOM_CODE_ALPHABET` | `ABCDEFGHJKLMNPQRSTUVWXYZ23456789` | 房间码字母表；不能为空、不能有重复字符，字符数必须不少于房间码长度 |
 | `GOMOKU_ADMIN_USERNAMES` | 空 | 逗号分隔的管理员用户名白名单，可访问举报复核接口 |
 
 起始积分、Glicko-2 参数、段位阈值与赛季软重置公式定义在 `server/app/ratings.py`、
@@ -372,7 +413,8 @@ docker run -d --name gomoku-server -p 8000:8000 `
 
 ## 生产部署要点
 
-1. 只运行 **一个 Uvicorn worker**；当前房间、匹配队列和身份互斥状态在进程内存中。
+1. 只运行 **一个 Uvicorn worker**（`--workers 1`）；当前房间、匹配队列和身份互斥状态
+   在进程内存中，多 worker 之间互不可见（房间查不到、匹配跨进程、观战与重连失效）。
    多实例需要 Redis/房间与队列路由后再开启。
 2. 使用 Caddy/Nginx 终止 TLS，对外只开放 HTTPS/WSS 443；不要把开发 HTTP/WS
    服务直接暴露到公网。
@@ -385,6 +427,8 @@ docker run -d --name gomoku-server -p 8000:8000 `
    `X-Forwarded-For`。
 5. 配置每日备份、健康检查和日志收集。SQLite 可用
    `python tools/backup_server_data.py` 在线备份；PostgreSQL 使用 `pg_dump`。
+   备份文件名里的时间戳统一使用 **UTC**（形如 `gomoku-20260101-120000-000000Z.db`，
+   末尾 `Z` 表示 UTC），与服务端日志的 UTC 策略一致，跨时区排序也不会错乱。
    设置防火墙，仅开放必要端口。
 6. 客户端仅在勾选“记住密码”时持久化 DPAPI 加密的 refresh token（access token 只存内存），
    下次启动可静默恢复登录；取消勾选或退出登录会删除本地 token。
@@ -401,7 +445,7 @@ cd C:\Users\a1325\Desktop\Gomoku
 server\.venv\Scripts\python.exe -m unittest discover -s server/tests -v
 ```
 
-当前 **121 项**测试覆盖：
+当前 **235 项**测试覆盖：
 
 - 用户名 + 密码注册、登录、refresh 轮换/重放、登出、认证响应积分/成就字段；
 - 双 WebSocket 建房/邀请/加入/落子/拒绝/认输/再战、服务器五连判定、断线重连；
@@ -416,6 +460,12 @@ server\.venv\Scripts\python.exe -m unittest discover -s server/tests -v
 - 最近对局/单局棋谱的参与者权限、分页、认输终局；
 - 回放审计：序列/颜色/座位/重复落点/终局一致性/时间倒流/秒回警告，参与者与管理员权限；
 - 举报提交、重复举报拒绝、只能举报已结束对局、我的举报、管理员列表与复核；
+- SQLite 引擎的 WAL 日志模式、5 秒忙等待、内存库可用性，以及并发写入等待而非报
+  `database is locked`；
+- 管理员举报列表的审计查询合并成一条 SQL（查询次数不随对局数增长）；
+- 文本日志包含全部 `extra` 字段、重复配置日志不累积 handler 且不误删外部 handler；
+- 房间码长度/字母表的环境变量解析与非法值拒绝；
+- 关闭路径（线程池、应用退出）失败时留下日志；
 - 预置头像更新、自定义头像上传/读取/移除、非法格式/过大/超尺寸图片拒绝；
 - 用户搜索、好友申请/同意/删除、在线状态推送、私聊历史与实时推送；
 - 自建房邀请接受/拒绝、非好友/离线好友拒绝，以及快照中的双方 user_id/头像/勋章；

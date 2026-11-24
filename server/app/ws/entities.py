@@ -15,7 +15,7 @@ from starlette.websockets import WebSocket
 
 from gomoku.shared.avatar import DEFAULT_AVATAR, normalize_avatar
 from gomoku.shared.game_model import GameModel
-from gomoku.shared.rules import Player
+from gomoku.shared.rules import Player, RuleMode
 from gomoku.shared.time_control import TimeControl
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,12 @@ class ClientConnection:
         try:
             await self.websocket.close(code=code, reason=reason)
         except Exception:
-            pass
+            # 连接关闭失败不能静默吞掉，否则重连/断线问题无法排查。
+            logger.debug(
+                "关闭 WebSocket 连接失败 user=%s",
+                self.user_id,
+                exc_info=True,
+            )
 
 
 @dataclass
@@ -92,6 +97,10 @@ class Room:
     new_achievements: dict[str, tuple[str, ...]] = field(
         default_factory=dict
     )
+    # 本局规则模式：自建房可选 freestyle（默认）或 renju，快速匹配/
+    # 排位固定为 freestyle。构造房间时必须让 ``game`` 使用同一模式，
+    # 否则界面显示与服务器裁决会按两套规则进行。
+    rule_mode: RuleMode = RuleMode.FREESTYLE
     game: GameModel = field(default_factory=GameModel)
     status: str = "waiting"  # waiting/playing/black_won/white_won/draw
     winner_user_id: Optional[str] = None

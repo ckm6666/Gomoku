@@ -4,6 +4,7 @@
 这类客观问题列出来，供举报复核和管理员排查：
 
 * 落子编号连续、黑白交替、执子人与座位一致、坐标合法且不重复；
+* 按对局记录的规则模式（freestyle/renju）重放，连珠禁手会被判为非法；
 * 重放后的局面胜者与 ``games`` 表记录一致；
 * 落子时间单调递增，且不存在大量“秒回”式响应；
 * 终局时间之后仍有落子等明显异常。
@@ -16,7 +17,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Sequence
 
 from gomoku.shared.game_model import GameModel
-from gomoku.shared.rules import BOARD_SIZE, Player
+from gomoku.shared.rules import Player, in_bounds
 
 #: 被判定为“秒回”的单步响应时间上限。
 FAST_RESPONSE_SECONDS = 0.3
@@ -78,10 +79,16 @@ def audit_game(
     moves: Sequence[AuditMove],
     started_at: Optional[datetime] = None,
     ended_at: Optional[datetime] = None,
+    rule_mode: str = "freestyle",
 ) -> AuditResult:
-    """审计一局；返回按发现顺序排列的异常列表。"""
+    """审计一局；返回按发现顺序排列的异常列表。
+
+    ``rule_mode`` 来自 ``games.rule_mode``：连珠对局按连珠规则重放，
+    黑棋长连、四四、三三会被记为 ``illegal_move``；缺省按自由规则处理，
+    与旧数据兼容。
+    """
     findings: list[AuditFinding] = []
-    model = GameModel()
+    model = GameModel(mode=rule_mode)
     seen: set[tuple[int, int]] = set()
     fast_moves = 0
     previous_at: Optional[datetime] = None
@@ -125,9 +132,7 @@ def audit_game(
                     f"第 {index} 手执子人与 {move.color} 方座位不一致",
                 )
             )
-        if not (
-            0 <= move.row < BOARD_SIZE and 0 <= move.col < BOARD_SIZE
-        ):
+        if not in_bounds(move.row, move.col):
             findings.append(
                 AuditFinding(
                     "coordinate_out_of_range",

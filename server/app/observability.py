@@ -97,7 +97,7 @@ class JsonFormatter(logging.Formatter):
         for key, value in record.__dict__.items():
             if key in _STANDARD_RECORD_FIELDS or key.startswith("_"):
                 continue
-            if key in {"message", "ts", "level", "logger"}:
+            if key in {"message", "asctime", "ts", "level", "logger"}:
                 continue
             if isinstance(value, (str, int, float, bool)) or value is None:
                 data[key] = value
@@ -109,7 +109,7 @@ class JsonFormatter(logging.Formatter):
 
 
 class TextFormatter(logging.Formatter):
-    """开发环境可读日志，附上请求上下文。"""
+    """开发环境可读日志，附上请求上下文与全部 ``extra`` 字段。"""
 
     def __init__(self) -> None:
         super().__init__(
@@ -118,32 +118,36 @@ class TextFormatter(logging.Formatter):
         )
 
     def format(self, record: logging.LogRecord) -> str:
-        base = super().format(record)
         fields = _context_fields()
-        for key in (
-            "event",
-            "method",
-            "path",
-            "status",
-            "duration_ms",
-            "user_id",
-            "game_id",
-            "connection_id",
-            "message_type",
-            "reason",
-            "move_no",
-        ):
-            value = getattr(record, key, None)
-            if value is not None and value != "":
-                fields[key] = str(value)
+        # 与 JSON 格式化器保持一致：遍历记录上的全部扩展字段，
+        # 不再维护硬编码白名单，避免新加的 extra 字段被静默丢弃。
+        # message/asctime 由 Formatter 自己生成，正文里已经有了。
+        for key, value in record.__dict__.items():
+            if key in _STANDARD_RECORD_FIELDS or key.startswith("_"):
+                continue
+            if key in {"message", "asctime"}:
+                continue
+            if value is None or value == "":
+                continue
+            fields[key] = str(value)
+        base = super().format(record)
         if not fields:
             return base
         suffix = " ".join(f"{key}={value}" for key, value in fields.items())
         return f"{base} [{suffix}]"
 
 
+#: 标记“本模块安装的”根日志处理器；重复配置时只摘掉自己装的那些，
+#: 不动宿主应用（或测试框架）自己挂上去的 handler。
+_MANAGED_HANDLER_FLAG = "_gomoku_managed_handler"
+
+
 def configure_logging(settings: Settings) -> None:
-    """按配置安装根日志处理器；重复调用不会累积 handler。"""
+    """按配置安装根日志处理器；重复调用不会累积 handler。
+
+    只移除本函数自己安装过的 handler，其他组件（宿主应用、pytest 等）
+    挂在根日志上的处理器保持原样。
+    """
     level = getattr(logging, settings.log_level, logging.INFO)
     stream = sys.stderr
     # Windows 控制台默认可能是 GBK；JSON 日志必须保持 UTF-8，否则中文会
@@ -154,14 +158,17 @@ def configure_logging(settings: Settings) -> None:
             reconfigure(encoding="utf-8")
         except (ValueError, OSError):
             pass
+    root = logging.getLogger()
+    for existing in list(root.handlers):
+        if getattr(existing, _MANAGED_HANDLER_FLAG, False):
+            root.removeHandler(existing)
     handler = logging.StreamHandler(stream)
+    setattr(handler, _MANAGED_HANDLER_FLAG, True)
     handler.setFormatter(
         JsonFormatter()
         if settings.log_format == "json"
         else TextFormatter()
     )
-    root = logging.getLogger()
-    root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(level)
 

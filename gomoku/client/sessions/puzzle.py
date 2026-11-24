@@ -21,10 +21,11 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from gomoku.client.ai_engine import AIDifficulty
 from gomoku.client.ai_worker import AIWorker
 from gomoku.client.board_view import BoardView
+from gomoku.client.sessions.ai import shutdown_worker
 from gomoku.client.sessions.base import GameSession
 from gomoku.shared.game_model import GameModel
 from gomoku.shared.puzzle import Puzzle
-from gomoku.shared.rules import Player
+from gomoku.shared.rules import Player, in_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +205,10 @@ class PuzzleSession(GameSession):
         QTimer.singleShot(0, self._maybe_start_ai)
 
     def shutdown(self) -> None:
+        """取消并有界等待防守 AI 线程结束，防止 QThread 在运行中被析构。
+
+        等待是有界的：引擎若迟迟不响应取消，也不会把 GUI 线程卡死。
+        """
         if self._closed:
             return
         self._closed = True
@@ -212,9 +217,10 @@ class PuzzleSession(GameSession):
 
         worker = self._ai_thread
         if worker is not None:
-            worker.cancel()
-            if not worker.wait(3000):
-                worker.wait()
+            # 等待是有界的：若线程仍未结束，界面连接会被断开，线程交给
+            # 保活器等待其自行结束，不会卡住 GUI 线程。
+            shutdown_worker(worker, "残局防守 AI")
+        self._ai_thread = None
 
     # ------------------------------------------------------------------
     # 结果
@@ -286,8 +292,7 @@ class PuzzleSession(GameSession):
             return
 
         if (
-            not 0 <= row < len(self._model.board)
-            or not 0 <= col < len(self._model.board)
+            not in_bounds(row, col)
             or self._model.board[row][col] is not None
         ):
             logger.warning("残局防守 AI 返回非法落点 %s,%s", row, col)

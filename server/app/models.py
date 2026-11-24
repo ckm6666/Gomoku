@@ -196,6 +196,14 @@ class Game(Base):
         server_default=text("false"),
         nullable=False,
     )
+    # 规则模式：freestyle（自由规则，默认）或 renju（连珠规则）。
+    # 审计与棋谱接口按该值重放，旧行由迁移填充 freestyle。
+    rule_mode: Mapped[str] = mapped_column(
+        String(16),
+        default="freestyle",
+        server_default=text("'freestyle'"),
+        nullable=False,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=utcnow_naive, nullable=False
     )

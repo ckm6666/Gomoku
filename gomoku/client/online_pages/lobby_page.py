@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 
 from gomoku.client.avatar_widgets import AvatarButton
 from gomoku.client.ui_theme import PaperCheckBox, PaperComboBox
+from gomoku.shared.rules import RuleMode
 from gomoku.shared.time_control import time_control_presets
 
 
@@ -156,6 +157,22 @@ def build_lobby_page(panel: Any) -> QWidget:
     time_row.addWidget(time_label)
     time_row.addWidget(panel.turn_seconds_combo)
     time_row.addStretch(1)
+    # 规则选择：自建房可选自由规则或连珠规则，默认自由规则。
+    rule_row = QHBoxLayout()
+    rule_label = QLabel("规则", card)
+    rule_label.setObjectName("formLabel")
+    panel.rule_mode_combo = PaperComboBox(card)
+    panel.rule_mode_combo.addItem("自由五子棋", RuleMode.FREESTYLE)
+    panel.rule_mode_combo.addItem("连珠（黑棋禁手）", RuleMode.RENJU)
+    panel.rule_mode_combo.setCurrentIndex(0)
+    rule_row.addWidget(rule_label)
+    rule_row.addWidget(panel.rule_mode_combo)
+    rule_row.addStretch(1)
+    panel.rule_mode_hint = QLabel(
+        "连珠：黑棋长连/双四/双三禁手；排位固定自由规则。", card
+    )
+    panel.rule_mode_hint.setObjectName("hintLabel")
+    panel.rule_mode_hint.setWordWrap(True)
     # 服务端太旧时不支持自定义时限，由面板在联机后显示原因。
     panel.time_control_hint = QLabel("", card)
     panel.time_control_hint.setObjectName("hintLabel")
@@ -169,6 +186,8 @@ def build_lobby_page(panel: Any) -> QWidget:
     layout.addWidget(panel.allow_spectators_checkbox)
     layout.addLayout(time_row)
     layout.addWidget(panel.time_control_hint)
+    layout.addLayout(rule_row)
+    layout.addWidget(panel.rule_mode_hint)
     layout.addWidget(panel.create_room_button)
 
     layout.addSpacing(4)

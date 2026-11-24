@@ -148,6 +148,12 @@ def apply_font_scale(app: QApplication, scale: float) -> float:
     return factor
 
 
+def reset_for_tests() -> None:
+    """把进程内缓存的字号比例恢复为默认值；仅供测试隔离使用。"""
+    global _current_scale
+    _current_scale = DEFAULT_FONT_SCALE
+
+
 __all__ = [
     "BASE_FONT_POINT_SIZE",
     "BODY_FONT_FAMILIES",
@@ -163,6 +169,7 @@ __all__ = [
     "current_font_scale",
     "load_font_scale",
     "preset_label",
+    "reset_for_tests",
     "save_font_scale",
     "scale_stylesheet",
 ]

@@ -15,6 +15,7 @@ import unittest
 import wave
 from array import array
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -22,7 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from PySide6.QtCore import QSettings, Qt  # noqa: E402
+from PySide6.QtCore import QSettings, QThread, Qt  # noqa: E402
 from PySide6.QtGui import QGuiApplication  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QPushButton  # noqa: E402
@@ -45,6 +46,11 @@ from gomoku.client.audio import (  # noqa: E402
     synthesize_sound,
 )
 from gomoku.client.sound_control import SoundButton  # noqa: E402
+
+try:  # pragma: no cover - 裁剪环境可能没有 QtMultimedia
+    from PySide6.QtMultimedia import QSoundEffect
+except ImportError:  # pragma: no cover
+    QSoundEffect = None  # type: ignore[assignment]
 
 QT_APP = QApplication.instance() or QApplication([])
 
@@ -179,8 +185,180 @@ class AssetPipelineTests(unittest.TestCase):
                     self.assertEqual(path.stat().st_mtime_ns, modified)
 
 
+class _FakeEffect:
+    """只实现音效池用到的接口的假音效实例。"""
+
+    def __init__(self, status: object) -> None:
+        self._status = status
+        self.play_count = 0
+        self.stop_count = 0
+        self.volume = 0.0
+
+    def status(self) -> object:
+        return self._status
+
+    def play(self) -> None:
+        self.play_count += 1
+
+    def stop(self) -> None:
+        self.stop_count += 1
+
+    def setVolume(self, volume: float) -> None:  # noqa: N802 - Qt 接口
+        self.volume = float(volume)
+
+
+class DecodeThreadTests(unittest.TestCase):
+    """解码必须离开主线程：QAudioDecoder 不能跨线程使用。"""
+
+    def test_decode_runs_on_a_worker_thread(self) -> None:
+        source = find_audio_asset(ASSET_MOVE)
+        self.assertIsNotNone(source)
+        assert source is not None
+
+        threads: list[QThread] = []
+        original = audio_module._decode_audio_bytes
+
+        def spy(path, cancel_check=None):
+            threads.append(QThread.currentThread())
+            return original(path, cancel_check)
+
+        with mock.patch.object(
+            audio_module, "_decode_audio_bytes", spy
+        ):
+            data = decode_audio_to_wav_bytes(source)
+
+        self.assertIsNotNone(data)
+        self.assertEqual(len(threads), 1)
+        self.assertNotEqual(threads[0], QT_APP.thread())
+
+    def test_startup_does_not_block_on_decode(self) -> None:
+        """启动流程里的解码在后台线程进行，不能把主线程卡住。"""
+        source = find_audio_asset(ASSET_MOVE)
+        self.assertIsNotNone(source)
+        assert source is not None
+
+        threads: list[QThread] = []
+        original = audio_module._decode_audio_bytes
+
+        def slow_spy(path, cancel_check=None):
+            threads.append(QThread.currentThread())
+            time.sleep(1.0)
+            return original(path, cancel_check)
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory)
+            settings = QSettings(
+                str(cache_dir / "audio.ini"), QSettings.Format.IniFormat
+            )
+            with mock.patch.object(
+                audio_module, "_decode_audio_bytes", slow_spy
+            ), mock.patch.object(
+                AudioManager, "_prepare_bgm", lambda self: None
+            ), mock.patch.object(
+                # 不创建真实音效实例：它们会一直占着缓存文件。
+                AudioManager, "_install_effects", lambda self, paths: None
+            ):
+                started = time.monotonic()
+                manager = AudioManager(
+                    enabled=True, settings=settings, cache_dir=cache_dir
+                )
+                elapsed = time.monotonic() - started
+                try:
+                    # 构造过程没有等解码完成。
+                    self.assertLess(elapsed, 0.9)
+                    # 等解码完成：缓存文件出现。
+                    deadline = time.monotonic() + 30.0
+                    cached: list[Path] = []
+                    while time.monotonic() < deadline:
+                        QT_APP.processEvents()
+                        cached = list(cache_dir.glob("move_src*.wav"))
+                        if cached:
+                            break
+                        time.sleep(0.01)
+                    # 缓存仍然生成。
+                    self.assertTrue(cached, "解码缓存没有生成")
+                    # 解码跑在后台线程里。
+                    self.assertTrue(threads)
+                    self.assertNotEqual(threads[0], QT_APP.thread())
+                finally:
+                    manager.shutdown()
+
+
+class EffectPoolTests(unittest.TestCase):
+    """音效池的补播与忙碌判断。"""
+
+    def _manager(self) -> AudioManager:
+        tmpdir = tempfile.TemporaryDirectory()
+        manager = AudioManager(
+            enabled=False,
+            settings=QSettings(
+                str(Path(tmpdir.name) / "audio.ini"),
+                QSettings.Format.IniFormat,
+            ),
+        )
+        # 离屏环境没有真实音频设备，这里直接打开开关并塞入假实例。
+        manager._available = True
+        # 临时目录要活到用例结束。
+        manager._test_tmpdir = tmpdir
+        return manager
+
+    @unittest.skipIf(QSoundEffect is None, "缺少 QtMultimedia")
+    def test_move_effect_is_catched_up_while_loading(self) -> None:
+        """加载中的落子音效也要补播，不能被静默丢弃。"""
+        manager = self._manager()
+        try:
+            effect = _FakeEffect(QSoundEffect.Status.Loading)
+            manager._effects["move"] = [effect]
+            manager.play_move()
+            self.assertIn("move", manager._pending_oneshots)
+        finally:
+            manager.shutdown()
+
+    @unittest.skipIf(QSoundEffect is None, "缺少 QtMultimedia")
+    def test_pool_uses_every_live_instance(self) -> None:
+        """轮到的实例没就绪时，要看池子里其它实例。"""
+        manager = self._manager()
+        try:
+            loading = _FakeEffect(QSoundEffect.Status.Loading)
+            ready = _FakeEffect(QSoundEffect.Status.Ready)
+            manager._effects["move"] = [loading, ready]
+            manager._sfx_pool_index = 0
+            manager.play_move()
+            self.assertEqual(ready.play_count, 1)
+            self.assertEqual(loading.play_count, 0)
+        finally:
+            manager.shutdown()
+
+    @unittest.skipIf(QSoundEffect is None, "缺少 QtMultimedia")
+    def test_error_is_reported_only_when_all_instances_fail(self) -> None:
+        """只有一个实例失败时，整种音效不算不可用。"""
+        manager = self._manager()
+        try:
+            ready = _FakeEffect(QSoundEffect.Status.Ready)
+            failed = _FakeEffect(QSoundEffect.Status.Error)
+            manager._effects["move"] = [ready, failed]
+            manager._on_effect_status_changed("move", failed)
+            self.assertNotIn("move", manager._error_logged)
+        finally:
+            manager.shutdown()
+
+    @unittest.skipIf(QSoundEffect is None, "缺少 QtMultimedia")
+    def test_pending_effect_plays_when_a_later_instance_is_ready(self) -> None:
+        """第二个实例先就绪时，补播要由这个实例发出。"""
+        manager = self._manager()
+        try:
+            loading = _FakeEffect(QSoundEffect.Status.Loading)
+            ready = _FakeEffect(QSoundEffect.Status.Ready)
+            manager._effects["move"] = [loading, ready]
+            manager._pending_oneshots.add("move")
+            manager._on_effect_status_changed("move", ready)
+            self.assertEqual(ready.play_count, 1)
+            self.assertNotIn("move", manager._pending_oneshots)
+        finally:
+            manager.shutdown()
+
+
 class ButtonClickFilterTests(unittest.TestCase):
-    """应用级事件过滤器把按钮按下映射为点击音效。"""
 
     def test_button_press_plays_click_sound(self) -> None:
         class FakeManager:
@@ -313,6 +491,8 @@ __all__ = [
     "AudioManagerTests",
     "ButtonClickFilterTests",
     "CacheTests",
+    "DecodeThreadTests",
+    "EffectPoolTests",
     "SoundButtonTests",
     "SynthesisTests",
 ]

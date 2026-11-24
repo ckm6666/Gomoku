@@ -55,6 +55,12 @@ def record_from_game_detail(data: Mapping[str, Any]) -> GameRecord:
     if not isinstance(created_at, str) or not created_at:
         created_at = _EPOCH
 
+    # 规则模式交给共享棋谱层校验：缺省或显式为 null 时按自由规则处理，
+    # 未知取值会抛出 RecordError，避免复盘时采用错误规则。
+    rule_mode = data.get("rule_mode")
+    if rule_mode is None:
+        rule_mode = "freestyle"
+
     metadata: dict[str, Any] = {
         "status": data.get("status", ""),
         "your_color": data.get("your_color", ""),
@@ -74,6 +80,7 @@ def record_from_game_detail(data: Mapping[str, Any]) -> GameRecord:
             "black_name": data.get("black_username", ""),
             "white_name": data.get("white_username", ""),
             "rated": bool(data.get("rated", False)),
+            "rule_mode": rule_mode,
             "moves": moves,
             "metadata": metadata,
         }

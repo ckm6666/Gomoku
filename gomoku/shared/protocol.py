@@ -19,13 +19,31 @@ from typing import Any, Mapping, Optional, Sequence
 from gomoku.shared.achievements import normalize_achievement_keys
 from gomoku.shared.avatar import normalize_avatar
 from gomoku.shared.errors import ProtocolError
-from gomoku.shared.rules import BOARD_SIZE, Cell, Move, Player
+from gomoku.shared.rules import (
+    BOARD_SIZE,
+    NON_BOARD_ENDINGS,
+    RESULT_REASON_FIVE,
+    WIN_DIRECTIONS,
+    WIN_LENGTH,
+    Cell,
+    Move,
+    Player,
+    RuleMode,
+    find_winning_line,
+    in_bounds,
+    parse_player,
+    parse_rule_mode,
+)
 from gomoku.shared.time_control import (
     TimeControl,
     time_control_from_snapshot,
 )
 
 PROTOCOL_VERSION = 1
+
+#: request_id 的最大长度。服务端处理落子请求时也用同一个上限，
+#: 过长的一律拒绝，避免超大字段占用带宽与日志。
+MAX_REQUEST_ID_LENGTH = 64
 
 # 客户端 → 服务端
 CLIENT_AUTH = "auth"
@@ -197,14 +215,28 @@ class GameSnapshot:
     # 每手模式不使用这两个字段，改用 turn_deadline_ms 显示本手倒计时。
     black_remaining_ms: Optional[int] = None
     white_remaining_ms: Optional[int] = None
+    # 本局规则模式：freestyle（默认）或 renju。旧服务端不下发时按自由
+    # 规则处理，保持向后兼容。
+    rule_mode: RuleMode = RuleMode.FREESTYLE
+
+
+def rule_mode_from_payload(value: object) -> RuleMode:
+    """解析协议里的可选 ``rule_mode`` 字段。
+
+    缺省（``None``）按自由规则处理；显式给出时必须是 ``"freestyle"``、
+    ``"renju"`` 或 :class:`RuleMode`，其余值一律抛 :class:`ProtocolError`，
+    避免服务端与客户端悄悄采用不同的规则。
+    """
+    if value is None:
+        return RuleMode.FREESTYLE
+    try:
+        return parse_rule_mode(value)
+    except ValueError as exc:
+        raise ProtocolError("rule_mode 必须是 'freestyle' 或 'renju'") from exc
 
 
 def _parse_player(value: Any, field: str) -> Player:
-    if value == "black":
-        return Player.BLACK
-    if value == "white":
-        return Player.WHITE
-    raise ProtocolError(f"{field} 必须是 'black' 或 'white'")
+    return parse_player(value, ProtocolError, field)
 
 
 def _parse_board(value: Any) -> tuple[tuple[Cell, ...], ...]:
@@ -241,9 +273,10 @@ def _parse_coord(value: Any, field: str) -> tuple[int, int]:
     ):
         raise ProtocolError(f"{field} 必须是 [row, col]")
     row, col = value
-    if not isinstance(row, int) or not isinstance(col, int):
+    # bool 是 int 的子类，必须用精确类型判断，否则 True 会被当成第 1 行。
+    if type(row) is not int or type(col) is not int:
         raise ProtocolError(f"{field} 坐标必须是整数")
-    if not 0 <= row < BOARD_SIZE or not 0 <= col < BOARD_SIZE:
+    if not in_bounds(row, col):
         raise ProtocolError(f"{field} 坐标越界")
     return row, col
 
@@ -271,19 +304,114 @@ def _parse_winning_line(value: Any) -> tuple[tuple[int, int], ...]:
     return tuple(_parse_coord(item, "winning_line[]") for item in value)
 
 
-def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
-    """校验并转换服务器权威局面快照。"""
-    if not isinstance(payload, Mapping):
-        raise ProtocolError("game_state payload 必须是对象")
+# ---------------------------------------------------------------------------
+# 快照字段族
+#
+# 快照字段很多，按“字段族”拆成几个小解析器：身份/状态/局面/房间信息/
+# 时钟/悔棋/排位/成就。每族只关心自己那几个字段，出错时的提示也更精确。
+# ---------------------------------------------------------------------------
 
+
+@dataclass(frozen=True)
+class _IdentityFields:
+    """对局身份、执子方与步数。"""
+
+    game_id: str
+    current_player: Player
+    your_color: Optional[Player]
+    is_spectator: bool
+    status: str
+    move_no: int
+
+
+@dataclass(frozen=True)
+class _PositionFields:
+    """棋盘、最后一手与胜利连线。"""
+
+    board: tuple[tuple[Cell, ...], ...]
+    last_move: Optional[Move]
+    winning_line: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class _RoomFields:
+    """房间与双方玩家的展示信息。"""
+
+    room_code: str
+    black_name: str
+    white_name: str
+    black_user_id: str
+    white_user_id: str
+    black_avatar: str
+    white_avatar: str
+    black_avatar_version: int
+    white_avatar_version: int
+
+
+@dataclass(frozen=True)
+class _ClockFields:
+    """时限设置与时钟余量。"""
+
+    time_control: Optional[TimeControl]
+    move_timeout_seconds: Optional[int]
+    turn_deadline_ms: Optional[int]
+    server_now_ms: Optional[int]
+    black_remaining_ms: Optional[int]
+    white_remaining_ms: Optional[int]
+
+
+@dataclass(frozen=True)
+class _UndoFields:
+    """终局原因与悔棋配额。"""
+
+    state_version: int
+    result_reason: str
+    undo_requester_id: str
+    undo_remaining: int
+    undo_limit: int
+    undo_cooldown_until_ms: Optional[int]
+    undo_cooldown_seconds: int
+
+
+@dataclass(frozen=True)
+class _RankingFields:
+    """排位积分信息。"""
+
+    rated: bool
+    your_rating_before: Optional[int]
+    your_rating_after: Optional[int]
+    opponent_rating_before: Optional[int]
+    opponent_rating_after: Optional[int]
+    rating_delta: Optional[int]
+
+
+def _optional_int(
+    payload: Mapping[str, Any], field: str
+) -> Optional[int]:
+    """读取可选的非负整数字段；缺省或 null 返回 None。"""
+    value = payload.get(field)
+    if value is None:
+        return None
+    # bool 是 int 的子类，必须显式排除。
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ProtocolError(f"{field} 必须是非负整数或 null")
+    return value
+
+
+def _optional_rating(
+    payload: Mapping[str, Any], field: str
+) -> Optional[int]:
+    """读取可选的积分字段（同样只接受非负整数）。"""
+    return _optional_int(payload, field)
+
+
+def _parse_identity_fields(payload: Mapping[str, Any]) -> _IdentityFields:
+    """解析对局身份、执子方、状态与步数。"""
     try:
-        game_id = payload["game_id"]
-        board = _parse_board(payload["board"])
-        current_player = _parse_player(
-            payload["current_player"], "current_player"
-        )
-        move_no = payload["move_no"]
-        status = payload["status"]
+        raw_game_id = payload["game_id"]
+        raw_current_player = payload["current_player"]
+        raw_move_no = payload["move_no"]
+        raw_status = payload["status"]
     except KeyError as exc:
         raise ProtocolError(f"game_state 缺少字段：{exc.args[0]}") from exc
 
@@ -299,37 +427,63 @@ def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
     else:
         your_color = _parse_player(raw_color, "your_color")
 
-    if not isinstance(game_id, str) or not game_id.strip():
+    if not isinstance(raw_game_id, str) or not raw_game_id.strip():
         raise ProtocolError("game_id 必须是非空字符串")
-    if not isinstance(move_no, int) or move_no < 0:
+    if type(raw_move_no) is not int or raw_move_no < 0:
         raise ProtocolError("move_no 必须是非负整数")
-
-    if status == "playing":
-        winner = None
-        is_draw = False
-        is_game_over = False
-    elif status == "black_won":
-        winner = Player.BLACK
-        is_draw = False
-        is_game_over = True
-    elif status == "white_won":
-        winner = Player.WHITE
-        is_draw = False
-        is_game_over = True
-    elif status == "draw":
-        winner = None
-        is_draw = True
-        is_game_over = True
-    else:
+    if not isinstance(raw_status, str):
         raise ProtocolError("status 必须是 playing/black_won/white_won/draw")
 
-    last_move = _parse_last_move(payload.get("last_move"))
-    winning_line = _parse_winning_line(payload.get("winning_line"))
+    return _IdentityFields(
+        game_id=raw_game_id,
+        current_player=_parse_player(
+            raw_current_player, "current_player"
+        ),
+        your_color=your_color,
+        is_spectator=is_spectator,
+        status=raw_status,
+        move_no=raw_move_no,
+    )
 
+
+def _parse_status_fields(
+    status: str,
+) -> tuple[Optional[Player], bool, bool]:
+    """把状态字符串翻译成 (胜者, 是否平局, 是否终局)。"""
+    if status == "playing":
+        return None, False, False
+    if status == "black_won":
+        return Player.BLACK, False, True
+    if status == "white_won":
+        return Player.WHITE, False, True
+    if status == "draw":
+        return None, True, True
+    raise ProtocolError("status 必须是 playing/black_won/white_won/draw")
+
+
+def _parse_position_fields(payload: Mapping[str, Any]) -> _PositionFields:
+    """解析棋盘、最后一手与胜利连线。"""
+    try:
+        raw_board = payload["board"]
+    except KeyError as exc:
+        raise ProtocolError(f"game_state 缺少字段：{exc.args[0]}") from exc
+    return _PositionFields(
+        board=_parse_board(raw_board),
+        last_move=_parse_last_move(payload.get("last_move")),
+        winning_line=_parse_winning_line(payload.get("winning_line")),
+    )
+
+
+def _parse_room_fields(payload: Mapping[str, Any]) -> _RoomFields:
+    """解析房间号、昵称、用户 id 与头像。"""
     room_code = payload.get("room_code", "")
     black_name = payload.get("black_name", "")
     white_name = payload.get("white_name", "")
-    if not isinstance(room_code, str) or not isinstance(black_name, str) or not isinstance(white_name, str):
+    if (
+        not isinstance(room_code, str)
+        or not isinstance(black_name, str)
+        or not isinstance(white_name, str)
+    ):
         raise ProtocolError("room_code/black_name/white_name 必须是字符串")
 
     black_user_id = payload.get("black_user_id", "")
@@ -346,55 +500,29 @@ def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
         )
     ):
         raise ProtocolError("用户 id/头像字段必须是字符串")
-    black_avatar = normalize_avatar(black_avatar, black_user_id)
-    white_avatar = normalize_avatar(white_avatar, white_user_id)
 
-    def optional_int(field: str) -> int | None:
-        value = payload.get(field)
-        if value is None:
-            return None
-        if not isinstance(value, int) or value < 0:
-            raise ProtocolError(f"{field} 必须是非负整数或 null")
-        return value
+    return _RoomFields(
+        room_code=room_code,
+        black_name=black_name,
+        white_name=white_name,
+        black_user_id=black_user_id,
+        white_user_id=white_user_id,
+        black_avatar=normalize_avatar(black_avatar, black_user_id),
+        white_avatar=normalize_avatar(white_avatar, white_user_id),
+        black_avatar_version=_optional_int(
+            payload, "black_avatar_version"
+        )
+        or 0,
+        white_avatar_version=_optional_int(
+            payload, "white_avatar_version"
+        )
+        or 0,
+    )
 
-    opponent_online = payload.get("opponent_online")
-    if opponent_online is not None and not isinstance(opponent_online, bool):
-        raise ProtocolError("opponent_online 必须是布尔值或 null")
 
-    rated = payload.get("rated", False)
-    if not isinstance(rated, bool):
-        raise ProtocolError("rated 必须是布尔值")
-
-    def optional_rating(field: str) -> int | None:
-        value = payload.get(field)
-        if value is None:
-            return None
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            raise ProtocolError(f"{field} 必须是非负整数或 null")
-        return value
-
-    rating_delta = payload.get("rating_delta")
-    if rating_delta is not None and (
-        not isinstance(rating_delta, int)
-        or isinstance(rating_delta, bool)
-    ):
-        raise ProtocolError("rating_delta 必须是整数或 null")
-
-    state_version = optional_int("state_version") or 0
-    result_reason = payload.get("result_reason", "")
-    undo_requester_id = payload.get("undo_requester_id", "")
-    if not isinstance(result_reason, str) or not isinstance(
-        undo_requester_id, str
-    ):
-        raise ProtocolError("result_reason/undo_requester_id 必须是字符串")
-    undo_remaining = optional_int("undo_remaining") or 0
-    undo_limit = optional_int("undo_limit") or 0
-    undo_cooldown_seconds = optional_int("undo_cooldown_seconds") or 0
-    undo_cooldown_until_ms = optional_int("undo_cooldown_until_ms")
-
-    black_avatar_version = optional_int("black_avatar_version") or 0
-    white_avatar_version = optional_int("white_avatar_version") or 0
-    move_timeout_seconds = optional_int("move_timeout_seconds")
+def _parse_clock_fields(payload: Mapping[str, Any]) -> _ClockFields:
+    """解析时限设置、倒计时与 Fischer 时钟余量。"""
+    move_timeout_seconds = _optional_int(payload, "move_timeout_seconds")
     time_control = time_control_from_snapshot(
         payload.get("time_control"), move_timeout_seconds
     )
@@ -403,8 +531,240 @@ def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
         move_timeout_seconds = time_control.turn_seconds
     elif time_control is not None and time_control.is_fischer:
         move_timeout_seconds = None
-    black_remaining_ms = optional_int("black_remaining_ms")
-    white_remaining_ms = optional_int("white_remaining_ms")
+    return _ClockFields(
+        time_control=time_control,
+        move_timeout_seconds=move_timeout_seconds,
+        turn_deadline_ms=_optional_int(payload, "turn_deadline_ms"),
+        server_now_ms=_optional_int(payload, "server_now_ms"),
+        black_remaining_ms=_optional_int(payload, "black_remaining_ms"),
+        white_remaining_ms=_optional_int(payload, "white_remaining_ms"),
+    )
+
+
+def _parse_undo_fields(payload: Mapping[str, Any]) -> _UndoFields:
+    """解析终局原因、局面版本与悔棋配额。"""
+    result_reason = payload.get("result_reason", "")
+    undo_requester_id = payload.get("undo_requester_id", "")
+    if not isinstance(result_reason, str) or not isinstance(
+        undo_requester_id, str
+    ):
+        raise ProtocolError("result_reason/undo_requester_id 必须是字符串")
+    return _UndoFields(
+        state_version=_optional_int(payload, "state_version") or 0,
+        result_reason=result_reason.strip(),
+        undo_requester_id=undo_requester_id,
+        undo_remaining=_optional_int(payload, "undo_remaining") or 0,
+        undo_limit=_optional_int(payload, "undo_limit") or 0,
+        undo_cooldown_until_ms=_optional_int(
+            payload, "undo_cooldown_until_ms"
+        ),
+        undo_cooldown_seconds=(
+            _optional_int(payload, "undo_cooldown_seconds") or 0
+        ),
+    )
+
+
+def _parse_ranking_fields(payload: Mapping[str, Any]) -> _RankingFields:
+    """解析排位标记与双方积分。"""
+    rated = payload.get("rated", False)
+    if not isinstance(rated, bool):
+        raise ProtocolError("rated 必须是布尔值")
+    rating_delta = payload.get("rating_delta")
+    if rating_delta is not None and (
+        not isinstance(rating_delta, int)
+        or isinstance(rating_delta, bool)
+    ):
+        raise ProtocolError("rating_delta 必须是整数或 null")
+    return _RankingFields(
+        rated=rated,
+        your_rating_before=_optional_rating(payload, "your_rating_before"),
+        your_rating_after=_optional_rating(payload, "your_rating_after"),
+        opponent_rating_before=_optional_rating(
+            payload, "opponent_rating_before"
+        ),
+        opponent_rating_after=_optional_rating(
+            payload, "opponent_rating_after"
+        ),
+        rating_delta=rating_delta,
+    )
+
+
+def _count_stones(board: tuple[tuple[Cell, ...], ...]) -> int:
+    """统计棋盘上的棋子数。"""
+    return sum(
+        1 for row in board for cell in row if cell is not None
+    )
+
+
+def _board_has_five(
+    board: tuple[tuple[Cell, ...], ...], player: Player
+) -> bool:
+    """扫描整块棋盘，判断 ``player`` 是否存在五连。"""
+    for row_index, row in enumerate(board):
+        for col_index, cell in enumerate(row):
+            if cell is not player:
+                continue
+            if find_winning_line(board, row_index, col_index, player):
+                return True
+    return False
+
+
+def _find_winner_line(
+    board: tuple[tuple[Cell, ...], ...],
+    winner: Player,
+    last_move: Optional[Move],
+) -> list[tuple[int, int]]:
+    """找出 ``winner`` 在棋盘上的五连；优先用最后一手作为锚点。"""
+    if last_move is not None and last_move.player is winner:
+        line = find_winning_line(
+            board, last_move.row, last_move.col, winner
+        )
+        if line:
+            return line
+    for row_index, row in enumerate(board):
+        for col_index, cell in enumerate(row):
+            if cell is not winner:
+                continue
+            line = find_winning_line(
+                board, row_index, col_index, winner
+            )
+            if line:
+                return line
+    return []
+
+
+def _validate_winning_line(
+    board: tuple[tuple[Cell, ...], ...],
+    winning_line: tuple[tuple[int, int], ...],
+    winner: Optional[Player],
+) -> None:
+    """校验胜利连线：坐标在界内、颜色一致、连续且长度达标。"""
+    if not winning_line:
+        return
+    if winner is None:
+        raise ProtocolError("出现胜利连线但没有胜者")
+    if len(winning_line) < WIN_LENGTH:
+        raise ProtocolError("胜利连线长度不足五颗")
+    for row, col in winning_line:
+        if not in_bounds(row, col):
+            raise ProtocolError("胜利连线坐标越界")
+        if board[row][col] is not winner:
+            raise ProtocolError("胜利连线上的棋子颜色与胜者不一致")
+
+    # 连线必须沿同一个方向连续排列。
+    step = (
+        winning_line[1][0] - winning_line[0][0],
+        winning_line[1][1] - winning_line[0][1],
+    )
+    reversed_step = (-step[0], -step[1])
+    if step not in WIN_DIRECTIONS and reversed_step not in WIN_DIRECTIONS:
+        raise ProtocolError("胜利连线不连续")
+    for index in range(2, len(winning_line)):
+        current = (
+            winning_line[index][0] - winning_line[index - 1][0],
+            winning_line[index][1] - winning_line[index - 1][1],
+        )
+        if current != step:
+            raise ProtocolError("胜利连线不连续")
+
+
+def _validate_snapshot_consistency(
+    status: str,
+    board: tuple[tuple[Cell, ...], ...],
+    winner: Optional[Player],
+    winning_line: tuple[tuple[int, int], ...],
+    last_move: Optional[Move],
+    move_no: int,
+    result_reason: str,
+) -> None:
+    """交叉校验快照各字段是否互相自洽。
+
+    服务端是权威方，正常情况下这些字段必然一致；这里做的是防御性校验，
+    避免异常快照把界面置于矛盾状态（例如界面显示黑方获胜，棋盘上却是
+    白方的五连）。
+
+    校验口径完全对齐服务端真实行为：
+
+    * ``move_no`` 是“已落子数”，悔棋会同时减少棋盘上的棋子和步数，
+      因此两者必须相等；
+    * 只有 ``result_reason == "five"``（棋盘分出胜负）时，棋盘上才必须
+      真的有五连；认输/超时/逃跑结束的棋局，棋盘上本来就没有五连；
+    * ``result_reason`` 为空是为了兼容不带该字段的旧服务端，此时只做
+      “连线自洽 + 不能有另一方五连”的宽松校验。
+    """
+    stones = _count_stones(board)
+    if move_no != stones:
+        raise ProtocolError(
+            f"move_no({move_no}) 与棋盘上的棋子数({stones})不一致"
+        )
+
+    if status in ("playing", "draw"):
+        if winning_line:
+            raise ProtocolError(
+                "对局进行中不应出现胜利连线"
+                if status == "playing"
+                else "和棋不应出现胜利连线"
+            )
+        # 只检查 winning_line 还不够：只要服务端声明 playing/draw，
+        # 就必须保证棋盘上确实没有五连，否则伪造的 status 会蒙混过关。
+        if _board_has_five(board, Player.BLACK) or _board_has_five(
+            board, Player.WHITE
+        ):
+            raise ProtocolError("对局尚未判定获胜，但棋盘上已有五连")
+
+    if status in ("black_won", "white_won"):
+        if winner is None:
+            raise ProtocolError("终局状态缺少胜者")
+        if result_reason == RESULT_REASON_FIVE:
+            # 棋盘分出胜负：棋盘上必须真的有该颜色的五连。
+            if not _find_winner_line(board, winner, last_move):
+                raise ProtocolError(
+                    "状态声明棋盘获胜，但棋盘上没有对应的五连"
+                )
+        elif result_reason in NON_BOARD_ENDINGS:
+            # 认输/超时/逃跑：棋盘上不会有五连，也就不该有胜利连线。
+            if winning_line:
+                raise ProtocolError(
+                    "认输/超时/逃跑结束的终局不应出现胜利连线"
+                )
+            if _board_has_five(board, winner.opponent):
+                raise ProtocolError(
+                    "状态声明的胜者与棋盘上的五连不一致"
+                )
+        else:
+            # 兼容不带 result_reason 的旧服务端：连线本身仍要自洽，
+            # 棋盘上也不能出现与胜者矛盾的另一方五连。
+            if _board_has_five(board, winner.opponent):
+                raise ProtocolError(
+                    "状态声明的胜者与棋盘上的五连不一致"
+                )
+
+    _validate_winning_line(board, winning_line, winner)
+
+
+def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
+    """校验并转换服务器权威局面快照。
+
+    逐字段校验之外还会做交叉校验（步数与棋子数、状态与胜利连线、胜者
+    与棋盘），字段互相矛盾时抛 ``ProtocolError``。
+    """
+    if not isinstance(payload, Mapping):
+        raise ProtocolError("game_state payload 必须是对象")
+
+    identity = _parse_identity_fields(payload)
+    winner, is_draw, is_game_over = _parse_status_fields(
+        identity.status
+    )
+    position = _parse_position_fields(payload)
+    room = _parse_room_fields(payload)
+    clock = _parse_clock_fields(payload)
+    undo = _parse_undo_fields(payload)
+    ranking = _parse_ranking_fields(payload)
+
+    opponent_online = payload.get("opponent_online")
+    if opponent_online is not None and not isinstance(opponent_online, bool):
+        raise ProtocolError("opponent_online 必须是布尔值或 null")
+
     black_achievements = normalize_achievement_keys(
         payload.get("black_achievements", ())
     )
@@ -415,61 +775,68 @@ def parse_game_state(payload: Mapping[str, Any]) -> GameSnapshot:
         payload.get("your_new_achievements", ())
     )
 
-    return GameSnapshot(
-        game_id=game_id,
-        board=board,
-        current_player=current_player,
-        last_move=last_move,
+    _validate_snapshot_consistency(
+        status=identity.status,
+        board=position.board,
         winner=winner,
-        winning_line=winning_line,
+        winning_line=position.winning_line,
+        last_move=position.last_move,
+        move_no=identity.move_no,
+        result_reason=undo.result_reason,
+    )
+
+    return GameSnapshot(
+        game_id=identity.game_id,
+        board=position.board,
+        current_player=identity.current_player,
+        last_move=position.last_move,
+        winner=winner,
+        winning_line=position.winning_line,
         is_draw=is_draw,
         is_game_over=is_game_over,
-        move_no=move_no,
-        your_color=your_color,
-        state_version=state_version,
-        result_reason=result_reason.strip(),
-        undo_requester_id=undo_requester_id,
-        undo_remaining=undo_remaining,
-        undo_limit=undo_limit,
-        undo_cooldown_until_ms=undo_cooldown_until_ms,
-        undo_cooldown_seconds=undo_cooldown_seconds,
-        room_code=room_code,
-        black_name=black_name,
-        white_name=white_name,
-        black_user_id=black_user_id,
-        white_user_id=white_user_id,
-        black_avatar=black_avatar,
-        white_avatar=white_avatar,
-        black_avatar_version=black_avatar_version,
-        white_avatar_version=white_avatar_version,
+        move_no=identity.move_no,
+        your_color=identity.your_color,
+        state_version=undo.state_version,
+        result_reason=undo.result_reason,
+        undo_requester_id=undo.undo_requester_id,
+        undo_remaining=undo.undo_remaining,
+        undo_limit=undo.undo_limit,
+        undo_cooldown_until_ms=undo.undo_cooldown_until_ms,
+        undo_cooldown_seconds=undo.undo_cooldown_seconds,
+        room_code=room.room_code,
+        black_name=room.black_name,
+        white_name=room.white_name,
+        black_user_id=room.black_user_id,
+        white_user_id=room.white_user_id,
+        black_avatar=room.black_avatar,
+        white_avatar=room.white_avatar,
+        black_avatar_version=room.black_avatar_version,
+        white_avatar_version=room.white_avatar_version,
         black_achievements=black_achievements,
         white_achievements=white_achievements,
         your_new_achievements=your_new_achievements,
-        turn_deadline_ms=optional_int("turn_deadline_ms"),
-        server_now_ms=optional_int("server_now_ms"),
-        move_timeout_seconds=move_timeout_seconds,
+        turn_deadline_ms=clock.turn_deadline_ms,
+        server_now_ms=clock.server_now_ms,
+        move_timeout_seconds=clock.move_timeout_seconds,
         opponent_online=opponent_online,
-        rated=rated,
-        your_rating_before=optional_rating("your_rating_before"),
-        your_rating_after=optional_rating("your_rating_after"),
-        opponent_rating_before=optional_rating("opponent_rating_before"),
-        opponent_rating_after=optional_rating("opponent_rating_after"),
-        rating_delta=rating_delta,
-        is_spectator=is_spectator,
-        time_control=time_control,
-        black_remaining_ms=black_remaining_ms,
-        white_remaining_ms=white_remaining_ms,
+        rated=ranking.rated,
+        your_rating_before=ranking.your_rating_before,
+        your_rating_after=ranking.your_rating_after,
+        opponent_rating_before=ranking.opponent_rating_before,
+        opponent_rating_after=ranking.opponent_rating_after,
+        rating_delta=ranking.rating_delta,
+        is_spectator=identity.is_spectator,
+        time_control=clock.time_control,
+        black_remaining_ms=clock.black_remaining_ms,
+        white_remaining_ms=clock.white_remaining_ms,
+        rule_mode=rule_mode_from_payload(payload.get("rule_mode")),
     )
 
 
 def make_move_intent(row: int, col: int) -> dict[str, int]:
     """构造客户端落子意图 payload；服务端仍须重新校验。"""
-    if (
-        not isinstance(row, int)
-        or not isinstance(col, int)
-        or not 0 <= row < BOARD_SIZE
-        or not 0 <= col < BOARD_SIZE
-    ):
+    # bool 是 int 的子类，必须用精确类型判断。
+    if type(row) is not int or type(col) is not int or not in_bounds(row, col):
         raise ProtocolError("落子坐标非法")
     return {"row": row, "col": col}
 
@@ -491,14 +858,27 @@ def make_message(
         "payload": dict(payload),
     }
     if request_id is not None:
-        if not isinstance(request_id, str) or not request_id:
-            raise ProtocolError("request_id 必须是非空字符串")
+        if (
+            not isinstance(request_id, str)
+            or not request_id
+            or len(request_id) > MAX_REQUEST_ID_LENGTH
+        ):
+            raise ProtocolError(
+                "request_id 必须是不超过 "
+                f"{MAX_REQUEST_ID_LENGTH} 个字符的非空字符串"
+            )
         message["request_id"] = request_id
     return message
 
 
 def parse_message(raw: Any) -> dict[str, Any]:
-    """校验 envelope 并返回原始 dict；未知类型交由会话决定是否忽略。"""
+    """校验 envelope 并返回原始 dict。
+
+    未知消息类型一律抛 ``ProtocolError``：解析器只负责“认得的消息必须
+    合法”。客户端需要向前兼容时，在调用本函数**之前**用
+    :data:`SERVER_MESSAGE_TYPES` 过滤掉不认识的类型（``OnlineSession``
+    就是这么做的），未知的服务端消息因此会被安静忽略，而不是打扰玩家。
+    """
     if not isinstance(raw, Mapping):
         raise ProtocolError("协议消息必须是对象")
     if raw.get("protocol") != PROTOCOL_VERSION:
@@ -516,14 +896,20 @@ def parse_message(raw: Any) -> dict[str, Any]:
 
     request_id = raw.get("request_id")
     if request_id is not None and (
-        not isinstance(request_id, str) or not request_id
+        not isinstance(request_id, str)
+        or not request_id
+        or len(request_id) > MAX_REQUEST_ID_LENGTH
     ):
-        raise ProtocolError("request_id 必须是非空字符串")
+        raise ProtocolError(
+            "request_id 必须是不超过 "
+            f"{MAX_REQUEST_ID_LENGTH} 个字符的非空字符串"
+        )
 
     return dict(raw)
 
 
 __all__ = [
+    "MAX_REQUEST_ID_LENGTH",
     "PROTOCOL_VERSION",
     "CLIENT_AUTH",
     "CLIENT_CREATE_ROOM",
@@ -561,6 +947,7 @@ __all__ = [
     "SERVER_LIVE_GAMES_CHANGED",
     "SERVER_MESSAGE_TYPES",
     "GameSnapshot",
+    "rule_mode_from_payload",
     "parse_game_state",
     "make_move_intent",
     "make_message",

@@ -2,12 +2,19 @@
 
 从项目根目录启动（开发）：
     server/.venv/Scripts/python.exe -m uvicorn server.app.main:app --host 127.0.0.1 --port 8000
+
+**部署约束：必须单 worker 运行。**
+房间、匹配队列、断线重连宽限等状态全部保存在进程内存里，多 worker
+（或多实例）之间互不可见：玩家会被匹配到别的进程上的队列、建好的
+房间在另一个进程里查不到、观战与重连会找不到房间。要横向扩容必须先把
+这些状态外置（Redis 等），当前只能用 ``--workers 1``。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Optional
@@ -46,6 +53,32 @@ from server.app.ws.rooms import RoomManager
 
 logger = logging.getLogger(__name__)
 
+#: REST/WS 接口版本号；升级到 v2 时只需要改这一处。
+API_VERSION = "v1"
+#: 所有接口的统一前缀，由版本号拼出来，避免各处硬编码 "/api/v1"。
+API_PREFIX = f"/api/{API_VERSION}"
+#: 健康检查路径（挂在 API_PREFIX 下）。
+HEALTH_PATHS = (
+    f"{API_PREFIX}/health",
+    f"{API_PREFIX}/health/live",
+    f"{API_PREFIX}/health/ready",
+)
+#: Prometheus 指标路径（不在版本前缀下）。
+METRICS_PATH = "/metrics"
+
+
+def _warn_if_multiple_workers() -> None:
+    """多 worker 启动时给出告警：房间状态在进程内存中，必须单 worker。"""
+    raw = os.environ.get("WEB_CONCURRENCY", "").strip()
+    if not raw.isdigit() or int(raw) <= 1:
+        return
+    logger.warning(
+        "检测到 WEB_CONCURRENCY=%s：房间/匹配队列保存在进程内存中，"
+        "多 worker 之间互不可见，请改用 --workers 1；"
+        "需要横向扩容请先把状态外置（如 Redis）",
+        raw,
+    )
+
 
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
     """创建可测试的 FastAPI 应用；每次调用拥有独立数据库/房间状态。"""
@@ -74,19 +107,33 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         app.state.room_manager = RoomManager(
             service_settings, session_factory, metrics
         )
+        # 启动扫描：补结算"已终局但 rating_applied 仍为假"的排位对局。
+        # 落子终局路径的写库与结算仍是两次提交，进程在中间崩溃会留下
+        # 这种对局；启动时补一遍，积分不会永久丢失。
+        await app.state.room_manager.repair_unsettled_games_once()
 
         logger.info(
             "服务启动 env=%s db=%s",
             service_settings.environment,
             service_settings.database_url.split(":", 1)[0],
         )
+        _warn_if_multiple_workers()
         try:
             yield
         finally:
             room_manager = getattr(app.state, "room_manager", None)
             if room_manager is not None:
-                await room_manager.shutdown()
-            await engine.dispose()
+                try:
+                    await room_manager.shutdown()
+                except Exception:
+                    # 关闭失败不能把后续清理步骤一起带崩，至少留个痕迹。
+                    logger.warning(
+                        "关闭房间管理器失败", exc_info=True
+                    )
+            try:
+                await engine.dispose()
+            except Exception:
+                logger.warning("释放数据库连接池失败", exc_info=True)
             logger.info("服务已停止")
 
     app = FastAPI(
@@ -136,12 +183,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "status": status_code,
                 "duration_ms": round(duration * 1000, 2),
             }
-            if route_path in {
-                "/api/v1/health",
-                "/api/v1/health/live",
-                "/api/v1/health/ready",
-                "/metrics",
-            }:
+            if route_path in HEALTH_PATHS or route_path == METRICS_PATH:
                 logger.debug("http_request", extra=fields)
             elif status_code >= 500:
                 logger.error("http_request", extra=fields)
@@ -149,15 +191,15 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 logger.info("http_request", extra=fields)
             reset_request_id(token)
 
-    app.include_router(auth_router, prefix="/api/v1")
-    app.include_router(ranked_router, prefix="/api/v1")
-    app.include_router(seasons_router, prefix="/api/v1")
-    app.include_router(games_router, prefix="/api/v1")
-    app.include_router(reports_router, prefix="/api/v1")
-    app.include_router(users_router, prefix="/api/v1")
-    app.include_router(friends_router, prefix="/api/v1")
-    app.include_router(messages_router, prefix="/api/v1")
-    app.include_router(ws_router, prefix="/api/v1")
+    app.include_router(auth_router, prefix=API_PREFIX)
+    app.include_router(ranked_router, prefix=API_PREFIX)
+    app.include_router(seasons_router, prefix=API_PREFIX)
+    app.include_router(games_router, prefix=API_PREFIX)
+    app.include_router(reports_router, prefix=API_PREFIX)
+    app.include_router(users_router, prefix=API_PREFIX)
+    app.include_router(friends_router, prefix=API_PREFIX)
+    app.include_router(messages_router, prefix=API_PREFIX)
+    app.include_router(ws_router, prefix=API_PREFIX)
 
     async def _database_ready() -> bool:
         session_factory = getattr(app.state, "session_factory", None)
@@ -178,21 +220,21 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             return False
         return True
 
-    @app.get("/api/v1/health")
+    @app.get(f"{API_PREFIX}/health")
     async def health(request: Request) -> dict:
         return {
             "status": "ok",
             "environment": request.app.state.settings.environment,
         }
 
-    @app.get("/api/v1/health/live")
+    @app.get(f"{API_PREFIX}/health/live")
     async def health_live(request: Request) -> dict:
         return {
             "status": "ok",
             "environment": request.app.state.settings.environment,
         }
 
-    @app.get("/api/v1/health/ready")
+    @app.get(f"{API_PREFIX}/health/ready")
     async def health_ready(request: Request) -> Response:
         ready = await _database_ready()
         payload = {
@@ -205,7 +247,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             content=payload,
         )
 
-    @app.get("/metrics", include_in_schema=False)
+    @app.get(METRICS_PATH, include_in_schema=False)
     async def metrics_endpoint(request: Request) -> Response:
         metrics = getattr(request.app.state, "metrics", None)
         if metrics is None:
@@ -219,3 +261,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
 
 app = create_app()
+
+__all__ = [
+    "API_PREFIX",
+    "API_VERSION",
+    "HEALTH_PATHS",
+    "METRICS_PATH",
+    "app",
+    "create_app",
+]

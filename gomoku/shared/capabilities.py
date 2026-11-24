@@ -40,9 +40,18 @@ SERVER_CAPABILITIES = frozenset(
 #: 当前客户端理解的服务端能力。
 CLIENT_CAPABILITIES = frozenset(SERVER_CAPABILITIES)
 
+#: 协议中已定义的全部能力名。未列出的名称会被 :func:`normalize_capabilities`
+#: 安静丢弃：未知能力只表示对端版本更新，不影响本端协商。
+KNOWN_CAPABILITIES = frozenset(SERVER_CAPABILITIES | CLIENT_CAPABILITIES)
+
 
 def normalize_capabilities(value: Any) -> tuple[str, ...]:
-    """校验并返回去重后的能力名；畸形输入抛 ``ProtocolError``。"""
+    """校验并返回去重后的已知能力名；畸形输入抛 ``ProtocolError``。
+
+    未知能力名不是错误，但会被过滤掉，避免把本端不认识的能力误当成
+    “已支持”。名称长度按 UTF-8 字节数计算：中文等多字节名称按字符计数
+    会明显放宽实际传输的字段长度。
+    """
     if value is None:
         return ()
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
@@ -56,8 +65,13 @@ def normalize_capabilities(value: Any) -> tuple[str, ...]:
         if not isinstance(item, str):
             raise ProtocolError("capabilities 只能包含字符串")
         name = item.strip()
-        if not name or len(name) > MAX_CAPABILITY_LENGTH:
+        # surrogatepass 让极端代理对输入也能得到确定的字节长度，
+        # 而不是在 encode 时抛 UnicodeEncodeError。
+        byte_length = len(name.encode("utf-8", errors="surrogatepass"))
+        if not name or byte_length > MAX_CAPABILITY_LENGTH:
             raise ProtocolError("capability 名称非法")
+        if name not in KNOWN_CAPABILITIES:
+            continue
         if name not in seen:
             seen.add(name)
             result.append(name)
@@ -74,6 +88,7 @@ __all__ = [
     "CAP_UNDO_QUOTA",
     "CAP_UNDO_REQUEST",
     "CLIENT_CAPABILITIES",
+    "KNOWN_CAPABILITIES",
     "MAX_CAPABILITIES",
     "MAX_CAPABILITY_LENGTH",
     "SERVER_CAPABILITIES",

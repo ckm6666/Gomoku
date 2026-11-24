@@ -7,7 +7,8 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from collections import defaultdict
+from typing import Optional, Sequence
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
@@ -48,14 +49,10 @@ def _report_entry(report: GameReport) -> ReportEntry:
     )
 
 
-async def _audit_count(session: AsyncSession, game: Game) -> int:
-    rows = (
-        await session.scalars(
-            select(MoveRow)
-            .where(MoveRow.game_id == game.id)
-            .order_by(MoveRow.move_no.asc())
-        )
-    ).all()
+def _audit_count_for_game(
+    game: Game, rows: Sequence[MoveRow]
+) -> int:
+    """用已加载的落子行计算审计异常数量。"""
     result = audit_game(
         game_id=game.id,
         black_user_id=game.black_user_id,
@@ -67,8 +64,34 @@ async def _audit_count(session: AsyncSession, game: Game) -> int:
         moves=audit_moves_from_rows(rows),
         started_at=game.started_at,
         ended_at=game.ended_at,
+        rule_mode=game.rule_mode or "freestyle",
     )
     return len(result.findings)
+
+
+async def _load_moves_by_game(
+    session: AsyncSession, game_ids: Sequence[str]
+) -> dict[str, list[MoveRow]]:
+    """一次性取出所有被举报对局的落子，并按对局分组。
+
+    举报列表可能有几十上百条、涉及几十局对局；逐局查询会让 SQL 次数
+    随对局数线性增长（N+1），长棋谱还要重复重放，延迟可以到秒级。
+    这里合并成一条 ``IN`` 查询，查询次数与对局数无关。
+    """
+    grouped: dict[str, list[MoveRow]] = defaultdict(list)
+    unique_ids = list(dict.fromkeys(game_ids))
+    if not unique_ids:
+        return grouped
+    rows = (
+        await session.scalars(
+            select(MoveRow)
+            .where(MoveRow.game_id.in_(unique_ids))
+            .order_by(MoveRow.game_id.asc(), MoveRow.move_no.asc())
+        )
+    ).all()
+    for row in rows:
+        grouped[row.game_id].append(row)
+    return grouped
 
 
 @router.post(
@@ -207,13 +230,20 @@ async def admin_reports(
             )
         ).all()
         games = {game.id: game for game in game_rows}
+    # 所有被举报对局的落子一次查完，再逐局在内存里重放审计，
+    # 避免每局一次查询（N+1）。
+    moves_by_game = await _load_moves_by_game(
+        session, list(games.keys())
+    )
     audit_counts: dict[str, int] = {}
     entries: list[AdminReportEntry] = []
     for report in reports:
         base = _report_entry(report)
         game = games.get(report.game_id)
         if game is not None and game.id not in audit_counts:
-            audit_counts[game.id] = await _audit_count(session, game)
+            audit_counts[game.id] = _audit_count_for_game(
+                game, moves_by_game.get(game.id, [])
+            )
         entries.append(
             AdminReportEntry(
                 **base.model_dump(),
