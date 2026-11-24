@@ -9,6 +9,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -19,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from PySide6.QtCore import QSettings  # noqa: E402
 
 from gomoku.client.credential_store import (  # noqa: E402
+    KEY_REMEMBER,
     clear_login,
     clear_refresh_token,
     load_login,
@@ -119,6 +121,25 @@ class CredentialStoreTests(unittest.TestCase):
         self.assertEqual(username, "")
         self.assertEqual(password, "")
 
+    def test_failed_password_storage_clears_remember_flag(self) -> None:
+        """密码没能安全保存时，“记住密码”状态必须一起变成 False。
+
+        否则下次启动界面还会勾着“记住密码”，而自动登录根本拿不出密码。
+        """
+        with mock.patch(
+            "gomoku.client.credential_store.protect_password",
+            return_value=None,
+        ):
+            saved = save_login(self.settings, "alice", "s3cret-pass")
+        self.assertFalse(saved)
+        self.assertFalse(
+            self.settings.value(KEY_REMEMBER, True, type=bool)
+        )
+        remember, username, password = load_login(self.settings)
+        self.assertFalse(remember)
+        self.assertEqual(username, "alice")
+        self.assertEqual(password, "")
+
     def test_undecryptable_password_is_treated_as_not_remembered(self) -> None:
         """密文失效时不能显示"已记住"却拿不出密码。
 
@@ -142,7 +163,8 @@ class CredentialStoreTests(unittest.TestCase):
         """非 Windows 平台不保存密码，只记住用户名。
 
         模块必须在非 Windows 上也能导入（客户端在 Linux/macOS 上仍要能
-        启动），只是不能保存密码。
+        启动），只是不能保存密码。密码存不下来时“记住密码”状态必须
+        一起变成 False，否则下次启动复选框还勾着却拿不出密码。
         """
         code = textwrap.dedent(
             """
@@ -156,6 +178,7 @@ class CredentialStoreTests(unittest.TestCase):
             sys.platform = "linux"
 
             from gomoku.client.credential_store import (
+                KEY_REMEMBER,
                 load_login,
                 protect_password,
                 save_login,
@@ -169,9 +192,10 @@ class CredentialStoreTests(unittest.TestCase):
             settings = QSettings(path, QSettings.Format.IniFormat)
             assert save_login(settings, "alice", "secret") is False
             remember, username, password = load_login(settings)
-            assert remember is True
+            assert remember is False
             assert username == "alice"
             assert password == ""
+            assert settings.value(KEY_REMEMBER, True, type=bool) is False
             print("ok")
             """
         ).format(root=str(PROJECT_ROOT))

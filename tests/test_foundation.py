@@ -280,9 +280,12 @@ class ProtocolTests(unittest.TestCase):
         self.assertFalse(snapshot.is_game_over)
 
     def test_game_state_undo_metadata_parse(self) -> None:
+        board = blank_values()
+        board[7][7] = "black"
+        board[7][8] = "white"
         payload = {
             "game_id": "g-undo",
-            "board": blank_values(),
+            "board": board,
             "current_player": "black",
             "your_color": "black",
             "move_no": 2,
@@ -362,7 +365,7 @@ class ProtocolTests(unittest.TestCase):
                 "board": blank_values(),
                 "current_player": "white",
                 "your_color": "black",
-                "move_no": 1,
+                "move_no": 0,
                 "status": "playing",
                 "time_control": {
                     "mode": "fischer",
@@ -396,13 +399,16 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(legacy.time_control.turn_seconds, 45)
 
     def test_rated_game_state_parse(self) -> None:
+        board = blank_values()
+        for col in range(3, 8):
+            board[7][col] = "black"
         snapshot = parse_game_state(
             {
                 "game_id": "g-rated",
-                "board": blank_values(),
+                "board": board,
                 "current_player": "black",
                 "your_color": "white",
-                "move_no": 6,
+                "move_no": 5,
                 "status": "black_won",
                 "rated": True,
                 "room_code": "",

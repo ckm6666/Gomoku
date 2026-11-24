@@ -9,16 +9,19 @@
 - 界面层负责比较版本号并在浏览器里打开发布页。
 
 日志里只允许出现状态码与错误枚举：令牌和响应正文都不许落盘。
+
+注意：更新检查走的是 GitHub 官方 API，不是自建服务端，因此地址是完整的
+绝对 URL，也没有 Bearer 头的强制要求（令牌只在 api.github.com 时附带）。
+公共的 JSON 解析、错误提取与 reply 生命周期仍由
+:class:`~gomoku.client.net.json_api.JsonApiClient` 统一处理。
 """
 
 from __future__ import annotations
 
-import json
 import logging
-from collections.abc import Mapping
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
-from PySide6.QtCore import QByteArray, QObject, QUrl, Signal
+from PySide6.QtCore import QObject, QUrl, Signal
 from PySide6.QtNetwork import (
     QNetworkAccessManager,
     QNetworkReply,
@@ -26,6 +29,7 @@ from PySide6.QtNetwork import (
 )
 
 from gomoku.client.constants import APP_VERSION, GITHUB_RELEASE_API_URL
+from gomoku.client.net.json_api import JsonApiClient, ReplyOutcome
 from gomoku.shared.update_check import ReleaseInfo, parse_release_payload
 
 logger = logging.getLogger(__name__)
@@ -40,12 +44,16 @@ _ERR_NETWORK = "无法连接 GitHub，请检查网络"
 _ERR_UNEXPECTED = "更新检查失败，请稍后再试"
 
 
-class UpdateHTTPClient(QObject):
+class UpdateHTTPClient(JsonApiClient):
     """向 GitHub Releases API 查询最新版本；同一时刻只允许一个在途请求。"""
 
     release_ready = Signal(object)  # ReleaseInfo
     failed = Signal(str)  # 中文错误消息
     busy_changed = Signal(bool)
+
+    invalid_url_message = _ERR_BAD_URL
+    malformed_payload_message = _ERR_BAD_PAYLOAD
+    default_error_message = _ERR_UNEXPECTED
 
     def __init__(
         self,
@@ -56,15 +64,11 @@ class UpdateHTTPClient(QObject):
         manager: Optional[QNetworkAccessManager] = None,
         parent: Optional[QObject] = None,
     ) -> None:
-        super().__init__(parent)
-        self._api_url = api_url or ""
-        self._timeout_seconds = timeout_seconds
+        super().__init__(
+            api_url, timeout_seconds, parent=parent, manager=manager
+        )
         # 令牌只用于提高 GitHub API 的频率上限；绝不入日志。
         self._token = token or ""
-        # manager 可注入，便于测试时替换成假的对象。
-        self._manager = (
-            manager if manager is not None else QNetworkAccessManager(self)
-        )
         self._reply: Optional[QNetworkReply] = None
 
     @property
@@ -84,18 +88,14 @@ class UpdateHTTPClient(QObject):
             self.failed.emit(_ERR_IN_PROGRESS)
             return False
 
-        url_text = self._api_url.strip()
-        if not url_text:
-            self.failed.emit(_ERR_BAD_URL)
-            return False
-        url = QUrl(url_text)
-        if url.scheme() not in ("http", "https") or not url.host():
-            self.failed.emit(_ERR_BAD_URL)
+        url, error = self.prepare_url(self.base_url)
+        if url is None:
+            self.failed.emit(error)
             return False
 
-        request = self._build_request(url)
+        request = self.build_request(url, headers=self._github_headers(url))
         try:
-            reply = self._manager.get(request)
+            reply = self.manager.get(request)
         except RuntimeError:
             # 宿主窗口已销毁，事件循环已经退出。
             self.failed.emit(_ERR_NETWORK)
@@ -123,91 +123,94 @@ class UpdateHTTPClient(QObject):
     # ------------------------------------------------------------------
     # 请求/响应
     # ------------------------------------------------------------------
-    def _build_request(self, url: QUrl) -> QNetworkRequest:
-        """构造带 GitHub 约定请求头的 GET 请求。"""
-        request = QNetworkRequest(url)
-        request.setRawHeader(
-            QByteArray(b"Accept"), QByteArray(b"application/vnd.github+json")
+    def prepare_url(self, path: str) -> tuple[Optional[QUrl], str]:
+        """更新检查直连 GitHub：地址是完整的绝对 URL，不拼基址。"""
+        text = (path or "").strip()
+        if not text:
+            return None, self.invalid_url_message
+        url = QUrl(text)
+        if url.scheme() not in ("http", "https") or not url.host():
+            return None, self.invalid_url_message
+        return url, ""
+
+    def is_success(
+        self, status_code: Optional[int], network_error: bool
+    ) -> bool:
+        """更新检查必须有 2xx 状态码，而且 Qt 没有报网络错误。"""
+        return (
+            status_code is not None
+            and 200 <= status_code < 300
+            and not network_error
         )
-        request.setRawHeader(
-            QByteArray(b"X-GitHub-Api-Version"), QByteArray(b"2022-11-28")
-        )
-        request.setRawHeader(
-            QByteArray(b"User-Agent"),
-            QByteArray(f"Gomoku/{APP_VERSION}".encode("utf-8")),
-        )
+
+    def _github_headers(self, url: QUrl) -> dict[str, bytes]:
+        """构造 GitHub 约定的请求头。"""
+        headers = {
+            "Accept": b"application/vnd.github+json",
+            "X-GitHub-Api-Version": b"2022-11-28",
+            "User-Agent": f"Gomoku/{APP_VERSION}".encode("utf-8"),
+        }
         # 令牌只发给 GitHub 官方 API：api_url 是可配置的，万一被改成第三方
         # 地址，把个人访问令牌带过去等于把凭据交出去。
         if self._token and url.host().lower() == "api.github.com":
-            request.setRawHeader(
-                QByteArray(b"Authorization"),
-                QByteArray(f"Bearer {self._token}".encode("utf-8")),
+            headers["Authorization"] = (
+                f"Bearer {self._token}".encode("utf-8")
             )
-        request.setTransferTimeout(int(self._timeout_seconds * 1000))
-        return request
+        return headers
 
     def _on_finished(self, reply: QNetworkReply) -> None:
         """处理一次请求的结束。"""
         if reply is not self._reply:
             # 已经被 abort() 取消的旧响应：静默丢弃，不发任何信号。
-            self._discard(reply)
+            self.discard(reply)
             return
 
         self._reply = None
         # 先复位忙状态，界面就不会在提示框弹出时还显示“检查中”。
         self.busy_changed.emit(False)
         try:
-            self._handle(reply)
+            self._log_reply(reply)
         except RuntimeError:
-            # 宿主窗口已经销毁，reply 也跟着没了。槽函数里抛出的异常
-            # 会让 PySide 直接中止整个进程，这里必须静默收场。
-            return
-        except Exception:  # pragma: no cover - 兜底，界面不能被异常打断
-            logger.exception("更新检查处理异常")
-            self.failed.emit(_ERR_UNEXPECTED)
-        finally:
-            self._discard(reply)
+            # reply 可能已经随宿主窗口销毁，日志拿不到就算了。
+            pass
+        self.handle_reply(
+            reply,
+            on_success=self._on_success,
+            on_error=self._on_error,
+        )
 
-    def _handle(self, reply: QNetworkReply) -> None:
-        """按状态码与错误枚举分流，产出结果信号。"""
-        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
-        status_code = status if isinstance(status, int) else None
-        error = reply.error()
-        logger.info("更新检查响应：HTTP %s，错误枚举 %s", status_code, error)
+    @staticmethod
+    def _log_reply(reply: QNetworkReply) -> None:
+        """记录状态码与错误枚举：令牌和响应正文都不许落盘。"""
+        status = reply.attribute(
+            QNetworkRequest.Attribute.HttpStatusCodeAttribute
+        )
+        logger.info(
+            "更新检查响应：HTTP %s，错误枚举 %s",
+            status if isinstance(status, int) else None,
+            reply.error(),
+        )
 
-        if status_code is not None and not 200 <= status_code < 300:
-            self.failed.emit(self._message_for_status(status_code))
-            return
-        if error != QNetworkReply.NetworkError.NoError or status_code is None:
-            # 没有 HTTP 状态码却带错误枚举：典型的连不上/超时。
-            self.failed.emit(_ERR_NETWORK)
-            return
-
-        payload = self._decode_payload(reply)
-        if payload is None:
-            self.failed.emit(_ERR_BAD_PAYLOAD)
-            return
-
+    def _on_success(self, data: Mapping[str, Any]) -> None:
         try:
-            release: ReleaseInfo = parse_release_payload(payload)
+            release: ReleaseInfo = parse_release_payload(data)
         except ValueError:
             self.failed.emit(_ERR_BAD_PAYLOAD)
             return
         self.release_ready.emit(release)
 
-    @staticmethod
-    def _decode_payload(reply: QNetworkReply) -> Optional[Mapping[str, Any]]:
-        """把响应正文解码成 JSON 对象；格式不对时返回 ``None``。"""
-        # QByteArray.data() 已经是字节串，这里再包一层 bytes 是为了
-        # 兼容不同 PySide6 版本返回的 bytes / bytearray / memoryview。
-        raw = bytes(reply.readAll().data())
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return None
-        if not isinstance(payload, Mapping):
-            return None
-        return payload
+    def _on_error(self, outcome: ReplyOutcome) -> None:
+        status = outcome.status
+        if status is not None and not 200 <= status < 300:
+            self.failed.emit(self._message_for_status(status))
+            return
+        if outcome.network_error or status is None:
+            self.failed.emit(_ERR_NETWORK)
+            return
+        if outcome.malformed:
+            self.failed.emit(_ERR_BAD_PAYLOAD)
+            return
+        self.failed.emit(_ERR_UNEXPECTED)
 
     @staticmethod
     def _message_for_status(status_code: int) -> str:
@@ -217,14 +220,6 @@ class UpdateHTTPClient(QObject):
         if status_code == 404:
             return _ERR_NOT_FOUND
         return f"更新检查失败（HTTP {status_code}）"
-
-    @staticmethod
-    def _discard(reply: QNetworkReply) -> None:
-        """安全地销毁 reply：它可能已经随宿主窗口一起没了。"""
-        try:
-            reply.deleteLater()
-        except RuntimeError:
-            pass
 
 
 __all__ = ["UpdateHTTPClient"]

@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import io
+import logging
 import unittest
 
 from gomoku.shared.errors import ConfigurationError
 from server.app.config import Settings
-from server.app.observability import sanitize_request_id
+from server.app.observability import (
+    JsonFormatter,
+    TextFormatter,
+    configure_logging,
+    sanitize_request_id,
+)
 from server.tests.helpers import ServerTestBase
 
 
@@ -95,6 +102,93 @@ class LoggingConfigTests(unittest.TestCase):
                     "GOMOKU_LOG_FORMAT": "xml",
                 }
             )
+
+
+class FormatterTests(unittest.TestCase):
+    """文本日志不能再用硬编码字段白名单，extra 字段必须全部可见。"""
+
+    def _record(self, **extra: object) -> logging.LogRecord:
+        record = logging.LogRecord(
+            name="gomoku.test",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="测试消息",
+            args=None,
+            exc_info=None,
+        )
+        for key, value in extra.items():
+            setattr(record, key, value)
+        return record
+
+    def test_text_formatter_includes_custom_extra_fields(self) -> None:
+        record = self._record(custom_field="value", event="custom_event")
+        output = TextFormatter().format(record)
+        self.assertIn("custom_field=value", output)
+        self.assertIn("event=custom_event", output)
+
+    def test_text_formatter_skips_standard_record_fields(self) -> None:
+        record = self._record(custom_field="value")
+        output = TextFormatter().format(record)
+        # 正文里已经有消息和时间，不能再重复一份。
+        self.assertNotIn("message=", output)
+        self.assertNotIn("asctime=", output)
+        self.assertNotIn("levelname=", output)
+
+    def test_json_formatter_includes_custom_extra_fields(self) -> None:
+        record = self._record(custom_field="value")
+        output = JsonFormatter().format(record)
+        self.assertIn('"custom_field": "value"', output)
+
+
+class ConfigureLoggingTests(unittest.TestCase):
+    """configure_logging 只管理自己装的 handler。"""
+
+    def setUp(self) -> None:
+        self.root = logging.getLogger()
+        self.original_handlers = list(self.root.handlers)
+        self.original_level = self.root.level
+
+    def tearDown(self) -> None:
+        for handler in list(self.root.handlers):
+            if handler not in self.original_handlers:
+                self.root.removeHandler(handler)
+        for handler in self.original_handlers:
+            if handler not in self.root.handlers:
+                self.root.addHandler(handler)
+        self.root.setLevel(self.original_level)
+
+    def _settings(self) -> Settings:
+        return Settings(
+            environment="test",
+            database_url="sqlite+aiosqlite:///:memory:",
+            jwt_secret="test-secret-" + "x" * 48,
+            log_level="WARNING",
+            log_format="text",
+        )
+
+    def test_repeated_call_does_not_accumulate_handlers(self) -> None:
+        marker = logging.StreamHandler(io.StringIO())
+        self.root.addHandler(marker)
+        try:
+            configure_logging(self._settings())
+            first = len(self.root.handlers)
+            configure_logging(self._settings())
+            second = len(self.root.handlers)
+            # 别的组件装上的 handler 不能被清掉。
+            self.assertIn(marker, self.root.handlers)
+        finally:
+            self.root.removeHandler(marker)
+        self.assertEqual(first, second)
+
+    def test_foreign_handlers_survive_configuration(self) -> None:
+        marker = logging.StreamHandler(io.StringIO())
+        self.root.addHandler(marker)
+        try:
+            configure_logging(self._settings())
+            self.assertIn(marker, self.root.handlers)
+        finally:
+            self.root.removeHandler(marker)
 
 
 if __name__ == "__main__":

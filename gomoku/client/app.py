@@ -122,6 +122,7 @@ def main() -> int:
     )
 
     # 在窗口创建前初始化音频，让 QSettings/QStandardPaths 使用正确的应用元信息。
+    # 内置 MP3 素材的解码在后台线程进行，首次运行也不会把启动卡住。
     audio_manager = initialize_audio()
     audio_manager.install_button_click_sounds(app)
     logger.info("音频初始化 available=%s", audio_manager.available)

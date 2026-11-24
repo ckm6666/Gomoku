@@ -122,6 +122,54 @@ class AuditSequenceTests(unittest.TestCase):
         )
 
 
+def _renju_overline_moves() -> list[AuditMove]:
+    """黑棋第 6 颗连成 6 颗：自由规则算胜，连珠规则是长连禁手。"""
+    coordinates = [
+        ((7, 2), "black"),
+        ((0, 0), "white"),
+        ((7, 3), "black"),
+        ((2, 0), "white"),
+        ((7, 4), "black"),
+        ((4, 0), "white"),
+        ((7, 5), "black"),
+        ((6, 0), "white"),
+        ((7, 7), "black"),
+        ((8, 0), "white"),
+        ((7, 6), "black"),
+    ]
+    return [
+        AuditMove(
+            move_no=index,
+            user_id=color,
+            color=color,
+            row=row,
+            col=col,
+            created_at=_START + timedelta(seconds=index * 2),
+        )
+        for index, ((row, col), color) in enumerate(coordinates, start=1)
+    ]
+
+
+class AuditRuleModeTests(unittest.TestCase):
+    """审计重放必须遵循对局记录的规则模式。"""
+
+    def test_freestyle_overline_is_still_a_win(self) -> None:
+        result = _audit(_renju_overline_moves())
+        self.assertTrue(result.ok, result.findings)
+
+    def test_renju_overline_is_an_illegal_move(self) -> None:
+        result = _audit(_renju_overline_moves(), rule_mode="renju")
+        self.assertFalse(result.ok)
+        codes = {item.code for item in result.findings}
+        self.assertIn("illegal_move", codes)
+        # 禁手被拒后重放棋盘没有胜者，记录的黑胜也随之对不上。
+        self.assertIn("result_mismatch", codes)
+
+    def test_renju_exact_five_is_still_a_win(self) -> None:
+        result = _audit(_winning_moves(), rule_mode="renju")
+        self.assertTrue(result.ok, result.findings)
+
+
 class AuditResultTests(unittest.TestCase):
     def test_resign_ending_without_five_is_ok(self) -> None:
         moves = [

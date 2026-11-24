@@ -123,6 +123,25 @@ def _fake_analyze(
     return None
 
 
+def _slow_analyze(
+    self,
+    board_snapshot,
+    player,
+    difficulty,
+    cancel_event=None,
+    *,
+    top_n=3,
+    config_override=None,
+):
+    """测试注入：可取消的慢速分析，用于稳定观察“分析进行中”状态。"""
+    del self, board_snapshot, player, difficulty, top_n, config_override
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if cancel_event is not None and cancel_event.wait(0.01):
+            return None
+    return None
+
+
 class UIAndAITests(unittest.TestCase):
     """覆盖双人回归、AI 自动落子、AI 先手、悔棋、设置锁定和关窗清理。"""
 
@@ -397,18 +416,30 @@ class UIAndAITests(unittest.TestCase):
 
     def test_replay_page_loads_local_records(self) -> None:
         """复盘页首次打开就要载入本地棋谱，而不是空列表。"""
+        # 棋谱必须是“完整的一局”：棋盘分出胜负，记录里的胜者也要一致，
+        # 否则棋谱库会把它当作损坏数据跳过。
         record = GameRecord(
             record_id="r1",
             created_at="2026-01-01T00:00:00+00:00",
             mode="local",
-            moves=(Move(7, 7, Player.BLACK),),
-            winner=None,
-            result_reason="",
+            moves=(
+                Move(7, 3, Player.BLACK),
+                Move(6, 3, Player.WHITE),
+                Move(7, 4, Player.BLACK),
+                Move(6, 4, Player.WHITE),
+                Move(7, 5, Player.BLACK),
+                Move(6, 5, Player.WHITE),
+                Move(7, 6, Player.BLACK),
+                Move(6, 6, Player.WHITE),
+                Move(7, 7, Player.BLACK),
+            ),
+            winner=Player.BLACK,
+            result_reason="five",
             black_name="黑棋",
             white_name="白棋",
         )
         store = self.window._record_store
-        store.append(record)
+        self.assertTrue(store.append(record))
 
         # 走真实入口：点击菜单按钮。QPushButton.clicked 会带一个
         # checked=False 参数，槽函数必须能正确处理。
@@ -825,6 +856,79 @@ class UIAndAITests(unittest.TestCase):
         self._click_cell(*empty)
         self.app.processEvents()
         self.assertIsNone(self.window.board_widget._hint_cell)
+        self.assertTrue(self.window.puzzle_hint_label.isHidden())
+
+    def test_session_canceled_hint_resets_button(self) -> None:
+        """会话侧取消提示（如暂停）后，按钮不能停留在“取消提示”。"""
+        self._start_ai(difficulty_index=0)
+        self._click_cell(7, 7)
+        self.assertTrue(
+            wait_until(
+                lambda: self.window.game.move_count == 2
+                and self.window._ai_thread is None,
+                6.0,
+                self.app,
+            )
+        )
+
+        with mock.patch(
+            "gomoku.client.ai_worker.GomokuAI.analyze",
+            new=_slow_analyze,
+        ):
+            self.window.hint_button.click()
+            self.app.processEvents()
+            self.assertEqual(self.window.hint_button.text(), "取消提示")
+            self.assertTrue(self.window.session.hint_running)
+
+            # 暂停会作废在途提示；界面通过 hint_cleared 同步复位。
+            self.window.session.pause()
+            self.app.processEvents()
+            self.assertFalse(self.window.session.hint_running)
+            self.assertFalse(self.window._hint_analysis_pending)
+            self.assertEqual(self.window.hint_button.text(), "提示")
+            self.assertTrue(self.window.puzzle_hint_label.isHidden())
+            self.assertTrue(
+                wait_until(
+                    lambda: self.window.session.hint_thread is None,
+                    2.0,
+                    self.app,
+                )
+            )
+
+    def test_session_clear_removes_cached_hint_marker(self) -> None:
+        """会话作废已显示的提示时，棋盘标记与备选 tooltip 一并清除。"""
+        self._start_ai(difficulty_index=0)
+        self._click_cell(7, 7)
+        self.assertTrue(
+            wait_until(
+                lambda: self.window.game.move_count == 2
+                and self.window._ai_thread is None,
+                6.0,
+                self.app,
+            )
+        )
+
+        with mock.patch(
+            "gomoku.client.ai_worker.GomokuAI.analyze",
+            new=_fake_analyze,
+        ):
+            self.window.hint_button.click()
+            self.assertTrue(
+                wait_until(
+                    lambda: self.window.session.hint_thread is None
+                    and self.window.board_widget._hint_cell is not None,
+                    5.0,
+                    self.app,
+                )
+            )
+        self.assertIn("备选", self.window.hint_button.toolTip())
+        self.assertFalse(self.window.puzzle_hint_label.isHidden())
+
+        # 暂停会作废缓存的提示结果；旧标记与 tooltip 不能留在界面上。
+        self.window.session.pause()
+        self.app.processEvents()
+        self.assertIsNone(self.window.board_widget._hint_cell)
+        self.assertNotIn("备选", self.window.hint_button.toolTip())
         self.assertTrue(self.window.puzzle_hint_label.isHidden())
 
     def test_ai_hint_disabled_while_ai_thinking(self) -> None:

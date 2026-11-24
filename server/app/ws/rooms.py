@@ -17,13 +17,13 @@ import asyncio
 import logging
 import secrets
 import time
+from collections import OrderedDict
 from typing import Optional, cast
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, select, update
 
-from gomoku.shared.achievements import new_achievement_keys
-from gomoku.shared.avatar import DEFAULT_AVATAR, normalize_avatar
+from gomoku.shared.avatar import DEFAULT_AVATAR
 from gomoku.shared.chat import (
     CHAT_BURST,
     CHAT_WINDOW_SECONDS,
@@ -33,74 +33,65 @@ from gomoku.shared.errors import ProtocolError
 from gomoku.shared.game_model import GameModel
 from gomoku.shared.protocol import (
     SERVER_ERROR,
-    SERVER_CHAT,
-    SERVER_FRIEND_EVENT,
-    SERVER_GAME_STATE,
     SERVER_LIVE_GAMES_CHANGED,
     SERVER_MATCH_FOUND,
     SERVER_MOVE_REJECTED,
-    SERVER_OPPONENT_STATUS,
     SERVER_QUEUE_STATUS,
-    SERVER_REMATCH_STATUS,
     SERVER_ROOM_CLOSED,
-    SERVER_ROOM_CREATED,
     SERVER_ROOM_INVITATION,
     SERVER_ROOM_INVITE_RESULT,
-    SERVER_UNDO_STATUS,
     make_message,
 )
-from gomoku.shared.rules import BOARD_SIZE, Player
-from gomoku.shared.social import (
-    FRIEND_EVENT_OFFLINE,
-    FRIEND_EVENT_ONLINE,
+from gomoku.shared.rules import (
+    Player,
+    RuleMode,
+    in_bounds,
+    is_forbidden_move,
+    parse_rule_mode,
 )
 from gomoku.shared.time_control import DEFAULT_TIME_CONTROL, TimeControl
-from server.app.achievement_service import achievement_keys_for_user
 from server.app.config import Settings
-from server.app.db import utcnow_naive
+from server.app.db import rowcount_of, utcnow_naive
 from server.app.metrics import ServerMetrics
 from server.app.models import (
     Friendship,
     Game,
     Move,
-    RatingEvent,
     User,
     new_id,
 )
-from server.app.ratings import calculate_pair, rank_for_rating
 from server.app.seasons import SeasonInfo, ensure_current_season
+from server.app.ws import payloads
+from server.app.ws.clock_service import ClockService
+from server.app.ws.connection_registry import ConnectionRegistry
 from server.app.ws.entities import (
     ClientConnection,
     QueuedPlayer,
     Room,
     RoomInvite,
 )
-from server.app.ws.limits import IpConnectionLimiter
+from server.app.ws.matchmaker import Matchmaker
+from server.app.ws.settlement import RatingSettlement, SettlementResult
 
 logger = logging.getLogger(__name__)
 
 _ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 _INVITE_TTL_SECONDS = 60.0
-#: 悔棋请求等待对手回应的最长时间；超时自动取消并恢复回合计时。
-_UNDO_REQUEST_TTL_SECONDS = 30.0
+#: 单个连接发送一条广播消息的最长时间；超过就放弃这一条。
+_BROADCAST_SEND_TIMEOUT_SECONDS = 5.0
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _color_text(player: Player) -> str:
-    return "black" if player is Player.BLACK else "white"
-
-
-def _status_for_game(game: GameModel) -> str:
-    if game.winner is Player.BLACK:
-        return "black_won"
-    if game.winner is Player.WHITE:
-        return "white_won"
-    if game.is_draw:
-        return "draw"
-    return "playing"
+def _consume_task_result(task: asyncio.Future) -> None:
+    """取走后台发送任务的异常，避免 asyncio 报“异常未被检索”。"""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("后台发送失败: %s", exc)
 
 
 class RoomManager:
@@ -117,54 +108,71 @@ class RoomManager:
         self._metrics = metrics
         self._rooms_by_code: dict[str, Room] = {}
         self._room_by_user: dict[str, Room] = {}
-        self._connection_limiter = IpConnectionLimiter(
-            settings.max_connections_per_ip
-        )
         # 观战者 → 正在观战的房间。观战者绝不进 _room_by_user：
         # 那张表表示“这个人是本局玩家”，混进去会让离开房间/断线/重连
         # 逻辑把观战者当成对局参与者处理。
         self._spectator_by_user: dict[str, Room] = {}
-        self._connections: dict[str, ClientConnection] = {}
-        self._queue: dict[str, QueuedPlayer] = {}
         self._invites: dict[str, RoomInvite] = {}
-        # 好友 id 缓存：连接建立时刷新，断开时只读缓存，避免关闭路径再查库。
-        self._friend_cache: dict[str, frozenset[str]] = {}
         self._state_lock = asyncio.Lock()
         # 赛季推进与积分结算共用一把锁，避免同一进程内重复归档/重置。
         self._season_lock = asyncio.Lock()
         self._current_season: Optional[SeasonInfo] = None
+        # 领域服务：连接、匹配、计时与积分结算各自持有独立状态。
+        self._connections_registry = ConnectionRegistry(
+            settings, session_factory, self._state_lock, self._room_by_user
+        )
+        self._matchmaker = Matchmaker(
+            self._state_lock,
+            self._connections_registry,
+            self._room_by_user,
+        )
+        # 注入 lambda 而不是函数对象：测试 monkeypatch
+        # ``server.app.ws.rooms._now_ms`` 后，服务内取值仍然生效。
+        self._clocks = ClockService(settings, lambda: _now_ms(), self)
+        self._settlement = RatingSettlement(
+            session_factory, self.current_season
+        )
+
+    @property
+    def _connections(self) -> dict[str, ClientConnection]:
+        """连接表视图；实际状态由 ConnectionRegistry 持有。"""
+        return self._connections_registry.connections
+
+    @_connections.setter
+    def _connections(self, value: dict[str, ClientConnection]) -> None:
+        self._connections_registry.connections = value
+
+    @property
+    def _friend_cache(self) -> "OrderedDict[str, frozenset[str]]":
+        """好友缓存视图；实际状态由 ConnectionRegistry 持有。"""
+        return self._connections_registry.friend_cache
+
+    @_friend_cache.setter
+    def _friend_cache(
+        self, value: "OrderedDict[str, frozenset[str]]"
+    ) -> None:
+        self._connections_registry.friend_cache = value
 
     # ------------------------------------------------------------------
     # 连接/发送辅助
     # ------------------------------------------------------------------
     def _is_current_connection(self, conn: ClientConnection) -> bool:
-        return self._connections.get(conn.user_id) is conn
+        return self._connections_registry.is_current_connection(conn)
 
     def is_online(self, user_id: str) -> bool:
         """用户当前是否有一条活动连接。"""
-        conn = self._connections.get(user_id)
-        return conn is not None and conn.connected
+        return self._connections_registry.is_online(user_id)
 
     def _release_connection_locked(self, connection_id: str) -> None:
         """调用方必须持有 ``_state_lock``。"""
-        self._connection_limiter.release(connection_id)
+        self._connections_registry.release_locked(connection_id)
 
     async def reserve_connection(self, conn: ClientConnection) -> bool:
         """认证后登记 IP 配额；同一 connection_id 重复调用是幂等的。"""
-        async with self._state_lock:
-            existing = self._connections.get(conn.user_id)
-            replacing_id = (
-                existing.connection_id
-                if existing is not None and existing is not conn
-                else None
-            )
-            return self._connection_limiter.reserve(
-                conn.client_ip, conn.connection_id, replacing_id
-            )
+        return await self._connections_registry.reserve_connection(conn)
 
     async def release_connection(self, connection_id: str) -> None:
-        async with self._state_lock:
-            self._release_connection_locked(connection_id)
+        await self._connections_registry.release_connection(connection_id)
 
     async def update_connection_avatar(
         self, user_id: str, avatar: str, avatar_version: int
@@ -175,40 +183,19 @@ class RoomManager:
         开局，不刷新缓存会让对手看到旧头像。这里只更新展示字段，不广播，
         下一份对局快照自然带上新头像。
         """
-        conn = self._connections.get(user_id)
-        safe_version = max(0, int(avatar_version))
-        if conn is not None:
-            conn.avatar = avatar
-            conn.avatar_version = safe_version
-        room = self._room_by_user.get(user_id)
-        if room is None:
-            return
-        async with room.lock:
-            if room.black_user_id == user_id:
-                room.black_avatar = avatar
-                room.black_avatar_version = safe_version
-            elif room.white_user_id == user_id:
-                room.white_avatar = avatar
-                room.white_avatar_version = safe_version
+        await self._connections_registry.update_connection_avatar(
+            user_id, avatar, avatar_version
+        )
 
     async def send_to_user(self, user_id: str, message: dict) -> bool:
         """向指定用户的当前连接发送一条消息。"""
-        conn = self._connections.get(user_id)
-        if conn is None or not conn.connected:
-            return False
-        return await conn.send(message)
+        return await self._connections_registry.send_to_user(
+            user_id, message
+        )
 
     def _connection_user_payload(self, conn: ClientConnection) -> dict:
         """连接用户的好友/邀请摘要。"""
-        return {
-            "id": conn.user_id,
-            "username": conn.username,
-            "avatar": normalize_avatar(conn.avatar, conn.user_id),
-            "avatar_version": max(0, conn.avatar_version),
-            "achievements": list(conn.achievements),
-            "rating": conn.rating,
-            "rank_name": rank_for_rating(conn.rating).name,
-        }
+        return payloads.connection_user_payload(conn)
 
     async def _send_error(
         self,
@@ -218,6 +205,45 @@ class RoomManager:
     ) -> None:
         await conn.send(
             make_message(SERVER_ERROR, {"reason": reason}, request_id=request_id)
+        )
+
+    async def _send_all(
+        self, sends: list[tuple[ClientConnection, dict]]
+    ) -> None:
+        """并发给一批连接发送各自的（同一类）消息。
+
+        逐个 await 会让总延迟变成各连接发送时间之和：2 名玩家加最多
+        50 名观战者里只要有一个慢客户端，整局广播（连同它持有的房间
+        锁）就被拖住，超时判定也会跟着延迟。这里改成并发发送，并给
+        每条发送单独设上限；某条失败或卡住都不影响其他人收到消息。
+
+        ``ClientConnection.send`` 自带每连接一把发送锁，保证同一条连接
+        上的消息不会交错；这里用 shield 包一层，超时时只是不再等待它，
+        不打断已经开始的 WebSocket 写。
+        """
+        if not sends:
+            return
+
+        async def _send_one(conn: ClientConnection, message: dict) -> None:
+            task = asyncio.ensure_future(conn.send(message))
+            task.add_done_callback(_consume_task_result)
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=_BROADCAST_SEND_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "广播发送超时 user=%s", conn.user_id
+                )
+            except Exception:
+                logger.warning(
+                    "广播发送失败 user=%s", conn.user_id
+                )
+
+        await asyncio.gather(
+            *(_send_one(conn, message) for conn, message in sends),
+            return_exceptions=True,
         )
 
     async def current_season(self) -> Optional[SeasonInfo]:
@@ -250,12 +276,15 @@ class RoomManager:
 
     async def _send_room_closed(self, room: Room, reason: str) -> None:
         message = make_message(SERVER_ROOM_CLOSED, {"reason": reason})
-        for conn in list(room.connections.values()):
-            await conn.send(message)
+        sends: list[tuple[ClientConnection, dict]] = [
+            (conn, message) for conn in room.connections.values()
+        ]
         # 观战者不是玩家，但对局结束/房间关闭时也要收到通知，
         # 否则客户端会一直以为还在观战。
-        for conn in list(room.spectators.values()):
-            await conn.send(message)
+        sends.extend(
+            (conn, message) for conn in room.spectators.values()
+        )
+        await self._send_all(sends)
 
     async def _send_opponent_status(
         self,
@@ -267,31 +296,11 @@ class RoomManager:
         conn = room.connections.get(target_user_id)
         if conn is not None:
             await conn.send(
-                make_message(
-                    SERVER_OPPONENT_STATUS,
-                    {"username": who_name, "online": online},
-                )
+                payloads.opponent_status_message(who_name, online)
             )
 
     async def _send_room_created(self, conn: ClientConnection, room: Room) -> None:
-        await conn.send(
-            make_message(
-                SERVER_ROOM_CREATED,
-                {
-                    "room_code": room.code,
-                    "game_id": room.game_id,
-                    "your_color": "black",
-                    "black_name": room.black_name,
-                    "white_name": room.white_name,
-                    "turn_seconds": (
-                        room.time_control.turn_seconds
-                        if not room.time_control.is_fischer
-                        else None
-                    ),
-                    "time_control": room.time_control.to_payload(),
-                },
-            )
-        )
+        await conn.send(payloads.room_created_message(room))
 
     async def _notify_live_games_changed(self) -> None:
         """通知空闲客户端：进行中的对局列表发生了变化。
@@ -303,28 +312,21 @@ class RoomManager:
         也不用让多余的消息插进对局的消息流里。
         """
         message = make_message(SERVER_LIVE_GAMES_CHANGED, {})
+        sends: list[tuple[ClientConnection, dict]] = []
         for user_id, conn in list(self._connections.items()):
             if (
                 user_id in self._room_by_user
                 or user_id in self._spectator_by_user
             ):
                 continue
-            await conn.send(message)
+            sends.append((conn, message))
+        await self._send_all(sends)
 
     # ------------------------------------------------------------------
     # 匹配队列辅助
     # ------------------------------------------------------------------
     def _queue_state_payload(self, user_id: str) -> dict:
-        queued = self._queue.get(user_id)
-        rating = queued.rating if queued is not None else None
-        return {
-            "state": "queued" if queued is not None else "idle",
-            "queue_size": len(self._queue),
-            "your_rating": rating,
-            "rank_name": (
-                rank_for_rating(rating).name if rating is not None else ""
-            ),
-        }
+        return self._matchmaker.state_payload(user_id)
 
     async def _send_queue_status(self, conn: ClientConnection) -> None:
         await conn.send(
@@ -337,32 +339,10 @@ class RoomManager:
     def _match_found_payload(
         self, room: Room, user_id: str, opponent_id: Optional[str]
     ) -> dict:
-        color = room.color_for(user_id)
-        return {
-            "game_id": room.game_id,
-            "your_color": _color_text(color) if color else "black",
-            "opponent_name": (
-                room.username_for(opponent_id)
-                if opponent_id
-                else "对手"
-            ),
-            "your_rating": room.rating_before.get(user_id),
-            "opponent_rating": (
-                room.rating_before.get(opponent_id)
-                if opponent_id
-                else None
-            ),
-            "rated": True,
-            "time_control": room.time_control.to_payload(),
-        }
+        return payloads.match_found_payload(room, user_id, opponent_id)
 
     def _prune_queue_locked(self) -> None:
-        for user_id, queued in list(self._queue.items()):
-            if (
-                not queued.conn.connected
-                or self._connections.get(user_id) is not queued.conn
-            ):
-                self._queue.pop(user_id, None)
+        self._matchmaker.prune_locked()
 
     async def _fetch_user_rating(self, user_id: str) -> Optional[int]:
         async with self._session_factory() as session:
@@ -373,132 +353,29 @@ class RoomManager:
             )
 
     def _room_state_payload(self, room: Room, user_id: str) -> dict:
-        color = room.color_for(user_id)
-        # 观战者没有执子颜色，但仍然可以拿到完整的权威快照。
-        is_spectator = False
-        if color is None:
-            if user_id not in room.spectators:
-                raise RuntimeError("用户不属于该房间")
-            is_spectator = True
-        opponent_id = room.opponent_id(user_id)
-        last_move = room.game.last_move
-        status = room.status
-        undo_limit = self._settings.undo_limit_per_game if color else 0
-        used_undos = room.undo_counts.get(user_id, 0) if color else 0
-        undo_remaining = max(0, undo_limit - used_undos)
-        undo_cooldown_seconds = (
-            int(self._settings.undo_cooldown_seconds + 0.999)
-            if color and self._settings.undo_cooldown_seconds > 0
-            else 0
+        return payloads.room_state_payload(
+            room,
+            user_id,
+            settings=self._settings,
+            remaining_ms=self._clocks.snapshot_remaining_locked,
+            now_ms=_now_ms,
         )
-        undo_cooldown_until_ms: Optional[int] = None
-        if color and self._settings.undo_cooldown_seconds > 0:
-            last_undo = room.undo_last_request.get(user_id)
-            if last_undo is not None:
-                undo_cooldown_until_ms = int(
-                    (last_undo + self._settings.undo_cooldown_seconds)
-                    * 1000
-                )
-        return {
-            "game_id": room.game_id,
-            "board": [
-                [
-                    None if cell is None else _color_text(cell)
-                    for cell in row
-                ]
-                for row in room.game.board
-            ],
-            "current_player": _color_text(room.game.current_player),
-            "your_color": _color_text(color) if color else None,
-            "is_spectator": is_spectator,
-            "move_no": room.game.move_count,
-            "status": status,
-            "state_version": room.state_version,
-            "result_reason": room.result_reason or "",
-            "undo_requester_id": room.undo_requester_id or "",
-            "undo_remaining": undo_remaining,
-            "undo_limit": undo_limit,
-            "undo_cooldown_until_ms": undo_cooldown_until_ms,
-            "undo_cooldown_seconds": undo_cooldown_seconds,
-            "last_move": (
-                None
-                if last_move is None
-                else {
-                    "row": last_move.row,
-                    "col": last_move.col,
-                    "player": _color_text(last_move.player),
-                }
-            ),
-            "winning_line": [list(cell) for cell in room.game.winning_line],
-            "room_code": "" if room.matchmade else room.code,
-            "black_name": room.black_name,
-            "white_name": room.white_name,
-            "black_user_id": room.black_user_id,
-            "white_user_id": room.white_user_id or "",
-            "black_avatar": room.avatar_for(room.black_user_id),
-            "white_avatar": (
-                room.avatar_for(room.white_user_id)
-                if room.white_user_id
-                else DEFAULT_AVATAR
-            ),
-            "black_avatar_version": room.avatar_version_for(
-                room.black_user_id
-            ),
-            "white_avatar_version": (
-                room.avatar_version_for(room.white_user_id)
-                if room.white_user_id
-                else 0
-            ),
-            "black_achievements": list(room.black_achievements),
-            "white_achievements": list(room.white_achievements),
-            "your_new_achievements": list(
-                room.new_achievements.get(user_id, ())
-            ),
-            "turn_deadline_ms": room.turn_deadline_ms,
-            "server_now_ms": _now_ms(),
-            "move_timeout_seconds": (
-                None
-                if room.time_control.is_fischer
-                else room.time_control.turn_seconds
-            ),
-            "time_control": room.time_control.to_payload(),
-            "black_remaining_ms": self._snapshot_remaining_locked(
-                room, room.black_user_id
-            ),
-            "white_remaining_ms": (
-                self._snapshot_remaining_locked(
-                    room, room.white_user_id
-                )
-                if room.white_user_id
-                else None
-            ),
-            "opponent_online": (
-                # 观战者没有“对手”这个概念：报告双方是否都在线。
-                (
-                    room.black_user_id in room.connections
-                    and room.white_user_id in room.connections
-                )
-                if is_spectator
-                else (
-                    room.opponent_id(user_id) in room.connections
-                    if room.opponent_id(user_id) else False
-                )
-            ),
-            "rated": room.rated,
-            "your_rating_before": room.rating_before.get(user_id),
-            "your_rating_after": room.rating_after.get(user_id),
-            "opponent_rating_before": (
-                room.rating_before.get(opponent_id)
-                if opponent_id is not None
-                else None
-            ),
-            "opponent_rating_after": (
-                room.rating_after.get(opponent_id)
-                if opponent_id is not None
-                else None
-            ),
-            "rating_delta": room.rating_delta.get(user_id),
-        }
+
+    def _game_state_message(
+        self,
+        room: Room,
+        conn: ClientConnection,
+        request_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """构造某条连接的权威局面消息；不属于该房间时返回 None。"""
+        return payloads.game_state_message(
+            room,
+            conn,
+            settings=self._settings,
+            remaining_ms=self._clocks.snapshot_remaining_locked,
+            now_ms=_now_ms,
+            request_id=request_id,
+        )
 
     async def _send_game_state(
         self,
@@ -506,13 +383,10 @@ class RoomManager:
         conn: ClientConnection,
         request_id: Optional[str] = None,
     ) -> None:
-        try:
-            payload = self._room_state_payload(room, conn.user_id)
-        except RuntimeError:
+        message = self._game_state_message(room, conn, request_id)
+        if message is None:
             return
-        await conn.send(
-            make_message(SERVER_GAME_STATE, payload, request_id=request_id)
-        )
+        await conn.send(message)
 
     async def _broadcast_game_state(
         self,
@@ -520,31 +394,30 @@ class RoomManager:
         request_user_id: Optional[str] = None,
         request_id: Optional[str] = None,
     ) -> None:
+        sends: list[tuple[ClientConnection, dict]] = []
         for user_id, conn in list(room.connections.items()):
-            await self._send_game_state(
+            message = self._game_state_message(
                 room,
                 conn,
                 request_id if user_id == request_user_id else None,
             )
+            if message is not None:
+                sends.append((conn, message))
         # 观战者也接收同一份权威快照（观战没有待回应的落子请求，
         # 所以不携带 request_id）。
         for conn in list(room.spectators.values()):
-            await self._send_game_state(room, conn)
+            message = self._game_state_message(room, conn)
+            if message is not None:
+                sends.append((conn, message))
+        await self._send_all(sends)
 
     async def _send_rematch_status(self, room: Room) -> None:
-        for user_id, conn in list(room.connections.items()):
-            opponent = room.opponent_id(user_id)
-            await conn.send(
-                make_message(
-                    SERVER_REMATCH_STATUS,
-                    {
-                        "your_requested": user_id in room.rematch_votes,
-                        "opponent_requested": (
-                            opponent in room.rematch_votes if opponent else False
-                        ),
-                    },
-                )
-            )
+        await self._send_all(
+            [
+                (conn, payloads.rematch_status_message(room, user_id))
+                for user_id, conn in list(room.connections.items())
+            ]
+        )
 
     def _undo_status_message(
         self,
@@ -553,18 +426,8 @@ class RoomManager:
         requester_id: Optional[str],
         reason: str = "",
     ) -> dict:
-        return make_message(
-            SERVER_UNDO_STATUS,
-            {
-                "state": state,
-                "requester_id": requester_id or "",
-                "requester_name": (
-                    room.username_for(requester_id)
-                    if requester_id
-                    else ""
-                ),
-                "reason": reason,
-            },
+        return payloads.undo_status_message(
+            room, state, requester_id, reason
         )
 
     async def _broadcast_undo_status(
@@ -577,72 +440,38 @@ class RoomManager:
         message = self._undo_status_message(
             room, state, requester_id, reason
         )
-        for conn in list(room.connections.values()):
-            await conn.send(message)
+        await self._send_all(
+            [(conn, message) for conn in room.connections.values()]
+        )
 
     # ------------------------------------------------------------------
     # 连接生命周期
     # ------------------------------------------------------------------
+    def _friend_cache_get(self, user_id: str) -> frozenset[str]:
+        """读取好友缓存并刷新 LRU 顺序。"""
+        return self._connections_registry.friend_cache_get(user_id)
+
+    def _friend_cache_put(
+        self, user_id: str, friend_ids: frozenset[str]
+    ) -> None:
+        """写入好友缓存；超过容量上限就淘汰最久未使用的一条。"""
+        self._connections_registry.friend_cache_put(user_id, friend_ids)
+
     async def _load_friend_ids(self, user_id: str) -> list[str]:
         """查询已接受好友的 id 列表并刷新缓存；数据库异常时返回空表。"""
-        try:
-            async with self._session_factory() as session:
-                rows = (
-                    await session.scalars(
-                        select(Friendship).where(
-                            Friendship.status == "accepted",
-                            or_(
-                                Friendship.user_a == user_id,
-                                Friendship.user_b == user_id,
-                            ),
-                        )
-                    )
-                ).all()
-        except Exception:
-            logger.exception("查询好友列表失败 user=%s", user_id)
-            # 数据库抖动时退回缓存快照，不要把好友列表清空——否则这一轮
-            # 上下线推送会被静默丢掉，好友的在线状态就此对不上。
-            return list(self._friend_cache.get(user_id, frozenset()))
-        ids = [
-            row.user_b if row.user_a == user_id else row.user_a
-            for row in rows
-        ]
-        self._friend_cache[user_id] = frozenset(ids)
-        return ids
+        return await self._connections_registry.load_friend_ids(user_id)
 
     async def refresh_friend_cache(self, user_id: str) -> None:
         """好友关系变化后刷新缓存（供 REST 接口调用）。"""
-        await self._load_friend_ids(user_id)
+        await self._connections_registry.refresh_friend_cache(user_id)
 
     async def _notify_friends_presence(
         self, conn: ClientConnection, online: bool
     ) -> None:
         """向在线好友推送上下线事件。"""
-        if online:
-            friend_ids = await self._load_friend_ids(conn.user_id)
-        else:
-            # 断开时不再查库，使用连接建立时缓存的快照。
-            friend_ids = list(
-                self._friend_cache.get(conn.user_id, frozenset())
-            )
-        if not friend_ids:
-            return
-        message = make_message(
-            SERVER_FRIEND_EVENT,
-            {
-                "event": (
-                    FRIEND_EVENT_ONLINE
-                    if online
-                    else FRIEND_EVENT_OFFLINE
-                ),
-                "user": self._connection_user_payload(conn),
-                "online": online,
-            },
+        await self._connections_registry.notify_friends_presence(
+            conn, online
         )
-        for friend_id in friend_ids:
-            target = self._connections.get(friend_id)
-            if target is not None:
-                await target.send(message)
 
     async def attach(self, conn: ClientConnection) -> None:
         """认证后的连接注册；若用户在房间中则重连并发送权威快照。"""
@@ -653,9 +482,9 @@ class RoomManager:
             if old_conn is not None and old_conn is not conn:
                 self._release_connection_locked(old_conn.connection_id)
             self._connections[conn.user_id] = conn
-            queued = self._queue.get(conn.user_id)
+            queued = self._matchmaker.get(conn.user_id)
             if queued is not None:
-                queued.conn = conn
+                self._matchmaker.rebind_connection(conn)
             watched = self._spectator_by_user.get(conn.user_id)
         if old_conn is not None and old_conn is not conn:
             await old_conn.close(4001, "账号已在另一处连接")
@@ -727,7 +556,7 @@ class RoomManager:
             if self._connections.get(conn.user_id) is not conn:
                 return
             self._connections.pop(conn.user_id, None)
-            self._queue.pop(conn.user_id, None)
+            self._matchmaker.remove(conn.user_id)
             # 观战者断线只是停止接收快照：不能触发逃跑计时、
             # 不能判作弃局，更不能把房间关掉。
             # 观战登记本身保留，重连时 attach 才能把棋盘补回来
@@ -813,6 +642,7 @@ class RoomManager:
         rated: bool = False,
         time_control: Optional[TimeControl] = None,
         turn_seconds: Optional[int] = None,
+        rule_mode: RuleMode = RuleMode.FREESTYLE,
     ) -> Game:
         control = time_control or TimeControl.per_move(
             turn_seconds or self._settings.turn_seconds
@@ -832,6 +662,7 @@ class RoomManager:
             main_seconds=control.main_seconds,
             increment_seconds=control.increment_seconds,
             rated=rated,
+            rule_mode=rule_mode.value,
             started_at=utcnow_naive() if started else None,
         )
         async with self._session_factory() as session:
@@ -846,8 +677,16 @@ class RoomManager:
         allow_spectators: bool = True,
         turn_seconds: Optional[int] = None,
         time_control: Optional[TimeControl] = None,
+        rule_mode: RuleMode | str = RuleMode.FREESTYLE,
     ) -> None:
         if not self._is_current_connection(conn):
+            return
+        # 兼容直接调用管理器的内部入口：接受 RuleMode 或字符串，非法值
+        # 一律拒绝，不能悄悄退回自由规则造成规则分歧。
+        try:
+            mode = parse_rule_mode(rule_mode)
+        except ValueError:
+            await self._send_error(conn, "规则模式非法", request_id)
             return
         if turn_seconds is not None and (
             not isinstance(turn_seconds, int)
@@ -861,41 +700,62 @@ class RoomManager:
         control = self._requested_time_control(turn_seconds, time_control)
         room: Optional[Room] = None
         error: Optional[str] = None
+        code = ""
+
+        # 第一阶段：锁内只做内存校验并预留房间码。数据库写入放到锁外，
+        # 否则一次慢查询会把所有用户的建房/匹配都堵在全局锁上。
         async with self._state_lock:
-            self._queue.pop(conn.user_id, None)
+            self._matchmaker.remove(conn.user_id)
             if conn.user_id in self._room_by_user:
                 error = "你已经在一个房间中"
             else:
                 code = self._new_room_code()
-                try:
-                    game_row = await self._create_game_row(
-                        code,
-                        conn.user_id,
-                        None,
-                        "waiting",
-                        False,
-                        time_control=control,
-                    )
-                except Exception:
-                    logger.exception("创建房间数据库写入失败")
-                    error = "服务器无法创建房间"
-                else:
-                    room = Room(
-                        code=code,
-                        game_id=game_row.id,
-                        black_user_id=conn.user_id,
-                        white_user_id=None,
-                        black_name=conn.username,
-                        white_name="",
-                        time_control=control,
-                        black_avatar=conn.avatar,
-                        black_avatar_version=conn.avatar_version,
-                        black_achievements=conn.achievements,
-                        connections={conn.user_id: conn},
-                        allow_spectators=allow_spectators,
-                    )
-                    self._rooms_by_code[code] = room
-                    self._room_by_user[conn.user_id] = room
+
+        if error is None:
+            # 第二阶段：锁外写库。
+            try:
+                game_row = await self._create_game_row(
+                    code,
+                    conn.user_id,
+                    None,
+                    "waiting",
+                    False,
+                    time_control=control,
+                    rule_mode=mode,
+                )
+            except Exception:
+                logger.exception("创建房间数据库写入失败")
+                error = "服务器无法创建房间"
+            else:
+                # 第三阶段：重新拿锁并二次校验——等数据库的这段时间里，
+                # 用户可能已经进了别的房间，这时不能把房间登记到他名下。
+                async with self._state_lock:
+                    if conn.user_id in self._room_by_user:
+                        error = "你已经在一个房间中"
+                    else:
+                        room = Room(
+                            code=code,
+                            game_id=game_row.id,
+                            black_user_id=conn.user_id,
+                            white_user_id=None,
+                            black_name=conn.username,
+                            white_name="",
+                            time_control=control,
+                            black_avatar=conn.avatar,
+                            black_avatar_version=conn.avatar_version,
+                            black_achievements=conn.achievements,
+                            connections={conn.user_id: conn},
+                            allow_spectators=allow_spectators,
+                            rule_mode=mode,
+                            game=GameModel(mode),
+                        )
+                        self._rooms_by_code[code] = room
+                        self._room_by_user[conn.user_id] = room
+                if error is not None:
+                    # 房间没能用上：把刚写入的对局行作废，别留下"等待中"
+                    # 的孤儿记录。
+                    await self._abandon_game_row(game_row.id, "left")
+
         if error:
             await self._send_error(conn, error, request_id)
         elif room is not None:
@@ -905,14 +765,19 @@ class RoomManager:
         self,
         conn: ClientConnection,
         room: Room,
-        request_id: Optional[str] = None,
     ) -> Optional[str]:
         """把连接加入等待中的普通房间；返回错误文本或 None。
 
-        调用方负责在锁外广播新的 game_state。这里只做校验、数据库写穿
-        和内存状态变更。
+        调用方负责在锁外广播新的 game_state，并且负责把玩家登记进
+        ``_room_by_user``（那张表由全局锁保护）。
+
+        数据库写入在房间锁之外做：写库期间的延迟不该卡住这一局的超时
+        判定。抢白座用条件更新——房间必须仍是"等待中且白座空着"才
+        写得进去，两个人同时抢也只会成功一个。
         """
+        # 第一阶段：房间锁内只做校验，不碰数据库。
         error: Optional[str] = None
+        host_offline = False
         async with room.lock:
             if room.matchmade:
                 error = "排位对局不能通过房间码加入"
@@ -922,35 +787,92 @@ class RoomManager:
                 error = "不能加入自己创建的房间"
             elif room.black_user_id not in room.connections:
                 error = "房主已离线，房间已关闭"
+                host_offline = True
+        if host_offline:
+            async with self._state_lock:
                 self._remove_room_locked(room)
-                await self._mark_waiting_game_abandoned(
-                    room, "host_offline"
+            await self._mark_waiting_game_abandoned(room, "host_offline")
+            return error
+        if error is not None:
+            return error
+
+        # 第二阶段：锁外写库，条件更新抢白座。
+        try:
+            async with self._session_factory() as session:
+                result = await session.execute(
+                    update(Game)
+                    .where(
+                        Game.id == room.game_id,
+                        Game.status == "waiting",
+                        Game.white_user_id.is_(None),
+                    )
+                    .values(
+                        white_user_id=conn.user_id,
+                        status="playing",
+                        started_at=utcnow_naive(),
+                    )
                 )
+                if rowcount_of(result) == 0:
+                    # 白座已经被别人抢走（或者房间已经开打）。
+                    await session.rollback()
+                    return "房间已经开始或已满"
+                await session.commit()
+        except Exception:
+            logger.exception("加入房间数据库写入失败")
+            return "服务器无法开始对局"
+
+        # 第三阶段：回到房间锁二次校验座位，再落内存状态。
+        async with room.lock:
+            if room.status != "waiting" or room.white_user_id is not None:
+                seat_taken = True
             else:
-                try:
-                    async with self._session_factory() as session:
-                        game_row = await session.get(Game, room.game_id)
-                        if game_row is None:
-                            raise RuntimeError("game row missing")
-                        game_row.white_user_id = conn.user_id
-                        game_row.status = "playing"
-                        game_row.started_at = utcnow_naive()
-                        await session.commit()
-                except Exception:
-                    logger.exception("加入房间数据库写入失败")
-                    error = "服务器无法开始对局"
-                else:
-                    room.white_user_id = conn.user_id
-                    room.white_name = conn.username
-                    room.white_avatar = conn.avatar
-                    room.white_avatar_version = conn.avatar_version
-                    room.white_achievements = conn.achievements
-                    room.status = "playing"
-                    room.connections[conn.user_id] = conn
-                    self._room_by_user[conn.user_id] = room
-                    self._reset_clocks_locked(room)
-                    self._start_timeout_locked(room)
-        return error
+                seat_taken = False
+                room.white_user_id = conn.user_id
+                room.white_name = conn.username
+                room.white_avatar = conn.avatar
+                room.white_avatar_version = conn.avatar_version
+                room.white_achievements = conn.achievements
+                room.status = "playing"
+                room.connections[conn.user_id] = conn
+                self._reset_clocks_locked(room)
+                self._start_timeout_locked(room)
+        if seat_taken:
+            # 写库期间房间被别人接手了：把刚才的写入撤回。
+            await self._revert_join(room, conn.user_id)
+            return "房间已经开始或已满"
+        return None
+
+    async def _revert_join(self, room: Room, user_id: str) -> None:
+        """撤销一次已经写库的加入：白座、状态和数据库行一起改回去。"""
+        async with room.lock:
+            if room.white_user_id != user_id:
+                return
+            room.white_user_id = None
+            room.white_name = ""
+            room.white_avatar = DEFAULT_AVATAR
+            room.white_avatar_version = 0
+            room.white_achievements = ()
+            room.status = "waiting"
+            room.connections.pop(user_id, None)
+            self._cancel_timeout_locked(room)
+            self._reset_clocks_locked(room)
+        try:
+            async with self._session_factory() as session:
+                await session.execute(
+                    update(Game)
+                    .where(
+                        Game.id == room.game_id,
+                        Game.white_user_id == user_id,
+                    )
+                    .values(
+                        white_user_id=None,
+                        status="waiting",
+                        started_at=None,
+                    )
+                )
+                await session.commit()
+        except Exception:
+            logger.exception("撤销加入房间数据库写入失败")
 
     async def join_room(
         self,
@@ -962,10 +884,11 @@ class RoomManager:
             return
         code = room_code.strip().upper()
         error: Optional[str] = None
-        joined_room: Optional[Room] = None
+        target: Optional[Room] = None
 
+        # 第一阶段：锁内校验并找到目标房间，数据库写入放到锁外。
         async with self._state_lock:
-            self._queue.pop(conn.user_id, None)
+            self._matchmaker.remove(conn.user_id)
             if conn.user_id in self._room_by_user:
                 error = "你已经在一个房间中"
             else:
@@ -973,42 +896,43 @@ class RoomManager:
                 if room is None:
                     error = "房间不存在或已关闭"
                 else:
-                    error = await self._join_waiting_room(
-                        conn, room, request_id
-                    )
-                    if error is None:
-                        joined_room = room
+                    target = room
 
-        if error:
+        if error is not None:
             await self._send_error(conn, error, request_id)
-        elif joined_room is not None:
-            async with joined_room.lock:
-                await self._broadcast_game_state(joined_room)
-            self._record_game_started(joined_room)
-            # 对局开始，进行中的对局列表多了一条。
-            await self._notify_live_games_changed()
+            return
+        joined_room = cast(Room, target)
+
+        # 第二阶段：锁外写库并占下白座。
+        error = await self._join_waiting_room(conn, joined_room)
+        if error is not None:
+            await self._send_error(conn, error, request_id)
+            return
+
+        # 第三阶段：重新拿锁，二次校验后登记全局索引。
+        async with self._state_lock:
+            if conn.user_id in self._room_by_user:
+                error = "你已经在一个房间中"
+            else:
+                self._room_by_user[conn.user_id] = joined_room
+        if error is not None:
+            await self._revert_join(joined_room, conn.user_id)
+            await self._send_error(conn, error, request_id)
+            return
+
+        async with joined_room.lock:
+            await self._broadcast_game_state(joined_room)
+        self._record_game_started(joined_room)
+        # 对局开始，进行中的对局列表多了一条。
+        await self._notify_live_games_changed()
 
     # ------------------------------------------------------------------
     # 自建房邀请
     # ------------------------------------------------------------------
     def _invite_payload(self, invite: RoomInvite) -> dict:
-        inviter = self._connections.get(invite.inviter_id)
-        user = (
-            self._connection_user_payload(inviter)
-            if inviter is not None
-            else {
-                "id": invite.inviter_id,
-                "username": "好友",
-                "avatar": DEFAULT_AVATAR,
-                "rating": 0,
-                "rank_name": "",
-            }
+        return payloads.invite_payload(
+            invite, self._connections.get(invite.inviter_id)
         )
-        return {
-            "invite_id": invite.invite_id,
-            "inviter": user,
-            "rated": False,
-        }
 
     @staticmethod
     def _invite_result_payload(
@@ -1018,13 +942,9 @@ class RoomManager:
         user: dict,
         reason: str = "",
     ) -> dict:
-        return {
-            "invite_id": invite.invite_id,
-            "status": status,
-            "accepted": accepted,
-            "user": user,
-            "reason": reason,
-        }
+        return payloads.invite_result_payload(
+            invite, status, accepted, user, reason
+        )
 
     async def _are_friends(self, user_a: str, user_b: str) -> bool:
         low, high = (
@@ -1042,6 +962,26 @@ class RoomManager:
             logger.exception("查询好友关系失败")
             return False
         return status == "accepted"
+
+    def _purge_expired_invites(self, except_id: Optional[str] = None) -> int:
+        """清理过期且无人回应的邀请，返回清理数量。
+
+        邀请的 TTL 是 60 秒，但过期之后没有任何地方真正把它删掉：没人
+        回应的邀请会一直留在 ``_invites`` 里，房间开得越多这张表就越
+        大。这里做惰性清理——每次碰到邀请表时顺手扫一遍，不必再起一个
+        后台任务。``except_id`` 用来保护正在处理的那条邀请，避免把
+        “已过期”的具体原因换成笼统的“已失效”。
+        """
+        now = time.monotonic()
+        expired = [
+            invite_id
+            for invite_id, invite in self._invites.items()
+            if invite_id != except_id
+            and now - invite.created_at > _INVITE_TTL_SECONDS
+        ]
+        for invite_id in expired:
+            self._invites.pop(invite_id, None)
+        return len(expired)
 
     async def invite_to_room(
         self,
@@ -1077,6 +1017,8 @@ class RoomManager:
             await self._send_error(conn, "只能邀请好友", request_id)
             return
 
+        # 发新邀请前先清掉过期邀请，邀请表不会随着房间数量无限增长。
+        self._purge_expired_invites()
         for existing in self._invites.values():
             if (
                 existing.room is room
@@ -1126,16 +1068,8 @@ class RoomManager:
             if target is None:
                 continue
             inviter = self._connections.get(invite.inviter_id)
-            user = (
-                self._connection_user_payload(inviter)
-                if inviter is not None
-                else {
-                    "id": invite.inviter_id,
-                    "username": "好友",
-                    "avatar": DEFAULT_AVATAR,
-                    "rating": 0,
-                    "rank_name": "",
-                }
+            user = payloads.invite_user_payload(
+                invite.inviter_id, inviter
             )
             await target.send(
                 make_message(
@@ -1162,6 +1096,8 @@ class RoomManager:
             else None
         )
         if invite is None:
+            # 顺手清掉过期邀请：失效的邀请不应该一直占着位置。
+            self._purge_expired_invites()
             await self._send_error(conn, "邀请已失效", request_id)
             return
         if invite.invitee_id != conn.user_id:
@@ -1171,6 +1107,8 @@ class RoomManager:
             self._invites.pop(invite.invite_id, None)
             await self._send_error(conn, "邀请已过期", request_id)
             return
+        # 处理这条邀请的同时清掉其它过期邀请。
+        self._purge_expired_invites(except_id=invite.invite_id)
         # 邀请发出后、对方回应前，好友关系可能已经被解除（删好友）。这里
         # 重新校验一次，否则“不是好友也能被拉进自建房”，绕过了发邀请时
         # 的好友限制。
@@ -1201,6 +1139,9 @@ class RoomManager:
         room = invite.room
         error: Optional[str] = None
         joined_room: Optional[Room] = None
+        host_offline = False
+        # 第一阶段：锁内只做内存校验；数据库写入放到锁外，避免一次慢
+        # 查询把所有人的建房/匹配都堵在全局锁上。
         async with self._state_lock:
             if conn.user_id in self._room_by_user:
                 error = "你已经在房间中"
@@ -1209,15 +1150,22 @@ class RoomManager:
             elif room.black_user_id not in room.connections:
                 error = "房主已离开"
                 self._remove_room_locked(room)
-                await self._mark_waiting_game_abandoned(
-                    room, "host_offline"
-                )
-            else:
-                error = await self._join_waiting_room(
-                    conn, room, request_id
-                )
-                if error is None:
+                host_offline = True
+        if host_offline:
+            await self._mark_waiting_game_abandoned(room, "host_offline")
+        if error is None:
+            # 第二阶段：锁外抢白座。
+            error = await self._join_waiting_room(conn, room)
+        if error is None:
+            # 第三阶段：重新拿锁，二次校验后登记全局索引。
+            async with self._state_lock:
+                if conn.user_id in self._room_by_user:
+                    error = "你已经在房间中"
+                else:
+                    self._room_by_user[conn.user_id] = room
                     joined_room = room
+            if error is not None:
+                await self._revert_join(room, conn.user_id)
 
         if error:
             await self._send_error(conn, error, request_id)
@@ -1274,21 +1222,53 @@ class RoomManager:
         # 匹配前推进赛季，避免跨赛季时仍在旧积分池里配对。
         await self.current_season()
 
+        # 第一阶段：锁内只做内存校验并记录是否已在队列；数据库查询在锁外。
+        async with self._state_lock:
+            self._matchmaker.prune_locked()
+            queued = self._matchmaker.get(conn.user_id)
+            if queued is not None:
+                self._matchmaker.refresh(conn, control)
+
+        rating: Optional[int] = (
+            queued.rating if queued is not None else None
+        )
+        if queued is None:
+            # 第二阶段：锁外读取积分。慢查询不该占着全局锁，把其他用户
+            # 的建房/入队也一起堵住。
+            rating = await self._fetch_user_rating(conn.user_id)
+            if rating is None:
+                await self._send_error(
+                    conn, "账号不存在或已停用", request_id
+                )
+                return
+
         room: Optional[Room] = None
         outgoing: list[tuple[ClientConnection, dict]] = []
         error: Optional[str] = None
+        pair: Optional[tuple[QueuedPlayer, QueuedPlayer]] = None
+        code = ""
 
         async with self._state_lock:
-            self._prune_queue_locked()
-            if conn.user_id in self._queue:
-                self._queue[conn.user_id].conn = conn
-                self._queue[conn.user_id].time_control = control
-                if len(self._queue) >= 2:
-                    # 上一次配对写库失败时允许玩家重试入队命令触发配对。
-                    room, outgoing, error = (
-                        await self._match_queued_locked(conn)
+            self._matchmaker.prune_locked()
+            if conn.user_id in self._room_by_user:
+                # 已经在房间里的玩家不能继续留在匹配队列中。
+                self._matchmaker.remove(conn.user_id)
+                error = "你已经在房间中"
+            else:
+                current = self._matchmaker.get(conn.user_id)
+                if current is None:
+                    self._matchmaker.put(
+                        QueuedPlayer(
+                            conn=conn,
+                            rating=cast(int, rating),
+                            queued_at=time.monotonic(),
+                            time_control=control,
+                        )
                     )
                 else:
+                    self._matchmaker.refresh(conn, control)
+                pair = self._matchmaker.pop_match_locked(conn)
+                if pair is None:
                     outgoing.append(
                         (
                             conn,
@@ -1298,34 +1278,101 @@ class RoomManager:
                             ),
                         )
                     )
-            else:
-                rating = await self._fetch_user_rating(conn.user_id)
-                if rating is None:
-                    error = "账号不存在或已停用"
                 else:
-                    self._queue[conn.user_id] = QueuedPlayer(
-                        conn=conn,
-                        rating=rating,
-                        queued_at=time.monotonic(),
-                        time_control=control,
-                    )
-                    if len(self._queue) >= 2:
-                        room, outgoing, error = (
-                            await self._match_queued_locked(conn)
-                        )
-                    else:
-                        outgoing.append(
-                            (
-                                conn,
-                                make_message(
-                                    SERVER_QUEUE_STATUS,
-                                    self._queue_state_payload(conn.user_id),
-                                ),
-                            )
-                        )
+                    # 房间码提前在锁内生成，避免两个并发匹配拿到同一个码。
+                    code = self._new_room_code()
 
-        if error:
+        if error is not None:
             await self._send_error(conn, error, request_id)
+            return
+
+        if pair is not None:
+            black, white = pair
+            # 第三阶段：锁外写库创建对局行。
+            try:
+                game_row = await self._create_game_row(
+                    code,
+                    black.conn.user_id,
+                    white.conn.user_id,
+                    "playing",
+                    True,
+                    rated=True,
+                    time_control=black.time_control,
+                    # 排位赛本迭代固定自由规则，不接受连珠。
+                    rule_mode=RuleMode.FREESTYLE,
+                )
+            except Exception:
+                logger.exception("创建排位对局数据库写入失败")
+                await self._matchmaker.requeue_opponent_after_failure(
+                    conn, pair
+                )
+                await self._send_error(
+                    conn,
+                    "服务器无法创建排位对局，请稍后重试",
+                    request_id,
+                )
+                return
+
+            # 第四阶段：重新拿锁，二次校验后登记房间。写库期间两人可能
+            # 已经进了别的房间（例如并发建房），这时不能覆盖已有归属。
+            conflict = False
+            async with self._state_lock:
+                if (
+                    black.conn.user_id in self._room_by_user
+                    or white.conn.user_id in self._room_by_user
+                ):
+                    conflict = True
+                else:
+                    # 写库期间他们可能重新入队：以本次配对为准清掉残留项。
+                    self._matchmaker.remove(black.conn.user_id)
+                    self._matchmaker.remove(white.conn.user_id)
+                    room = Room(
+                        code=code,
+                        game_id=game_row.id,
+                        black_user_id=black.conn.user_id,
+                        white_user_id=white.conn.user_id,
+                        black_name=black.conn.username,
+                        white_name=white.conn.username,
+                        time_control=black.time_control,
+                        black_avatar=black.conn.avatar,
+                        white_avatar=white.conn.avatar,
+                        black_avatar_version=black.conn.avatar_version,
+                        white_avatar_version=white.conn.avatar_version,
+                        black_achievements=black.conn.achievements,
+                        white_achievements=white.conn.achievements,
+                        status="playing",
+                        connections={
+                            black.conn.user_id: black.conn,
+                            white.conn.user_id: white.conn,
+                        },
+                        rated=True,
+                        matchmade=True,
+                        rating_before={
+                            black.conn.user_id: black.rating,
+                            white.conn.user_id: white.rating,
+                        },
+                        # 排位房固定自由规则。
+                        rule_mode=RuleMode.FREESTYLE,
+                        game=GameModel(RuleMode.FREESTYLE),
+                    )
+                    self._rooms_by_code[code] = room
+                    self._room_by_user[black.conn.user_id] = room
+                    self._room_by_user[white.conn.user_id] = room
+                    self._record_game_started(room)
+                    self._reset_clocks_locked(room)
+                    self._start_timeout_locked(room)
+                    outgoing = self._match_found_outgoing(room, pair)
+            if conflict:
+                # 刚写入的对局行没人用得上，作废掉，别留下"进行中"孤儿。
+                await self._abandon_game_row(game_row.id, "left")
+                await self._matchmaker.requeue_opponent_after_failure(
+                    conn, pair
+                )
+                await self._send_error(
+                    conn, "匹配状态已变化，请重试", request_id
+                )
+                return
+
         for target, message in outgoing:
             await target.send(message)
         if room is not None:
@@ -1333,101 +1380,13 @@ class RoomManager:
             # 排位匹配成功，进行中的对局列表多了一条。
             await self._notify_live_games_changed()
 
-    async def _match_queued_locked(
-        self, conn: ClientConnection
-    ) -> tuple[
-        Optional[Room],
-        list[tuple[ClientConnection, dict]],
-        Optional[str],
-    ]:
-        """为入队玩家选择积分最接近的对手并创建排位房。
-
-        排位赛固定每手 30 秒，所有排队玩家时限一致，不再按设置筛选。
-        调用方必须持有 ``_state_lock``。写库失败时本次入队的玩家退出队列
-        并收到错误，其他等待者保留；避免客户端认为未入队而服务器仍在队列。
-        """
-        queued = self._queue.get(conn.user_id)
-        if queued is None:
-            return None, [], "你不在匹配队列中"
-        candidates = [
-            player
-            for user_id, player in self._queue.items()
-            if user_id != conn.user_id
-        ]
-        if not candidates:
-            return (
-                None,
-                [
-                    (
-                        conn,
-                        make_message(
-                            SERVER_QUEUE_STATUS,
-                            self._queue_state_payload(conn.user_id),
-                        ),
-                    )
-                ],
-                None,
-            )
-
-        opponent = min(
-            candidates, key=lambda player: abs(player.rating - queued.rating)
-        )
-        if secrets.randbelow(2) == 0:
-            black, white = queued, opponent
-        else:
-            black, white = opponent, queued
-
-        code = self._new_room_code()
-        try:
-            game_row = await self._create_game_row(
-                code,
-                black.conn.user_id,
-                white.conn.user_id,
-                "playing",
-                True,
-                rated=True,
-                time_control=queued.time_control,
-            )
-        except Exception:
-            logger.exception("创建排位对局数据库写入失败")
-            self._queue.pop(conn.user_id, None)
-            return None, [], "服务器无法创建排位对局，请稍后重试"
-
-        self._queue.pop(black.conn.user_id, None)
-        self._queue.pop(white.conn.user_id, None)
-        room = Room(
-            code=code,
-            game_id=game_row.id,
-            black_user_id=black.conn.user_id,
-            white_user_id=white.conn.user_id,
-            black_name=black.conn.username,
-            white_name=white.conn.username,
-            time_control=queued.time_control,
-            black_avatar=black.conn.avatar,
-            white_avatar=white.conn.avatar,
-            black_avatar_version=black.conn.avatar_version,
-            white_avatar_version=white.conn.avatar_version,
-            black_achievements=black.conn.achievements,
-            white_achievements=white.conn.achievements,
-            status="playing",
-            connections={
-                black.conn.user_id: black.conn,
-                white.conn.user_id: white.conn,
-            },
-            rated=True,
-            matchmade=True,
-            rating_before={
-                black.conn.user_id: black.rating,
-                white.conn.user_id: white.rating,
-            },
-        )
-        self._rooms_by_code[code] = room
-        self._room_by_user[black.conn.user_id] = room
-        self._room_by_user[white.conn.user_id] = room
-        self._record_game_started(room)
-        self._reset_clocks_locked(room)
-        self._start_timeout_locked(room)
-
+    def _match_found_outgoing(
+        self,
+        room: Room,
+        pair: tuple[QueuedPlayer, QueuedPlayer],
+    ) -> list[tuple[ClientConnection, dict]]:
+        """构造配对成功时要发给双方的消息（队列状态 + 匹配结果）。"""
+        black, white = pair
         outgoing: list[tuple[ClientConnection, dict]] = []
         for player, rival in ((black, white), (white, black)):
             outgoing.append(
@@ -1452,7 +1411,7 @@ class RoomManager:
                     ),
                 )
             )
-        return room, outgoing, None
+        return outgoing
 
     async def cancel_match(
         self, conn: ClientConnection, request_id: Optional[str] = None
@@ -1461,11 +1420,15 @@ class RoomManager:
         if not self._is_current_connection(conn):
             return
         async with self._state_lock:
-            self._queue.pop(conn.user_id, None)
+            self._matchmaker.remove(conn.user_id)
             payload = self._queue_state_payload(conn.user_id)
         await conn.send(make_message(SERVER_QUEUE_STATUS, payload))
 
-    async def leave_room(self, conn: ClientConnection) -> None:
+    async def leave_room(
+        self,
+        conn: ClientConnection,
+        request_id: Optional[str] = None,
+    ) -> None:
         """等待中或终局后可离开；进行中的对局请使用认输。"""
         if not self._is_current_connection(conn):
             return
@@ -1477,6 +1440,11 @@ class RoomManager:
         error: Optional[str] = None
         message = make_message(SERVER_ROOM_CLOSED, {"reason": "对局房间已关闭"})
         async with room.lock:
+            # 只有房间里登记的那条连接能离房：旧连接（已被重连替换）
+            # 不能把房间关掉，否则对手和观战者会收到莫名其妙的
+            # ROOM_CLOSED。检查放在关闭房间之前。
+            if room.connections.get(conn.user_id) is not conn:
+                return
             if room.status == "playing":
                 error = "进行中的对局请先认输"
             else:
@@ -1491,7 +1459,7 @@ class RoomManager:
                 self._remove_room_locked(room)
 
         if error:
-            await self._send_error(conn, error)
+            await self._send_error(conn, error, request_id)
 
     # ------------------------------------------------------------------
     # 观战
@@ -1537,7 +1505,7 @@ class RoomManager:
         target: Optional[Room] = None
         async with self._state_lock:
             # 观战和匹配不能同时存在，否则被匹配进新房间后身份会打架。
-            self._queue.pop(conn.user_id, None)
+            self._matchmaker.remove(conn.user_id)
             target = self._find_playing_room(game_id)
             if target is None:
                 error = "对局不存在或已结束"
@@ -1585,6 +1553,7 @@ class RoomManager:
                 "white_user_id": room.white_user_id or "",
                 "move_no": room.game.move_count,
                 "status": room.status,
+                "rule_mode": room.rule_mode.value,
             }
             for room in self._rooms_by_code.values()
             if room.status == "playing" and room.allow_spectators
@@ -1613,7 +1582,7 @@ class RoomManager:
             "spectators": sum(
                 len(room.spectators) for room in rooms
             ),
-            "match_queue": len(self._queue),
+            "match_queue": len(self._matchmaker),
         }
 
     def _record_game_started(self, room: Room) -> None:
@@ -1658,14 +1627,31 @@ class RoomManager:
             return
         room = self._room_by_user.get(conn.user_id)
         if room is None:
-            await self._send_error(conn, "你不在房间中")
+            await self._send_error(conn, "你不在房间中", request_id)
             return
 
         async with room.lock:
             if room.connections.get(conn.user_id) is not conn:
                 return
+            # 幂等重发：同一 request_id 已经落子成功时，直接回当前权威
+            # 状态，不重复落子。
+            #
+            # 这个分支必须排在所有业务校验（终局 / 超时补判 / 回合 /
+            # 坐标 / 位置占用）之前：客户端丢了 ACK 后重发时，对手可能
+            # 已经落子、或者对局已经结束，此时若先做业务校验，就会把
+            # "已经生效的落子"误报成"该位置已有棋子/还没有轮到你/
+            # 当前对局已结束"，客户端会以为自己的落子失败了。
+            #
+            # 也要排在超时补判之前：重发的是"已经走过的那一手"，玩家
+            # 在当时就已经消耗了自己的时间；因为一次重发再判一次超时，
+            # 等于让玩家为同一手付两次账。
+            if request_id in room.processed_moves:
+                await self._send_game_state(
+                    room, conn, request_id=request_id
+                )
+                return
             if room.status != "playing" or room.game.is_game_over:
-                await self._send_error(conn, "当前对局已结束")
+                await self._send_error(conn, "当前对局已结束", request_id)
                 return
             move_received_ms = _now_ms()
             if (
@@ -1675,14 +1661,15 @@ class RoomManager:
                 # 时钟已经耗尽但计时任务还没来得及执行：由服务器在落子
                 # 路径上补判超时，防止“卡点落子”绕过超时判负。
                 loser_id = self._current_clock_user_id(room)
-                timeout_winner_id = (
-                    room.opponent_id(loser_id) if loser_id else None
-                )
-                if timeout_winner_id is not None:
-                    await self._end_game_locked(
-                        room, timeout_winner_id, "timeout"
-                    )
-                    return
+                if loser_id is not None:
+                    timeout_winner_id = room.opponent_id(loser_id)
+                    if timeout_winner_id is not None:
+                        await self._end_game_locked(
+                            room,
+                            timeout_winner_id,
+                            self._timeout_reason_locked(room, loser_id),
+                        )
+                        return
             if room.undo_requester_id:
                 await self._send_move_rejected(
                     conn, request_id, "请先处理悔棋请求"
@@ -1690,26 +1677,28 @@ class RoomManager:
                 return
             color = room.color_for(conn.user_id)
             if color is None:
-                await self._send_error(conn, "你不是本局玩家")
+                await self._send_error(conn, "你不是本局玩家", request_id)
                 return
             if room.game.current_player is not color:
                 await self._send_move_rejected(conn, request_id, "还没有轮到你")
                 return
-            if not (
-                isinstance(row, int)
-                and isinstance(col, int)
-                and 0 <= row < BOARD_SIZE
-                and 0 <= col < BOARD_SIZE
-            ):
+            if not in_bounds(row, col):
                 await self._send_move_rejected(conn, request_id, "落子坐标非法")
                 return
             if room.game.board[row][col] is not None:
                 await self._send_move_rejected(conn, request_id, "该位置已有棋子")
                 return
 
-            # 客户端重试同一 move_id：返回当前权威状态，不重复落子。
-            if request_id in room.processed_moves:
-                await self._send_game_state(room, conn, request_id=request_id)
+            # 连珠模式下黑棋的长连、四四、三三禁手在服务器侧直接拒绝，
+            # 客户端无法通过伪造落子绕过；``place_stone`` 内的同一判定
+            # 保留作最后防线。白棋与自由规则不受影响。
+            if (
+                room.rule_mode is RuleMode.RENJU
+                and is_forbidden_move(
+                    room.game.board, row, col, color, room.rule_mode
+                )
+            ):
+                await self._send_move_rejected(conn, request_id, "连珠禁手")
                 return
 
             if not room.game.place_stone(row, col):
@@ -1717,15 +1706,36 @@ class RoomManager:
                 return
 
             new_move_no = room.game.move_count
-            status = _status_for_game(room.game)
+            status = payloads.status_for_game(room.game)
             winner_id: Optional[str] = None
             if room.game.winner is Player.BLACK:
                 winner_id = room.black_user_id
             elif room.game.winner is Player.WHITE:
                 winner_id = room.white_user_id
+            result_reason: Optional[str] = None
+            if status != "playing":
+                result_reason = "five" if winner_id is not None else "draw"
+            # 终局写入与排位结算必须原子提交：分成两次提交时，进程在
+            # 中间被杀会留下"已终局但没结算"的对局，只有启动补结算能
+            # 兜底。这里把落子、终局状态与结算放进同一个事务。
+            settle_rating = (
+                status != "playing"
+                and room.rated
+                and not room.rating_applied
+            )
+            settlement: Optional[SettlementResult] = None
 
             db_started = time.perf_counter()
             try:
+                # 赛季 id 必须在事务外取：current_season() 自己会开一个
+                # 会话，不能把会话嵌套进下面的事务里。这一步放进 try 是
+                # 有意的：取赛季失败时也要撤销上面的内存落子，否则棋盘
+                # 上会多出一颗数据库里并不存在的棋子。
+                season_id = (
+                    await self._settlement.settlement_season_id()
+                    if settle_rating
+                    else None
+                )
                 async with self._session_factory() as session:
                     game_row = await session.get(Game, room.game_id)
                     if game_row is None:
@@ -1735,7 +1745,7 @@ class RoomManager:
                             game_id=room.game_id,
                             move_no=new_move_no,
                             user_id=conn.user_id,
-                            color=_color_text(color),
+                            color=payloads.color_text(color),
                             row=row,
                             col=col,
                             client_move_id=request_id,
@@ -1745,15 +1755,29 @@ class RoomManager:
                     game_row.status = status
                     game_row.winner_user_id = winner_id
                     if status != "playing":
-                        game_row.result_reason = (
-                            "five" if winner_id is not None else "draw"
-                        )
+                        game_row.result_reason = result_reason
                         game_row.ended_at = utcnow_naive()
+                        if settle_rating:
+                            settlement = await self._settlement.settle_rated_game_in_session(
+                                session,
+                                game_row,
+                                black_id=room.black_user_id,
+                                white_id=room.white_user_id,
+                                winner_user_id=winner_id,
+                                status=status,
+                                result_reason=result_reason or "",
+                                move_no=new_move_no,
+                                season_id=season_id,
+                            )
+                    # 任何一步失败都整体回滚：下面 except 会撤销内存
+                    # 落子并让客户端重试。
                     await session.commit()
             except Exception:
                 logger.exception("落子数据库写入失败，撤销内存落子")
                 room.game.undo()
-                await self._send_error(conn, "服务器保存落子失败，请重试")
+                await self._send_error(
+                    conn, "服务器保存落子失败，请重试", request_id
+                )
                 return
             db_seconds = time.perf_counter() - db_started
             self._metrics.record_move(db_seconds)
@@ -1767,6 +1791,11 @@ class RoomManager:
                 },
             )
 
+            # 结算结果必须在广播前落到内存房间：快照里的积分与成就
+            # 字段直接读 room，晚一步客户端就会收到"已终局但无积分"。
+            if settlement is not None:
+                self._settlement.apply_settlement(room, settlement)
+
             room.processed_moves[request_id] = new_move_no
             room.status = status
             room.winner_user_id = winner_id
@@ -1779,12 +1808,9 @@ class RoomManager:
             if status == "playing":
                 self._start_timeout_locked(room)
             else:
-                room.result_reason = (
-                    "five" if winner_id is not None else "draw"
-                )
+                room.result_reason = result_reason
                 room.turn_deadline_ms = None
                 self._record_game_finished(room)
-                await self._settle_rated_game_locked(room)
 
             await self._broadcast_game_state(
                 room,
@@ -1808,7 +1834,11 @@ class RoomManager:
             )
         )
 
-    async def resign(self, conn: ClientConnection) -> None:
+    async def resign(
+        self,
+        conn: ClientConnection,
+        request_id: Optional[str] = None,
+    ) -> None:
         if not self._is_current_connection(conn):
             return
         room = self._room_by_user.get(conn.user_id)
@@ -1816,11 +1846,17 @@ class RoomManager:
             # 观战者没有执子资格，明确拒绝而不是静默忽略，
             # 否则客户端会把请求当成已受理。
             if conn.user_id in self._spectator_by_user:
-                await self._send_error(conn, "观战者不能认输")
+                await self._send_error(conn, "观战者不能认输", request_id)
             return
         async with room.lock:
+            # 只有房间里登记的那条连接能认输：重连替换过的旧连接
+            # 不再代表玩家本人，不能替它终结对局。
+            if room.connections.get(conn.user_id) is not conn:
+                return
             if room.status != "playing":
-                await self._send_error(conn, "当前没有进行中的对局")
+                await self._send_error(
+                    conn, "当前没有进行中的对局", request_id
+                )
                 return
             opponent = room.opponent_id(conn.user_id)
             if opponent is None:
@@ -1995,9 +2031,23 @@ class RoomManager:
                     await session.commit()
             except Exception:
                 logger.exception("悔棋数据库写入失败 room=%s", room.code)
+                # 写库失败必须把待回应的悔棋请求收干净：否则
+                # room.undo_requester_id 一直挂着、回合计时一直暂停，
+                # 对手可以反复点“同意”，直到 30 秒过期任务自己跑完。
+                # 这里照搬“拒绝”路径的收尾动作，再把状态广播给双方。
+                self._clear_undo_locked(room)
+                room.state_version += 1
+                self._start_timeout_locked(room)
                 await self._send_error(
                     conn, "服务器保存悔棋失败，请重试", request_id
                 )
+                await self._broadcast_undo_status(
+                    room,
+                    "cancelled",
+                    requester_id,
+                    "服务器保存悔棋失败，悔棋请求已取消",
+                )
+                await self._broadcast_game_state(room)
                 return
 
             while room.game.move_count > target_move_no:
@@ -2026,14 +2076,18 @@ class RoomManager:
             )
             await self._broadcast_game_state(room)
 
-    async def rematch(self, conn: ClientConnection) -> None:
+    async def rematch(
+        self,
+        conn: ClientConnection,
+        request_id: Optional[str] = None,
+    ) -> None:
         if not self._is_current_connection(conn):
             return
         room = self._room_by_user.get(conn.user_id)
         if room is None:
             # 观战者不是本局玩家，不能发起再战。
             if conn.user_id in self._spectator_by_user:
-                await self._send_error(conn, "观战者不能发起再战")
+                await self._send_error(conn, "观战者不能发起再战", request_id)
             return
         error: Optional[str] = None
         async with room.lock:
@@ -2060,6 +2114,8 @@ class RoomManager:
                                 "playing",
                                 True,
                                 time_control=room.time_control,
+                                # 再战沿用本房规则模式，不能退回默认值。
+                                rule_mode=room.rule_mode,
                             )
                         except Exception:
                             logger.exception("再战新对局写入失败")
@@ -2086,7 +2142,9 @@ class RoomManager:
                             room.white_avatar_version = old_black_version
                             room.black_achievements = old_white_achievements
                             room.white_achievements = old_black_achievements
-                            room.game = GameModel()
+                            # 这是明确的新局重置：棋盘清空但仍沿用原规则
+                            # 模式，不能把连珠房悄悄变回自由规则。
+                            room.game = GameModel(room.rule_mode)
                             room.status = "playing"
                             room.winner_user_id = None
                             room.result_reason = None
@@ -2108,7 +2166,7 @@ class RoomManager:
                     await self._send_rematch_status(room)
 
         if error:
-            await self._send_error(conn, error)
+            await self._send_error(conn, error, request_id)
 
     # ------------------------------------------------------------------
     # 表情/评论
@@ -2166,250 +2224,71 @@ class RoomManager:
             times.append(now)
             room.chat_sent_times[conn.user_id] = times
 
-            payload = {
-                "kind": kind,
-                "content": normalized,
-                "sender_id": conn.user_id,
-                "sender_name": conn.username,
-                "sent_at_ms": _now_ms(),
-            }
             # 广播给房间内所有连接（含发送者本人，双方看到同样的弹幕）。
-            message = make_message(SERVER_CHAT, payload)
-            for other in list(room.connections.values()):
-                await other.send(message)
+            message = payloads.chat_message(
+                conn, kind, normalized, _now_ms()
+            )
+            await self._send_all(
+                [(other, message) for other in room.connections.values()]
+            )
 
     # ------------------------------------------------------------------
-    # 时钟
+    # 时钟（实现见 clock_service.ClockService）
     # ------------------------------------------------------------------
     def _start_undo_expiry_locked(self, room: Room) -> None:
-        """悔棋请求在无人回应时自动过期，避免回合永久暂停。"""
-        self._cancel_undo_timer_locked(room)
-        room.undo_token += 1
-        token = room.undo_token
-        room.undo_task = asyncio.create_task(
-            self._undo_expire_after(room, token)
-        )
+        self._clocks.start_undo_expiry_locked(room)
 
     def _cancel_undo_timer_locked(self, room: Room) -> None:
-        task = room.undo_task
-        room.undo_task = None
-        if task is not None and task is not asyncio.current_task():
-            task.cancel()
+        self._clocks.cancel_undo_timer_locked(room)
 
     def _clear_undo_locked(self, room: Room) -> None:
-        room.undo_requester_id = None
-        self._cancel_undo_timer_locked(room)
-
-    async def _undo_expire_after(self, room: Room, token: int) -> None:
-        try:
-            await asyncio.sleep(_UNDO_REQUEST_TTL_SECONDS)
-            async with room.lock:
-                if (
-                    room.undo_token != token
-                    or room.undo_requester_id is None
-                ):
-                    return
-                requester_id = room.undo_requester_id
-                self._clear_undo_locked(room)
-                room.state_version += 1
-                if room.status == "playing":
-                    self._start_timeout_locked(room)
-                await self._broadcast_undo_status(
-                    room, "expired", requester_id, "悔棋请求已超时"
-                )
-                await self._broadcast_game_state(room)
-        except asyncio.CancelledError:
-            return
+        self._clocks.clear_undo_locked(room)
 
     def _start_escape_timer_locked(
         self, room: Room, user_id: str
     ) -> None:
-        """掉线宽限计时：到期仍未重连则由对手获胜。"""
-        self._cancel_escape_timer_locked(room, user_id)
-        room.escape_tokens[user_id] = room.escape_tokens.get(user_id, 0) + 1
-        token = room.escape_tokens[user_id]
-        seconds = max(0.05, float(self._settings.disconnect_forfeit_seconds))
-        room.escape_tasks[user_id] = asyncio.create_task(
-            self._escape_after(room, user_id, token, seconds)
-        )
+        self._clocks.start_escape_timer_locked(room, user_id)
 
     def _cancel_escape_timer_locked(
         self, room: Room, user_id: str
     ) -> None:
-        task = room.escape_tasks.pop(user_id, None)
-        if task is not None and task is not asyncio.current_task():
-            task.cancel()
+        self._clocks.cancel_escape_timer_locked(room, user_id)
 
     def _cancel_all_escape_timers_locked(self, room: Room) -> None:
-        for task in list(room.escape_tasks.values()):
-            if task is not asyncio.current_task():
-                task.cancel()
-        room.escape_tasks.clear()
-
-    async def _escape_after(
-        self,
-        room: Room,
-        user_id: str,
-        token: int,
-        seconds: float,
-    ) -> None:
-        try:
-            await asyncio.sleep(seconds)
-            async with room.lock:
-                if room.escape_tokens.get(user_id) != token:
-                    return
-                room.escape_tasks.pop(user_id, None)
-                if room.status != "playing":
-                    return
-                if user_id in room.connections:
-                    return
-                winner_id = room.opponent_id(user_id)
-                if winner_id is None:
-                    return
-                await self._end_game_locked(room, winner_id, "escape")
-        except asyncio.CancelledError:
-            return
+        self._clocks.cancel_all_escape_timers_locked(room)
 
     def _current_clock_user_id(self, room: Room) -> Optional[str]:
-        if room.game.current_player is Player.BLACK:
-            return room.black_user_id
-        if room.game.current_player is Player.WHITE:
-            return room.white_user_id
-        return None
+        return self._clocks.current_clock_user_id(room)
 
     def _cancel_timeout_locked(self, room: Room) -> None:
-        task = room.timeout_task
-        room.timeout_task = None
-        if task is not None and task is not asyncio.current_task():
-            task.cancel()
+        self._clocks.cancel_timeout_locked(room)
 
     def _reset_clocks_locked(self, room: Room) -> None:
         """新对局/再战开始时重置双方余量。"""
-        initial = room.time_control.initial_remaining_ms()
-        room.clock_remaining_ms = {
-            user_id: initial for user_id in room.participant_ids()
-        }
-        room.clock_started_ms = None
-        room.turn_deadline_ms = None
+        self._clocks.reset_clocks_locked(room)
 
     def _pause_clock_locked(self, room: Room) -> None:
         """暂停计时（悔棋等待期间），把已用时间从当前余量中扣除。"""
-        if room.clock_started_ms is not None:
-            current_id = self._current_clock_user_id(room)
-            if (
-                current_id is not None
-                and room.turn_deadline_ms is not None
-            ):
-                room.clock_remaining_ms[current_id] = max(
-                    0, room.turn_deadline_ms - _now_ms()
-                )
-        self._cancel_timeout_locked(room)
-        room.clock_started_ms = None
-        room.turn_deadline_ms = None
+        self._clocks.pause_clock_locked(room)
 
     def _consume_clock_locked(
         self, room: Room, user_id: str, at_ms: Optional[int] = None
     ) -> None:
-        """落子成功后结算走子方本手耗时。
-
-        per_move 模式下一手重新给满；Fischer 模式从余量里扣除本手耗时，
-        再加上固定加秒。调用方持有 ``room.lock``。
-        """
-        control = room.time_control
-        if control.is_fischer:
-            now = _now_ms() if at_ms is None else at_ms
-            started = room.clock_started_ms
-            remaining = room.clock_remaining_ms.get(
-                user_id, control.initial_remaining_ms()
-            )
-            if started is not None:
-                remaining = max(0, remaining - max(0, now - started))
-            room.clock_remaining_ms[user_id] = (
-                remaining + control.increment_seconds * 1000
-            )
-        else:
-            room.clock_remaining_ms[user_id] = 0
-        room.clock_started_ms = None
-        room.turn_deadline_ms = None
+        """落子成功后结算走子方本手耗时。"""
+        self._clocks.consume_clock_locked(room, user_id, at_ms)
 
     def _snapshot_remaining_locked(
         self, room: Room, user_id: str
     ) -> Optional[int]:
         """快照里展示的余量；每手模式不使用双方余量字段。"""
-        if not room.time_control.is_fischer:
-            return None
-        remaining = room.clock_remaining_ms.get(
-            user_id, room.time_control.initial_remaining_ms()
-        )
-        if (
-            room.clock_started_ms is not None
-            and room.turn_deadline_ms is not None
-            and self._current_clock_user_id(room) == user_id
-        ):
-            remaining = max(0, room.turn_deadline_ms - _now_ms())
-        return remaining
+        return self._clocks.snapshot_remaining_locked(room, user_id)
 
     def _start_timeout_locked(self, room: Room) -> None:
-        self._cancel_timeout_locked(room)
-        if room.status != "playing":
-            room.turn_deadline_ms = None
-            room.clock_started_ms = None
-            return
-        now = _now_ms()
-        current_id = self._current_clock_user_id(room)
-        if current_id is None:
-            room.turn_deadline_ms = None
-            room.clock_started_ms = None
-            return
-        control = room.time_control
-        if room.clock_started_ms is None:
-            room.clock_started_ms = now
-            if not control.is_fischer:
-                # 每手模式：每个回合都重新给满。
-                room.clock_remaining_ms[current_id] = (
-                    control.turn_seconds * 1000
-                )
-            else:
-                room.clock_remaining_ms.setdefault(
-                    current_id, control.initial_remaining_ms()
-                )
-        remaining = max(
-            0,
-            room.clock_remaining_ms.get(
-                current_id, control.initial_remaining_ms()
-            ),
-        )
-        room.turn_deadline_ms = room.clock_started_ms + remaining
-        room.turn_token += 1
-        token = room.turn_token
-        delay = max(0.001, (room.turn_deadline_ms - now) / 1000.0)
-        room.timeout_task = asyncio.create_task(
-            self._timeout_after(room, token, delay)
-        )
+        self._clocks.start_timeout_locked(room)
 
-    async def _timeout_after(
-        self, room: Room, token: int, delay_seconds: float
-    ) -> None:
-        try:
-            await asyncio.sleep(delay_seconds)
-            async with room.lock:
-                if room.status != "playing" or room.turn_token != token:
-                    return
-                loser_id = self._current_clock_user_id(room)
-                if loser_id is None:
-                    return
-                winner_id = room.opponent_id(loser_id)
-                if winner_id is None:
-                    return
-                # 掉线且未在宽限期内回来，按“逃跑”而不是普通超时记录。
-                reason = (
-                    "escape"
-                    if loser_id not in room.connections
-                    else "timeout"
-                )
-                await self._end_game_locked(room, winner_id, reason)
-        except asyncio.CancelledError:
-            return
+    def _timeout_reason_locked(self, room: Room, loser_id: str) -> str:
+        """超时判负的原因：掉线方按“逃跑”，在线方按普通“超时”。"""
+        return self._clocks.timeout_reason_locked(room, loser_id)
 
     async def _end_game_locked(
         self,
@@ -2417,22 +2296,41 @@ class RoomManager:
         winner_user_id: str,
         reason: str,
     ) -> None:
+        """终局：终局状态与排位积分在同一个事务里提交。
+
+        两件事必须原子：写成两次提交时，进程在中间被杀会留下
+        "已终局但没结算"的对局（``rating_applied`` 仍为假），而服务
+        启动时的作废扫描只看 waiting/playing，扫不到它——积分就永久
+        丢了。写库失败时把内存状态回滚，不能让客户端看到"对局已结束"
+        而数据库里这局还停在"进行中"。
+        """
         color = room.color_for(winner_user_id)
         if color is None:
             return
+        previous_status = room.status
+        previous_winner = room.winner_user_id
+        previous_reason = room.result_reason
+        previous_deadline = room.turn_deadline_ms
+        previous_started = room.clock_started_ms
+
         room.status = "black_won" if color is Player.BLACK else "white_won"
         room.winner_user_id = winner_user_id
         room.result_reason = reason
         room.turn_deadline_ms = None
         room.clock_started_ms = None
         room.rematch_votes.clear()
-        self._record_game_finished(room)
         room.state_version += 1
         self._clear_undo_locked(room)
         self._cancel_all_escape_timers_locked(room)
         self._cancel_timeout_locked(room)
 
+        settlement: Optional[SettlementResult] = None
         try:
+            # 赛季 id 必须在事务外取：current_season() 自己要开一个会话，
+            # 不能把会话嵌套进调用方的事务里。放在 try 内是为了让查询
+            # 自身失败时同样回滚上面的内存终局状态，而不是把房间卡在
+            # “内存已终局、数据库仍在进行中”的矛盾状态。
+            season_id = await self._settlement.settlement_season_id()
             async with self._session_factory() as session:
                 game_row = await session.get(Game, room.game_id)
                 if game_row is not None:
@@ -2441,244 +2339,120 @@ class RoomManager:
                     game_row.result_reason = reason
                     game_row.ended_at = utcnow_naive()
                     game_row.move_no = room.game.move_count
-                    await session.commit()
+                    if room.rated and not room.rating_applied:
+                        settlement = await self._settlement.settle_rated_game_in_session(
+                            session,
+                            game_row,
+                            black_id=room.black_user_id,
+                            white_id=room.white_user_id,
+                            winner_user_id=room.winner_user_id,
+                            status=room.status,
+                            result_reason=room.result_reason or "",
+                            move_no=room.game.move_count,
+                            season_id=season_id,
+                        )
+                # 终局状态与积分结算一起提交：要么都成功，要么都回滚。
+                await session.commit()
         except Exception:
-            logger.exception("终局结果数据库写入失败")
+            logger.exception("终局结果写入失败 room=%s", room.code)
+            room.status = previous_status
+            room.winner_user_id = previous_winner
+            room.result_reason = previous_reason
+            room.turn_deadline_ms = previous_deadline
+            room.clock_started_ms = previous_started
+            room.state_version += 1
+            if previous_status == "playing":
+                self._start_timeout_locked(room)
+            await self._broadcast_game_state(room)
+            return
 
-        await self._settle_rated_game_locked(room)
+        if settlement is not None:
+            self._settlement.apply_settlement(room, settlement)
+        self._record_game_finished(room)
         await self._broadcast_game_state(room)
         # 对局结束，进行中的对局列表少了一条。
         await self._notify_live_games_changed()
         if not room.connections:
             self._remove_room_locked(room)
 
+    async def _settlement_season_id(self) -> Optional[str]:
+        """结算要用的赛季 id。"""
+        return await self._settlement.settlement_season_id()
+
     async def _settle_rated_game_locked(self, room: Room) -> None:
-        """结算排位积分；同一局只应用一次，好友房直接跳过。
+        """独立事务结算排位积分；实现见 settlement.RatingSettlement。"""
+        await self._settlement.settle_rated_game_locked(room)
 
-        调用方持有 ``room.lock``。积分与 RatingEvent、Game.rating_applied
-        在同一数据库事务中提交，失败则保留未结算状态并记录日志。
-        """
-        if not room.rated or room.rating_applied:
-            return
-        black_id = room.black_user_id
-        white_id = room.white_user_id
-        if not black_id or not white_id:
-            return
-        if room.winner_user_id is None:
-            score_black = 0.5
-        elif room.winner_user_id == black_id:
-            score_black = 1.0
-        elif room.winner_user_id == white_id:
-            score_black = 0.0
-        else:
-            return
+    async def _settle_rated_game_in_session(
+        self,
+        session: AsyncSession,
+        game_row: Game,
+        *,
+        black_id: Optional[str],
+        white_id: Optional[str],
+        winner_user_id: Optional[str],
+        status: str,
+        result_reason: str,
+        move_no: int,
+        season_id: Optional[str],
+    ) -> Optional[SettlementResult]:
+        """在给定会话里完成排位结算的数据库部分。"""
+        return await self._settlement.settle_rated_game_in_session(
+            session,
+            game_row,
+            black_id=black_id,
+            white_id=white_id,
+            winner_user_id=winner_user_id,
+            status=status,
+            result_reason=result_reason,
+            move_no=move_no,
+            season_id=season_id,
+        )
 
-        try:
-            season = await self.current_season()
-            season_id = season.id if season is not None else None
-            async with self._session_factory() as session:
-                users = {
-                    user.id: user
-                    for user in (
-                        await session.scalars(
-                            select(User).where(
-                                User.id.in_((black_id, white_id))
-                            )
-                        )
-                    ).all()
-                }
-                black_user = users.get(black_id)
-                white_user = users.get(white_id)
-                game_row = await session.get(Game, room.game_id)
-                if (
-                    black_user is None
-                    or white_user is None
-                    or game_row is None
-                ):
-                    logger.warning(
-                        "排位积分结算缺少玩家或对局 room=%s", room.code
-                    )
-                    return
-                if game_row.rating_applied:
-                    room.rating_applied = True
-                    room.black_achievements = achievement_keys_for_user(
-                        black_user
-                    )
-                    room.white_achievements = achievement_keys_for_user(
-                        white_user
-                    )
-                    return
+    def _apply_settlement(
+        self, room: Room, result: SettlementResult
+    ) -> None:
+        """把已经提交的结算结果落到内存房间。"""
+        self._settlement.apply_settlement(room, result)
 
-                # 结算前先记下成就集合，结算后做差得到"本局新解锁"。
-                black_achievements_before = achievement_keys_for_user(
-                    black_user
-                )
-                white_achievements_before = achievement_keys_for_user(
-                    white_user
-                )
+    async def repair_unsettled_games(self) -> int:
+        """补结算"已终局但没结算"的排位对局，返回补结算的对局数。"""
+        return await self._settlement.repair_unsettled_games()
 
-                black_change, white_change = calculate_pair(
-                    black_user.rating,
-                    black_user.rating_rd,
-                    black_user.rating_volatility,
-                    white_user.rating,
-                    white_user.rating_rd,
-                    white_user.rating_volatility,
-                    score_black,
-                )
-                black_user.rating = black_change.after
-                white_user.rating = white_change.after
-                black_user.rating_rd = black_change.rd_after
-                white_user.rating_rd = white_change.rd_after
-                black_user.rating_volatility = (
-                    black_change.volatility_after
-                )
-                white_user.rating_volatility = (
-                    white_change.volatility_after
-                )
-                black_user.peak_rating = max(
-                    black_user.peak_rating, black_change.after
-                )
-                white_user.peak_rating = max(
-                    white_user.peak_rating, white_change.after
-                )
-                black_user.rated_games += 1
-                white_user.rated_games += 1
-
-                if score_black == 1.0:
-                    black_user.wins += 1
-                    white_user.losses += 1
-                    black_score, white_score = "win", "loss"
-                    black_user.current_win_streak += 1
-                    black_user.best_win_streak = max(
-                        black_user.best_win_streak,
-                        black_user.current_win_streak,
-                    )
-                    white_user.current_win_streak = 0
-                elif score_black == 0.0:
-                    white_user.wins += 1
-                    black_user.losses += 1
-                    black_score, white_score = "loss", "win"
-                    white_user.current_win_streak += 1
-                    white_user.best_win_streak = max(
-                        white_user.best_win_streak,
-                        white_user.current_win_streak,
-                    )
-                    black_user.current_win_streak = 0
-                else:
-                    black_user.draws += 1
-                    white_user.draws += 1
-                    black_score = white_score = "draw"
-                    black_user.current_win_streak = 0
-                    white_user.current_win_streak = 0
-
-                black_achievements_after = achievement_keys_for_user(
-                    black_user
-                )
-                white_achievements_after = achievement_keys_for_user(
-                    white_user
-                )
-                new_black_achievements = new_achievement_keys(
-                    black_achievements_before,
-                    black_achievements_after,
-                )
-                new_white_achievements = new_achievement_keys(
-                    white_achievements_before,
-                    white_achievements_after,
-                )
-
-                session.add_all(
-                    [
-                        RatingEvent(
-                            game_id=room.game_id,
-                            user_id=black_id,
-                            opponent_id=white_id,
-                            score=black_score,
-                            rating_before=black_change.before,
-                            rating_after=black_change.after,
-                            delta=black_change.delta,
-                            rating_rd_before=black_change.rd_before,
-                            rating_rd_after=black_change.rd_after,
-                            rating_volatility_before=(
-                                black_change.volatility_before
-                            ),
-                            rating_volatility_after=(
-                                black_change.volatility_after
-                            ),
-                            season_id=season_id,
-                        ),
-                        RatingEvent(
-                            game_id=room.game_id,
-                            user_id=white_id,
-                            opponent_id=black_id,
-                            score=white_score,
-                            rating_before=white_change.before,
-                            rating_after=white_change.after,
-                            delta=white_change.delta,
-                            rating_rd_before=white_change.rd_before,
-                            rating_rd_after=white_change.rd_after,
-                            rating_volatility_before=(
-                                white_change.volatility_before
-                            ),
-                            rating_volatility_after=(
-                                white_change.volatility_after
-                            ),
-                            season_id=season_id,
-                        ),
-                    ]
-                )
-                game_row.rated = True
-                game_row.rating_applied = True
-                game_row.status = room.status
-                game_row.winner_user_id = room.winner_user_id
-                game_row.result_reason = room.result_reason or (
-                    "five" if room.winner_user_id else "draw"
-                )
-                game_row.ended_at = game_row.ended_at or utcnow_naive()
-                game_row.move_no = room.game.move_count
-                await session.commit()
-        except Exception:
-            logger.exception("排位积分结算失败 room=%s", room.code)
-            return
-
-        room.rating_before = {
-            black_id: black_change.before,
-            white_id: white_change.before,
-        }
-        room.rating_after = {
-            black_id: black_change.after,
-            white_id: white_change.after,
-        }
-        room.rating_delta = {
-            black_id: black_change.delta,
-            white_id: white_change.delta,
-        }
-        room.black_achievements = black_achievements_after
-        room.white_achievements = white_achievements_after
-        room.new_achievements = {
-            black_id: new_black_achievements,
-            white_id: new_white_achievements,
-        }
-        room.rating_applied = True
+    async def repair_unsettled_games_once(self) -> int:
+        """整个进程只补结算一次；重复调用直接返回 0。"""
+        return await self._settlement.repair_unsettled_games_once()
 
     # ------------------------------------------------------------------
     # 持久化清理/关闭
     # ------------------------------------------------------------------
-    async def _mark_waiting_game_abandoned(
-        self, room: Room, reason: str
-    ) -> None:
-        if room.status != "waiting":
-            return
+    async def _abandon_game_row(self, game_id: str, reason: str) -> None:
+        """把一个还没用上的对局行标记为作废。
+
+        覆盖 waiting（建房后没能入座）与 playing（匹配写库成功、但二次
+        校验发现玩家已进别的房间）两种状态；终局行不属于“没用上”，
+        不会被这里改写。
+        """
         try:
             async with self._session_factory() as session:
-                game_row = await session.get(Game, room.game_id)
-                if game_row is not None and game_row.status == "waiting":
+                game_row = await session.get(Game, game_id)
+                if game_row is not None and game_row.status in (
+                    "waiting",
+                    "playing",
+                ):
                     game_row.status = "abandoned"
                     game_row.result_reason = reason
                     game_row.ended_at = utcnow_naive()
                     await session.commit()
         except Exception:
-            logger.exception("作废等待房间数据库写入失败")
+            logger.exception("作废未使用对局数据库写入失败")
+
+    async def _mark_waiting_game_abandoned(
+        self, room: Room, reason: str
+    ) -> None:
+        if room.status != "waiting":
+            return
+        await self._abandon_game_row(room.game_id, reason)
 
     def _remove_room_locked(self, room: Room) -> None:
         self._cancel_timeout_locked(room)
@@ -2730,9 +2504,8 @@ class RoomManager:
         self._rooms_by_code.clear()
         self._room_by_user.clear()
         self._spectator_by_user.clear()
-        self._connections.clear()
-        self._connection_limiter.clear()
-        self._queue.clear()
+        self._connections_registry.clear()
+        self._matchmaker.clear()
 
 
 __all__ = [

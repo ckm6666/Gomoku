@@ -23,6 +23,7 @@ from gomoku.shared.rules import (
     Move,
     Player,
     find_winning_line,
+    in_bounds,
 )
 
 
@@ -159,7 +160,7 @@ class SandboxModel:
 
         if self.is_game_over:
             return False
-        if not 0 <= row < BOARD_SIZE or not 0 <= col < BOARD_SIZE:
+        if not in_bounds(row, col):
             return False
         if self._board[row][col] is not None:
             return False

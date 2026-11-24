@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 
 from gomoku.shared.protocol import (
@@ -13,6 +14,8 @@ from gomoku.shared.protocol import (
     SERVER_AUTHENTICATED,
     make_message,
 )
+from server.app.db import create_engine, create_session_factory
+from server.app.models import Game
 from server.tests.helpers import ServerTestBase
 
 
@@ -174,6 +177,74 @@ class GameHistoryTests(ServerTestBase):
 
         anonymous = self.client.get("/api/v1/games/recent")
         self.assertEqual(anonymous.status_code, 401)
+
+
+class GameRuleModeTests(ServerTestBase):
+    """详情与最近对局必须回传数据库中记录的规则模式。"""
+
+    def _register_user(self, username: str) -> tuple[str, str]:
+        response = self.register(username)
+        self.assertEqual(response.status_code, 201, response.text)
+        payload = response.json()
+        return payload["user"]["id"], payload["access_token"]
+
+    def _seed_game(
+        self,
+        game_id: str,
+        black_id: str,
+        white_id: str,
+        rule_mode: str,
+    ) -> None:
+        async def seed() -> None:
+            engine = create_engine(self.settings)
+            factory = create_session_factory(engine)
+            try:
+                async with factory() as session:
+                    session.add(
+                        Game(
+                            id=game_id,
+                            room_code=game_id[:12],
+                            black_user_id=black_id,
+                            white_user_id=white_id,
+                            status="black_won",
+                            winner_user_id=black_id,
+                            result_reason="resign",
+                            move_no=0,
+                            rated=False,
+                            rule_mode=rule_mode,
+                        )
+                    )
+                    await session.commit()
+            finally:
+                await engine.dispose()
+
+        asyncio.run(seed())
+
+    def test_detail_and_recent_expose_rule_mode(self) -> None:
+        black_id, black_token = self._register_user("rule_black")
+        white_id, _white_token = self._register_user("rule_white")
+        self._seed_game("renju-game", black_id, white_id, "renju")
+        self._seed_game("freestyle-game", black_id, white_id, "freestyle")
+
+        recent = self.client.get(
+            "/api/v1/games/recent",
+            headers=self.auth_headers(black_token),
+        )
+        self.assertEqual(recent.status_code, 200, recent.text)
+        entries = {
+            entry["game_id"]: entry for entry in recent.json()["entries"]
+        }
+        self.assertEqual(entries["renju-game"]["rule_mode"], "renju")
+        self.assertEqual(
+            entries["freestyle-game"]["rule_mode"], "freestyle"
+        )
+
+        detail = self.client.get(
+            "/api/v1/games/renju-game",
+            headers=self.auth_headers(black_token),
+        )
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["rule_mode"], "renju")
 
 
 if __name__ == "__main__":

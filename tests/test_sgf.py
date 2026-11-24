@@ -15,6 +15,7 @@ def _record(
     winner: Player | None,
     reason: str,
     mode: str = "local",
+    rule_mode: str = "freestyle",
 ) -> GameRecord:
     return GameRecord(
         record_id="sgf-test",
@@ -25,7 +26,17 @@ def _record(
         result_reason=reason,
         black_name="甲",
         white_name="乙",
+        rule_mode=rule_mode,
     )
+
+
+def _five_moves() -> list[tuple[int, int, Player]]:
+    moves: list[tuple[int, int, Player]] = []
+    for index, col in enumerate(range(3, 8)):
+        moves.append((7, col, Player.BLACK))
+        if index < 4:
+            moves.append((9, col, Player.WHITE))
+    return moves
 
 
 class SgfRoundTripTests(unittest.TestCase):
@@ -79,6 +90,55 @@ class SgfRoundTripTests(unittest.TestCase):
             record_from_sgf("(;GM[1]SZ[15];B[zz])")
         with self.assertRaises(SgfError):
             record_from_sgf("(;GM[1]SZ[15];B[aa];W[aa])")
+
+    def test_freestyle_ruleset_is_exported_and_imported(self) -> None:
+        record = _record(_five_moves(), winner=Player.BLACK, reason="five")
+        text = record_to_sgf(record)
+        self.assertIn("RU[freestyle]", text)
+        self.assertEqual(record_from_sgf(text).rule_mode, "freestyle")
+
+    def test_renju_ruleset_round_trip(self) -> None:
+        record = _record(
+            _five_moves(),
+            winner=Player.BLACK,
+            reason="five",
+            rule_mode="renju",
+        )
+        text = record_to_sgf(record)
+        self.assertIn("RU[renju]", text)
+        restored = record_from_sgf(text)
+        self.assertEqual(restored.rule_mode, "renju")
+        self.assertIs(restored.winner, Player.BLACK)
+        self.assertEqual(restored.result_reason, "five")
+
+    def test_missing_ruleset_defaults_to_freestyle(self) -> None:
+        restored = record_from_sgf("(;GM[1]SZ[15];B[aa];W[bb])")
+        self.assertEqual(restored.rule_mode, "freestyle")
+
+    def test_unknown_ruleset_is_rejected(self) -> None:
+        for value in ("chess", "", "Renju"):
+            with self.subTest(value=value):
+                with self.assertRaises(SgfError):
+                    record_from_sgf(
+                        f"(;GM[1]SZ[15]RU[{value}];B[aa])"
+                    )
+
+    def test_invalid_record_rule_mode_is_rejected(self) -> None:
+        record = _record(
+            [], winner=None, reason="", rule_mode="chess"
+        )
+        with self.assertRaises(SgfError):
+            record_to_sgf(record)
+
+    def test_renju_import_rejects_black_overline(self) -> None:
+        # 黑棋第 6 颗连成 6 颗；自由规则下算胜，连珠规则下是禁手。
+        sgf = (
+            "(;GM[1]SZ[15]RU[renju]"
+            ";B[ch];W[aa];B[dh];W[ac];B[eh];W[ae]"
+            ";B[fh];W[ag];B[hh];W[ai];B[gh])"
+        )
+        with self.assertRaises(SgfError):
+            record_from_sgf(sgf)
 
 
 if __name__ == "__main__":

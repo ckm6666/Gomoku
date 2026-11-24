@@ -36,6 +36,7 @@ from gomoku.shared.capabilities import (  # noqa: E402
 from gomoku.shared.protocol import (  # noqa: E402
     CLIENT_AUTH,
     CLIENT_CANCEL_MATCH,
+    CLIENT_CREATE_ROOM,
     CLIENT_QUICK_MATCH,
     CLIENT_UNDO_REQUEST,
     CLIENT_UNDO_RESPONSE,
@@ -50,7 +51,7 @@ from gomoku.shared.protocol import (  # noqa: E402
     SERVER_UNDO_STATUS,
     make_message,
 )
-from gomoku.shared.rules import BOARD_SIZE, Player  # noqa: E402
+from gomoku.shared.rules import BOARD_SIZE, Player, RuleMode  # noqa: E402
 from gomoku.shared.time_control import TimeControl  # noqa: E402
 from tests.fakes import FakeTransport  # noqa: E402
 
@@ -154,6 +155,7 @@ def state_message(
     server_now_ms: int | None = None,
     time_control: dict | None = None,
     move_timeout_seconds: int | None = None,
+    rule_mode: str | None = None,
 ) -> dict:
     """构造一个符合协议的服务器局面消息。"""
     return make_message(
@@ -185,6 +187,7 @@ def state_message(
             "rating_delta": rating_delta,
             "time_control": time_control,
             "move_timeout_seconds": move_timeout_seconds,
+            "rule_mode": rule_mode,
         },
         request_id=request_id,
     )
@@ -442,9 +445,10 @@ class OnlineSessionTests(unittest.TestCase):
                     },
                 )
             )
+            # 未知能力只表示对端版本更新，客户端应静默过滤，不能当成已支持。
             self.assertEqual(
                 session.server_capabilities,
-                frozenset({"spectate", "unknown_feature"}),
+                frozenset({"spectate"}),
             )
             self.assertTrue(session.supports("spectate"))
             self.assertFalse(session.supports("missing"))
@@ -593,6 +597,160 @@ class OnlineSessionTests(unittest.TestCase):
             self.assertEqual(
                 sent["payload"]["time_control"]["main_seconds"], 180
             )
+        finally:
+            session.shutdown()
+            transport.close()
+
+    def test_create_room_sends_default_freestyle_rule(self) -> None:
+        """未指定规则时，建房请求默认提交自由规则。"""
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        try:
+            self._authenticate(transport, session)
+            self.assertTrue(session.create_room())
+            sent = transport.sent_messages[-1]
+            self.assertEqual(sent["type"], CLIENT_CREATE_ROOM)
+            self.assertEqual(sent["payload"]["rule_mode"], "freestyle")
+        finally:
+            session.shutdown()
+            transport.close()
+
+    def test_create_room_sends_renju_rule(self) -> None:
+        """选择连珠规则时，建房请求提交 "renju"。"""
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        try:
+            self._authenticate(transport, session)
+            self.assertTrue(session.create_room(rule_mode=RuleMode.RENJU))
+            sent = transport.sent_messages[-1]
+            self.assertEqual(sent["type"], CLIENT_CREATE_ROOM)
+            self.assertEqual(sent["payload"]["rule_mode"], "renju")
+        finally:
+            session.shutdown()
+            transport.close()
+
+    def test_room_created_parses_renju_rule(self) -> None:
+        """room_created 下发的规则模式要在等待房间阶段就能读到。"""
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        codes: list[str] = []
+        session.room_created.connect(codes.append)
+        try:
+            self._authenticate(transport, session)
+            transport.receive(
+                make_message(
+                    SERVER_ROOM_CREATED,
+                    {
+                        "room_code": "ABC123",
+                        "game_id": "game-renju",
+                        "your_color": "black",
+                        "black_name": "tester",
+                        "white_name": "",
+                        "turn_seconds": 30,
+                        "rule_mode": "renju",
+                    },
+                )
+            )
+            self.assertEqual(codes, ["ABC123"])
+            self.assertIs(session.rule_mode, RuleMode.RENJU)
+            self.assertIs(session.phase, OnlineSessionPhase.WAITING)
+        finally:
+            session.shutdown()
+            transport.close()
+
+    def test_room_created_without_rule_mode_defaults_to_freestyle(
+        self,
+    ) -> None:
+        """旧服务端不下发 rule_mode 时按自由规则处理。"""
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        try:
+            self._authenticate(transport, session)
+            transport.receive(
+                make_message(
+                    SERVER_ROOM_CREATED,
+                    {
+                        "room_code": "ABC123",
+                        "game_id": "game-free",
+                        "your_color": "black",
+                        "black_name": "tester",
+                        "white_name": "",
+                        "turn_seconds": 30,
+                    },
+                )
+            )
+            self.assertIs(session.rule_mode, RuleMode.FREESTYLE)
+        finally:
+            session.shutdown()
+            transport.close()
+
+    def test_room_created_with_bad_rule_mode_still_opens_room(
+        self,
+    ) -> None:
+        """规则模式非法时退回自由规则，不能中断建房流程。"""
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        codes: list[str] = []
+        session.room_created.connect(codes.append)
+        try:
+            self._authenticate(transport, session)
+            transport.receive(
+                make_message(
+                    SERVER_ROOM_CREATED,
+                    {
+                        "room_code": "ABC123",
+                        "game_id": "game-bad-rule",
+                        "your_color": "black",
+                        "black_name": "tester",
+                        "white_name": "",
+                        "turn_seconds": 30,
+                        "rule_mode": "chess",
+                    },
+                )
+            )
+            self.assertEqual(codes, ["ABC123"])
+            self.assertIs(session.rule_mode, RuleMode.FREESTYLE)
+            self.assertTrue(session.waiting_for_opponent)
+        finally:
+            session.shutdown()
+            transport.close()
+
+    def test_snapshot_rule_mode_updates_session(self) -> None:
+        """权威快照里的规则模式覆盖等待房间的缓存值。"""
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        try:
+            self._authenticate(transport, session)
+            transport.receive(
+                make_message(
+                    SERVER_ROOM_CREATED,
+                    {
+                        "room_code": "ABC123",
+                        "game_id": "game-renju",
+                        "your_color": "black",
+                        "black_name": "tester",
+                        "white_name": "",
+                        "turn_seconds": 30,
+                        "rule_mode": "freestyle",
+                    },
+                )
+            )
+            self.assertIs(session.rule_mode, RuleMode.FREESTYLE)
+            transport.receive(
+                state_message(
+                    blank_board(),
+                    room_code="ABC123",
+                    rule_mode="renju",
+                )
+            )
+            self.assertIs(session.rule_mode, RuleMode.RENJU)
+            self.assertIs(session.snapshot.rule_mode, RuleMode.RENJU)
+
+            # 房间关闭后回到默认规则，避免影响下一局。
+            transport.receive(
+                make_message(SERVER_ROOM_CLOSED, {"reason": "测试关闭"})
+            )
+            self.assertIs(session.rule_mode, RuleMode.FREESTYLE)
         finally:
             session.shutdown()
             transport.close()
@@ -991,9 +1149,12 @@ class OnlineSessionTests(unittest.TestCase):
             self.assertEqual(session.snapshot.room_code, "")
             self.assertFalse(session.accepts_human_input)  # 对手黑棋先手
 
+            winning_board = blank_board()
+            for col in range(3, 8):
+                winning_board[7][col] = "black"
             transport.receive(
                 state_message(
-                    blank_board(),
+                    winning_board,
                     current="black",
                     your_color="white",
                     move_no=5,

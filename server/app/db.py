@@ -4,6 +4,10 @@
 PostgreSQL（生产配置见 README）。正常启动由
 :mod:`server.app.migrations` 执行 Alembic 迁移；``create_tables`` 仅保留
 给引入 Alembic 之前创建的旧库做一次性兼容登记。
+
+SQLite 连接会统一打开 WAL 日志模式、5 秒忙等待与 NORMAL 同步级别，
+避免多人同时落子时读写互斥导致的 ``database is locked``；PostgreSQL
+不受这些 PRAGMA 影响。
 """
 
 from __future__ import annotations
@@ -23,9 +27,19 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase
 
-from server.app.config import Settings
+from server.app.config import (
+    Settings,
+    normalize_database_url,
+    sqlite_path_from_url as _sqlite_path_from_url,
+)
 
 logger = logging.getLogger(__name__)
+
+#: SQLite 写锁被占用时的最长等待时间（毫秒）。
+#:
+#: 服务端每手棋都写穿数据库，读写并发时容易撞上写锁；没有忙等待的话
+#: SQLite 会立刻抛 "database is locked"，有了它则最多等这么久。
+SQLITE_BUSY_TIMEOUT_MS = 5000
 
 
 class Base(DeclarativeBase):
@@ -46,22 +60,56 @@ def rowcount_of(result: Any) -> int:
     return int(cast(CursorResult[Any], result).rowcount or 0)
 
 
+def apply_sqlite_pragmas(dbapi_connection: Any) -> None:
+    """为每条 SQLite 连接设置忙等待、WAL 日志模式与同步级别。
+
+    * ``busy_timeout=5000``：写锁被占用时最多等 5 秒，而不是立刻抛
+      ``database is locked``。这是**每连接**设置，必须每次建连都设。
+    * ``journal_mode=WAL``：读写不再互斥，读者可以与写者同时存在。这是
+      **库级**设置（写在数据库文件里），每次连接都设无害，但必须检查
+      返回值：内存库不支持 WAL（返回 ``memory``），部分网络文件系统也
+      切不过去（返回原模式）。
+    * ``synchronous=NORMAL``：WAL 下兼顾安全与速度，也是每连接设置。
+
+    顺序说明：先设 ``busy_timeout`` 再切 WAL——切换日志模式本身要拿库级
+    锁，没有忙等待时并发建连会直接失败。
+    """
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        row = cursor.fetchone()
+        mode = str(row[0]).lower() if row else ""
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        cursor.close()
+    if mode == "memory":
+        # 内存数据库不支持 WAL，属于预期情况，不报警。
+        return
+    if mode != "wal":
+        logger.warning(
+            "SQLite 未启用 WAL 日志模式（当前 %s），"
+            "并发写入可能报 database is locked",
+            mode or "未知",
+        )
+
+
 def create_engine(settings: Settings) -> AsyncEngine:
-    """创建异步引擎，并为 SQLite 打开外键约束。"""
-    url = settings.database_url
-    if url.startswith("sqlite+aiosqlite:///"):
-        db_path = url.split("sqlite+aiosqlite:///", 1)[1]
-        if db_path and db_path != ":memory:":
-            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    """创建异步引擎；SQLite 连接统一打开 WAL、忙等待与外键约束。"""
+    url = normalize_database_url(settings.database_url)
+    sqlite_path = sqlite_path_from_url(url)
+    if sqlite_path is not None:
+        raw_path = str(sqlite_path)
+        if raw_path and raw_path != ":memory:":
+            Path(raw_path).parent.mkdir(parents=True, exist_ok=True)
 
     engine = create_async_engine(url, future=True)
-    if url.startswith("sqlite+aiosqlite:///"):
+    if sqlite_path is not None:
 
         @event.listens_for(engine.sync_engine, "connect")
-        def _enable_sqlite_foreign_keys(dbapi_connection, _record) -> None:
-            cursor = dbapi_connection.cursor()
-            cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.close()
+        def _configure_sqlite(dbapi_connection, _record) -> None:
+            apply_sqlite_pragmas(dbapi_connection)
 
     return engine
 
@@ -196,15 +244,18 @@ async def mark_unfinished_games_abandoned(
 
 
 def sqlite_path_from_url(url: str) -> Optional[Path]:
-    """测试/部署辅助：从 SQLite URL 提取文件路径。"""
-    prefix = "sqlite+aiosqlite:///"
-    if url.startswith(prefix):
-        return Path(url[len(prefix):])
-    return None
+    """测试/部署辅助：从 SQLite URL 提取文件路径。
+
+    实现放在 :mod:`server.app.config`（无第三方依赖），备份工具也复用
+    同一份解析逻辑，这里只做转发以兼容既有导入路径。
+    """
+    return _sqlite_path_from_url(url)
 
 
 __all__ = [
     "Base",
+    "SQLITE_BUSY_TIMEOUT_MS",
+    "apply_sqlite_pragmas",
     "create_engine",
     "create_session_factory",
     "create_tables",

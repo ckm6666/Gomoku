@@ -45,6 +45,7 @@ from gomoku.shared.protocol import (
     SERVER_PONG,
     make_message,
     parse_message,
+    rule_mode_from_payload,
 )
 from gomoku.shared.time_control import (
     PER_MOVE_MAX_SECONDS,
@@ -60,6 +61,12 @@ from server.app.ws.limits import CommandRateLimiter
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["game-websocket"])
+
+#: 心跳（ping）单独限流。ping 是保活机制，不能按命令的额度限，否则
+#: 空闲连接会被误伤；但也不能完全豁免——每条 ping 都要服务端回一个
+#: pong，无限制的 ping 等于让客户端无限占用服务端往返。
+_PING_BURST = 5
+_PING_WINDOW_SECONDS = 5.0
 
 
 class _EnvelopeError(ProtocolError):
@@ -104,7 +111,8 @@ async def _safe_close(websocket: WebSocket, code: int, reason: str) -> None:
     try:
         await websocket.close(code=code, reason=reason)
     except Exception:
-        pass
+        # 关闭失败也要留痕：否则「连接没断开」这类问题无从排查。
+        logger.debug("关闭 WebSocket 失败", exc_info=True)
 
 
 def _requested_time_control(
@@ -280,6 +288,9 @@ async def game_websocket(websocket: WebSocket) -> None:
         },
     )
     season = await room_manager.current_season()
+    # 兜底的启动补结算：把"已终局但没结算"的排位对局补上。真正的启动
+    # 钩子在 main.py 的 lifespan 里，这里保证只要有连接进来就会补一次。
+    await room_manager.repair_unsettled_games_once()
     authenticated = await conn.send(
         make_message(
             SERVER_AUTHENTICATED,
@@ -322,6 +333,10 @@ async def game_websocket(websocket: WebSocket) -> None:
         settings.ws_command_burst,
         settings.ws_command_window_seconds,
     )
+    # 心跳单独一套额度：比命令宽松，但同样有限。
+    ping_limiter = CommandRateLimiter(
+        _PING_BURST, _PING_WINDOW_SECONDS
+    )
     try:
         while True:
             try:
@@ -347,9 +362,30 @@ async def game_websocket(websocket: WebSocket) -> None:
             request_id = message.get("request_id")
             payload = message.get("payload", {})
 
-            if message_type != CLIENT_PING and not command_limiter.allow(
-                time.monotonic()
-            ):
+            if message_type == CLIENT_PING:
+                # 心跳有自己的额度：不占命令配额，但同样有限。
+                if not ping_limiter.allow(time.monotonic()):
+                    metrics = getattr(app.state, "metrics", None)
+                    if metrics is not None:
+                        metrics.ws_rate_limited.inc()
+                    logger.warning(
+                        "ws_ping_rate_limited",
+                        extra={
+                            "event": "ws_ping_rate_limited",
+                            "user_id": user_id,
+                            "message_type": message_type,
+                            "request_id": request_id,
+                        },
+                    )
+                    await conn.send(
+                        make_message(
+                            SERVER_ERROR,
+                            {"reason": "心跳过于频繁，请稍后再试"},
+                            request_id=request_id,
+                        )
+                    )
+                    continue
+            elif not command_limiter.allow(time.monotonic()):
                 metrics = getattr(app.state, "metrics", None)
                 if metrics is not None:
                     metrics.ws_rate_limited.inc()
@@ -386,6 +422,14 @@ async def game_websocket(websocket: WebSocket) -> None:
                     time_control, time_error = _requested_time_control(
                         payload
                     )
+                    # 缺省视为自由规则；显式给出非法值时沿用协议错误
+                    # 语义，回具体的 request_id，客户端才能归因。
+                    try:
+                        rule_mode = rule_mode_from_payload(
+                            payload.get("rule_mode")
+                        )
+                    except ProtocolError:
+                        rule_mode = None
                     if not isinstance(allow_spectators, bool):
                         await conn.send(
                             make_message(
@@ -402,12 +446,21 @@ async def game_websocket(websocket: WebSocket) -> None:
                                 request_id=request_id,
                             )
                         )
+                    elif rule_mode is None:
+                        await conn.send(
+                            make_message(
+                                SERVER_ERROR,
+                                {"reason": "规则模式非法"},
+                                request_id=request_id,
+                            )
+                        )
                     else:
                         await room_manager.create_room(
                             conn,
                             request_id,
                             allow_spectators,
                             time_control=time_control,
+                            rule_mode=rule_mode,
                         )
                 elif message_type == CLIENT_JOIN_ROOM:
                     code = payload.get("room_code")
@@ -440,7 +493,7 @@ async def game_websocket(websocket: WebSocket) -> None:
                     else:
                         await room_manager.move(conn, request_id, row, col)
                 elif message_type == CLIENT_RESIGN:
-                    await room_manager.resign(conn)
+                    await room_manager.resign(conn, request_id)
                 elif message_type == CLIENT_UNDO_REQUEST:
                     await room_manager.undo_request(conn, request_id)
                 elif message_type == CLIENT_UNDO_RESPONSE:
@@ -458,7 +511,7 @@ async def game_websocket(websocket: WebSocket) -> None:
                             conn, accept, request_id
                         )
                 elif message_type == CLIENT_LEAVE_ROOM:
-                    await room_manager.leave_room(conn)
+                    await room_manager.leave_room(conn, request_id)
                 elif message_type == CLIENT_WATCH_GAME:
                     # 观战：旁观者按对局编号进入别人正在进行的一局。
                     game_id = payload.get("game_id")
@@ -475,7 +528,7 @@ async def game_websocket(websocket: WebSocket) -> None:
                             conn, game_id, request_id
                         )
                 elif message_type == CLIENT_REMATCH:
-                    await room_manager.rematch(conn)
+                    await room_manager.rematch(conn, request_id)
                 elif message_type == CLIENT_QUICK_MATCH:
                     # 排位固定每手 30 秒；这里仍解析一次时限字段，
                     # 只为了拒绝畸形请求，实际对局不采用客户端的设置。
@@ -552,6 +605,7 @@ async def game_websocket(websocket: WebSocket) -> None:
                         make_message(
                             SERVER_ERROR,
                             {"reason": "连接已经认证"},
+                            request_id=request_id,
                         )
                     )
                 else:

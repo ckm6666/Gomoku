@@ -200,6 +200,64 @@ class PlayerCard(QFrame):
         self.update()
 
 
+class TransientNotice(QWidget):
+    """窗口底部的非阻塞提示条。
+
+    用于“本地棋谱没能保存”这类必须告知、但不该打断当前操作的提示：
+    它不进入模态状态、不拦截鼠标事件，几秒后自动消失。相比模态弹窗，
+    它不会把终局结果挡在后面。
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("transientNotice")
+        self.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        self.setStyleSheet(
+            "background-color: rgba(26, 22, 17, 225);"
+            "border: 1px solid rgba(212, 175, 55, 180);"
+            "border-radius: 10px;"
+        )
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(18, 8, 18, 8)
+        self.label = QLabel("", self)
+        self.label.setObjectName("transientNoticeLabel")
+        self.label.setStyleSheet(
+            "color: #f6ead6; background: transparent; border: none;"
+        )
+        layout.addWidget(self.label)
+
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.hide)
+        self.hide()
+
+    def show_message(self, text: str, *, timeout_ms: int = 5000) -> None:
+        """显示一条提示，并在若干毫秒后自动隐藏。"""
+        self.label.setText(text)
+        self._reposition()
+        self.show()
+        self.raise_()
+        self._timer.start(timeout_ms)
+
+    def _reposition(self) -> None:
+        """把提示条贴在宿主底部居中。"""
+        host = self.parentWidget()
+        if host is None:
+            return
+        label_hint = self.label.sizeHint()
+        width = min(
+            max(label_hint.width() + 36, 280),
+            max(host.width() - 32, 280),
+        )
+        height = label_hint.height() + 18
+        x = max(0, (host.width() - width) // 2)
+        y = max(0, host.height() - height - 24)
+        self.setGeometry(x, y, width, height)
+
+
 class MainWindow(QMainWindow):
     """应用主窗口。"""
 
@@ -228,6 +286,8 @@ class MainWindow(QMainWindow):
         self._replay_return_page: Optional[QWidget] = None
         # 当前正在显示的窗口内模态层（终局弹窗/确认框），供测试定位。
         self._active_modal: Optional[ModalOverlay] = None
+        # 窗口底部的非阻塞提示条（棋谱保存失败等）。
+        self._transient_notice: Optional[TransientNotice] = None
 
         # 更新检查：版本信息只从 GitHub Releases 检索，安装包也由用户从
         # 发布页下载，客户端不经过游戏服务端分发新版本。
@@ -253,10 +313,14 @@ class MainWindow(QMainWindow):
         # 弹窗/关闭/程序化设置同步的保护标志。
         self._result_dialog_open = False
         self._modal_dialog_open = False
+        # 被模态层挡住的终局弹窗：记下代次，等模态层关闭后一次性补上。
+        self._pending_result_dialog: Optional[int] = None
         self._closing = False
         self._syncing_settings = False
         # 提示结果显示后，_sync_ui 不应立即覆盖“备选着法”tooltip。
         self._hint_tooltip_active = False
+        # 提示分析是否正在进行：进行中时提示按钮变成“取消提示”。
+        self._hint_analysis_pending = False
 
         # 每次会话替换/撤销递增，用于丢弃过期终局弹窗定时器。
         self._game_generation = 0
@@ -321,6 +385,8 @@ class MainWindow(QMainWindow):
         if isinstance(session, AIGameSession):
             session.hint_ready.connect(self._on_ai_hint_ready)
             session.hint_failed.connect(self._on_ai_hint_failed)
+            # 会话侧作废提示（取消、落子、暂停、重开）时同步清掉界面标记。
+            session.hint_cleared.connect(self._on_ai_hint_cleared)
         return session
 
     def _replace_session(self) -> None:
@@ -452,10 +518,17 @@ class MainWindow(QMainWindow):
             metadata=metadata,
         )
         try:
-            self._record_store.append(record)
+            saved = self._record_store.append(record)
         except Exception:
             logger.exception("保存本地棋谱失败")
+            saved = False
         self._recorded_generation = self._game_generation
+        if not saved:
+            # 只记日志的话，用户会以为棋谱已经存好；这里给一条不打断
+            # 操作的提示。
+            self._show_transient_notice(
+                "本地棋谱写入失败，本局棋谱没有保存。"
+            )
 
     def _play_start_sound(self) -> None:
         if not self._closing:
@@ -904,6 +977,42 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # 主菜单导航
     # ------------------------------------------------------------------
+    def _leave_game_page(self) -> None:
+        """离开对局页的统一入口。
+
+        所有切走对局页的路径都必须先经过这里：暂停会话，让后台 AI 停止
+        思考并作废在途结果。否则用户在复盘页或联机页浏览时，隐藏的棋盘
+        仍会被 AI 悄悄改掉。
+        """
+        if self._closing:
+            return
+        self._session.pause()
+
+    def _enter_game_page(self) -> None:
+        """回到对局页：恢复被 :meth:`_leave_game_page` 暂停的会话。"""
+        if self._closing:
+            return
+        self._session.resume()
+
+    def _show_page(self, widget: QWidget) -> None:
+        """切换页面栈，并同步联机面板的可见状态。
+
+        页面切换一律走这里：联机面板藏在页面栈里时必须停掉它的界面
+        定时器与终局提示，否则隐藏的页面还在刷新、还在弹窗。
+        """
+        self.stack.setCurrentWidget(widget)
+        self._sync_online_panel_visibility()
+
+    def _sync_online_panel_visibility(self) -> None:
+        """按当前页面同步联机面板的可见状态生命周期。"""
+        panel = self._online_panel
+        if panel is None:
+            return
+        if self.stack.currentWidget() is panel:
+            panel.resume_visible_state()
+        else:
+            panel.pause_visible_state()
+
     def start_local_game(self) -> None:
         """从主菜单开始一局本地双人对战。"""
         self._start_game(GameMode.LOCAL)
@@ -925,7 +1034,7 @@ class MainWindow(QMainWindow):
         self._game_mode = mode
         # _replace_session 负责 shutdown 旧会话、同步界面和播放开局音。
         self._replace_session()
-        self.stack.setCurrentWidget(self.game_page)
+        self._show_page(self.game_page)
         self._set_game_shortcuts_enabled(True)
 
     def _on_back_requested(self) -> None:
@@ -946,20 +1055,20 @@ class MainWindow(QMainWindow):
             return
 
         # 先暂停，确保确认框打开期间 AI/网络结果不会改变棋盘。
-        self._session.pause()
+        self._leave_game_page()
         if self._session.view.move_count > 0:
             if not self._confirm_discard_game(
                 "返回主菜单",
                 "返回主菜单将结束当前棋局，确定要返回吗？",
                 confirm_text="返回主菜单",
             ):
-                self._session.resume()
+                self._enter_game_page()
                 self._sync_ui()
                 return
 
         # 使尚未执行的终局弹窗定时器失效。
         self._game_generation += 1
-        self.stack.setCurrentWidget(self.menu_page)
+        self._show_page(self.menu_page)
         self._set_game_shortcuts_enabled(False)
         self.online_button.setFocus()
 
@@ -971,9 +1080,9 @@ class MainWindow(QMainWindow):
             or self._result_dialog_open
         ):
             return
-        self._session.pause()
+        self._leave_game_page()
         self.puzzle_page.refresh_daily()
-        self.stack.setCurrentWidget(self.puzzle_page)
+        self._show_page(self.puzzle_page)
         self._set_game_shortcuts_enabled(False)
         self.puzzle_page.back_button.setFocus()
 
@@ -981,8 +1090,8 @@ class MainWindow(QMainWindow):
         """残局列表返回主菜单。"""
         if self._closing or self._modal_dialog_open:
             return
-        self._session.pause()
-        self.stack.setCurrentWidget(self.menu_page)
+        self._leave_game_page()
+        self._show_page(self.menu_page)
         self._set_game_shortcuts_enabled(False)
         self.online_button.setFocus()
 
@@ -1000,7 +1109,7 @@ class MainWindow(QMainWindow):
         self._game_mode = GameMode.PUZZLE
         self._puzzle_result = None
         self._replace_session()
-        self.stack.setCurrentWidget(self.game_page)
+        self._show_page(self.game_page)
         self._set_game_shortcuts_enabled(True)
         self.board_widget.setFocus()
 
@@ -1029,8 +1138,9 @@ class MainWindow(QMainWindow):
                 return
 
         self._game_generation += 1
+        self._leave_game_page()
         self.puzzle_page.refresh_daily()
-        self.stack.setCurrentWidget(self.puzzle_page)
+        self._show_page(self.puzzle_page)
         self._set_game_shortcuts_enabled(False)
         self.puzzle_page.back_button.setFocus()
 
@@ -1072,14 +1182,19 @@ class MainWindow(QMainWindow):
             panel.set_records(records)
 
         self._replay_return_page = return_to or self.stack.currentWidget()
-        self.stack.setCurrentWidget(panel)
+        # 复盘页不是对局页：离开对局页前先暂停会话。
+        self._leave_game_page()
+        self._show_page(panel)
         self._set_game_shortcuts_enabled(False)
 
     def _on_replay_panel_closed(self) -> None:
         """复盘页关闭：回到来源页面。"""
         target = self._replay_return_page or self.menu_page
         self._replay_return_page = None
-        self.stack.setCurrentWidget(target)
+        self._show_page(target)
+        if target is self.game_page:
+            # 回到对局页：恢复之前被暂停的会话。
+            self._enter_game_page()
         if target is self.menu_page:
             self.online_button.setFocus()
 
@@ -1111,7 +1226,9 @@ class MainWindow(QMainWindow):
                 panel.replay_requested.connect(self._open_replay_page)
                 self._online_panel = panel
                 self.stack.addWidget(panel)
-            self.stack.setCurrentWidget(panel)
+            # 联机页不是对局页：离开对局页前先暂停会话。
+            self._leave_game_page()
+            self._show_page(panel)
             self._set_game_shortcuts_enabled(False)
         except Exception as exc:  # 依赖/页面初始化失败时不要让离线应用崩溃
             logger.exception("打开联机页失败")
@@ -1128,12 +1245,14 @@ class MainWindow(QMainWindow):
         if panel is not None and panel.in_room():
             confirmed = self._confirm_discard_game(
                 "返回主菜单",
-                "对局仍在继续，返回主菜单只是切走界面，确定要返回吗？",
+                "对局仍在继续，返回主菜单只是切走界面，"
+                "连接会保持（心跳继续），确定要返回吗？",
                 confirm_text="返回主菜单",
             )
             if not confirmed:
                 return
-        self.stack.setCurrentWidget(self.menu_page)
+        self._leave_game_page()
+        self._show_page(self.menu_page)
         self._set_game_shortcuts_enabled(False)
         self.online_button.setFocus()
 
@@ -1279,7 +1398,11 @@ class MainWindow(QMainWindow):
             self._sync_ui()
 
     def _request_hint(self) -> None:
-        """按模式请求提示：残局显示文字，人机模式请求 AI 分析。"""
+        """按模式请求提示：残局显示文字，人机模式请求 AI 分析。
+
+        分析进行中时这个按钮变成“取消提示”：再点一次就能中止后台搜索，
+        不必干等它算完。
+        """
         if (
             self._closing
             or self._modal_dialog_open
@@ -1295,13 +1418,92 @@ class MainWindow(QMainWindow):
             return
 
         session = self._session
-        if not isinstance(session, AIGameSession) or not session.can_hint:
+        if not isinstance(session, AIGameSession):
             return
-        if session.request_hint():
-            self._hint_tooltip_active = False
-            self.puzzle_hint_label.setText("提示：正在分析局面…")
-            self.puzzle_hint_label.setVisible(True)
-            self.hint_button.setEnabled(False)
+
+        if self._hint_analysis_pending:
+            self._cancel_hint_analysis(session)
+            return
+
+        if not session.can_hint:
+            return
+        if not session.request_hint():
+            return
+
+        # 新一轮分析开始：上一轮的提示文字、tooltip 与棋盘标记全部作废，
+        # 否则旧局面的推荐会一直挂在界面上。
+        self._clear_hint_display()
+        self._hint_analysis_pending = True
+        self.puzzle_hint_label.setText("提示：正在分析局面…")
+        self.puzzle_hint_label.setVisible(True)
+        self._sync_hint_button()
+
+    def _cancel_hint_analysis(self, session: AIGameSession) -> None:
+        """中止正在进行的提示分析。
+
+        会话侧的取消入口由 AIGameSession 提供（``cancel_hint``）。这里按
+        公开接口优先、其次兼容旧名字的顺序调用；接口缺失时只把界面复位，
+        避免按钮永远停在“取消提示”。
+        """
+        for name in (
+            "cancel_hint",
+            "cancel_hint_search",
+            "_cancel_hint_search",
+        ):
+            cancel = getattr(session, name, None)
+            if callable(cancel):
+                cancel()
+                break
+        else:
+            logger.warning("当前 AI 会话没有取消提示分析的接口")
+        self._clear_hint_display()
+        self._sync_hint_button()
+
+    def _default_hint_tooltip(self) -> str:
+        """返回提示按钮在“没有备选着法”时使用的默认提示文字。"""
+        if self._game_mode is GameMode.PUZZLE:
+            return "查看当前残局的提示"
+        if self._game_mode is GameMode.AI:
+            return "让 AI 分析局面并推荐一手"
+        return "查看提示"
+
+    def _sync_hint_button(self) -> None:
+        """同步提示按钮的文案与可用状态。
+
+        分析进行中时按钮保持可点，作用从“请求提示”变成“取消提示”。
+        ``AIGameSession.hint_running`` 是唯一事实来源：会话因暂停、悔棋或
+        棋盘变化作废提示后，按钮不能停留在“取消提示”。
+        """
+        button = self.hint_button
+        if isinstance(self._session, AIGameSession):
+            self._hint_analysis_pending = self._session.hint_running
+        if self._hint_analysis_pending:
+            button.setText("取消提示")
+            button.setEnabled(True)
+            button.setToolTip("取消正在进行的提示分析")
+            return
+
+        view = self._session.view
+        game_over = view.is_game_over
+        puzzle_over = (
+            self._game_mode is GameMode.PUZZLE
+            and self._puzzle_result is not None
+        )
+        button.setText("提示")
+        if self._game_mode is GameMode.PUZZLE:
+            button.setEnabled(not puzzle_over)
+            button.setToolTip(self._default_hint_tooltip())
+        elif self._game_mode is GameMode.AI:
+            session = self._session
+            button.setEnabled(
+                isinstance(session, AIGameSession)
+                and session.can_hint
+                and not game_over
+            )
+            if not self._hint_tooltip_active:
+                button.setToolTip(self._default_hint_tooltip())
+        else:
+            button.setEnabled(False)
 
     def _show_puzzle_hint(self) -> None:
         """在当前残局中展示题库提供的文字提示。"""
@@ -1325,6 +1527,7 @@ class MainWindow(QMainWindow):
         move = getattr(analysis, "best_move", None)
         if not isinstance(session, AIGameSession) or move is None:
             return
+        self._hint_analysis_pending = False
         row, col = move
         self.board_widget.set_hint_cell(move, session.model.move_count)
 
@@ -1363,23 +1566,38 @@ class MainWindow(QMainWindow):
             ]
             self.hint_button.setToolTip("备选：" + "，".join(parts))
             self._hint_tooltip_active = True
+        self._sync_hint_button()
 
     def _on_ai_hint_failed(self, message: str) -> None:
         """提示分析失败时给出简短反馈，不阻断对局。"""
         if self.sender() is not self._session or self._closing:
             return
         logger.warning("AI 提示分析失败：%s", message)
+        self._hint_analysis_pending = False
         self.puzzle_hint_label.setText("提示：分析失败，请稍后重试")
         self.puzzle_hint_label.setVisible(True)
+        self._sync_hint_button()
+
+    def _on_ai_hint_cleared(self) -> None:
+        """会话侧作废提示：清除旧文字、标记并在需要时复位按钮。"""
+        if self.sender() is not self._session or self._closing:
+            return
+        self._clear_hint_display()
 
     def _clear_hint_display(self) -> None:
-        """清除提示文字与棋盘标记。"""
+        """清除提示文字、棋盘标记与按钮上的备选着法。"""
         self._hint_tooltip_active = False
+        self._hint_analysis_pending = False
         if hasattr(self, "puzzle_hint_label"):
             self.puzzle_hint_label.clear()
             self.puzzle_hint_label.setVisible(False)
         if hasattr(self, "board_widget"):
             self.board_widget.clear_hint()
+        if hasattr(self, "hint_button"):
+            # 备选着法已经作废，tooltip 不能继续留在按钮上。
+            self.hint_button.setToolTip(self._default_hint_tooltip())
+            # 旧提示被清除时，按钮文案也要立刻回到“提示”。
+            self._sync_hint_button()
 
     @staticmethod
     def _format_board_coordinate(row: int, col: int) -> str:
@@ -1442,9 +1660,11 @@ class MainWindow(QMainWindow):
         if not (self._session.view.is_game_over or puzzle_over):
             return
         if self._modal_dialog_open:
-            # 返回主菜单/重新开局的确认框仍在，关闭后再展示终局结果。
-            QTimer.singleShot(
-                100, lambda: self._show_result_dialog(generation)
+            # 返回主菜单/重新开局的确认框仍在：记下待显示的终局结果，
+            # 等模态层关闭后一次性补上。旧实现每 100ms 轮询一次，
+            # 用户不点掉确认框就会一直占着定时器队列。
+            self._pending_result_dialog = (
+                self._game_generation if generation is None else generation
             )
             return
 
@@ -1470,6 +1690,24 @@ class MainWindow(QMainWindow):
             self._reset_game()
         elif self._game_mode is GameMode.PUZZLE:
             self._request_puzzle_list()
+
+        QTimer.singleShot(0, self._flush_pending_result_dialog)
+
+    def _flush_pending_result_dialog(self) -> None:
+        """模态层关闭后补显示被推迟的终局弹窗。
+
+        终局弹窗只挂起一次，不会变成轮询；代次校验保证上一局的终局
+        不会盖到新一局头上。
+        """
+        generation = self._pending_result_dialog
+        if generation is None:
+            return
+        self._pending_result_dialog = None
+        if self._modal_dialog_open:
+            # 还有别的模态层开着：继续挂起，等它关闭时再补。
+            self._pending_result_dialog = generation
+            return
+        self._show_result_dialog(generation)
 
     def _build_result_presentation(
         self, winner: Optional[Player], move_count: int
@@ -1557,6 +1795,8 @@ class MainWindow(QMainWindow):
             return confirmed
         finally:
             self._modal_dialog_open = False
+            # 延后一拍再补终局弹窗：让当前这次页面切换先走完。
+            QTimer.singleShot(0, self._flush_pending_result_dialog)
 
     def _overlay_host(self) -> QWidget:
         """模态层的宿主：主窗口中央部件。"""
@@ -1577,6 +1817,23 @@ class MainWindow(QMainWindow):
             self._modal_dialog_open = previous_modal_state
             notice.deleteLater()
             self._active_modal = None
+            if not self._modal_dialog_open:
+                # 提示层关掉了：补上被推迟的终局弹窗。
+                QTimer.singleShot(0, self._flush_pending_result_dialog)
+
+    def _show_transient_notice(self, text: str) -> None:
+        """显示一条非阻塞提示：窗口底部的提示条，几秒后自动消失。
+
+        与 :meth:`_show_notice` 的模态提示不同，它不会挡住终局弹窗，
+        也不会让用户必须点“知道了”才能继续。
+        """
+        if self._closing:
+            return
+        notice = self._transient_notice
+        if notice is None:
+            notice = TransientNotice(self._overlay_host())
+            self._transient_notice = notice
+        notice.show_message(text)
 
     # ------------------------------------------------------------------
     # 更新检查（版本信息只来自 GitHub Releases）
@@ -1653,6 +1910,8 @@ class MainWindow(QMainWindow):
             self._modal_dialog_open = False
             dialog.deleteLater()
             self._active_modal = None
+            # 弹窗关掉了：补上被推迟的终局弹窗与更新提示。
+            QTimer.singleShot(0, self._flush_pending_result_dialog)
 
         # 弹窗已经关闭，此时再打开浏览器，避免两个模态层同时存在。
         pending = self._pending_download_url
@@ -1808,20 +2067,7 @@ class MainWindow(QMainWindow):
             )
         hint_visible = self._game_mode in (GameMode.PUZZLE, GameMode.AI)
         self.hint_button.setVisible(hint_visible)
-        if self._game_mode is GameMode.PUZZLE:
-            self.hint_button.setEnabled(not puzzle_over)
-            self.hint_button.setToolTip("查看当前残局的提示")
-        elif self._game_mode is GameMode.AI:
-            session = self._session
-            self.hint_button.setEnabled(
-                isinstance(session, AIGameSession)
-                and session.can_hint
-                and not game_over
-            )
-            if not self._hint_tooltip_active:
-                self.hint_button.setToolTip("让 AI 分析局面并推荐一手")
-        else:
-            self.hint_button.setEnabled(False)
+        self._sync_hint_button()
         self.restart_button.setText(
             "重新挑战"
             if self._game_mode is GameMode.PUZZLE

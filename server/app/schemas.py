@@ -227,6 +227,7 @@ class RecentGameEntry(BaseModel):
     move_no: int
     ended_at: Optional[datetime] = None
     rating_delta: Optional[int] = None
+    rule_mode: str = "freestyle"
 
 
 class RecentGamesResponse(BaseModel):
@@ -245,6 +246,7 @@ class LiveGameEntry(BaseModel):
     white_user_id: str
     move_no: int
     status: str
+    rule_mode: str = "freestyle"
 
 
 class LiveGamesResponse(BaseModel):
@@ -376,6 +378,7 @@ class GameDetailResponse(BaseModel):
     rating_delta: Optional[int] = None
     moves: list[GameMove]
     time_control: dict = Field(default_factory=dict)
+    rule_mode: str = "freestyle"
 
 
 class ReportCreateRequest(BaseModel):

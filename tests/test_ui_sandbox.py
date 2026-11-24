@@ -51,7 +51,7 @@ def make_state_message(
     stones: dict[tuple[int, int], str] | None = None,
     your_color: str | None = "black",
     current: str = "white",
-    move_no: int = 2,
+    move_no: int = 0,
 ) -> dict:
     """构造一个带棋子的符合协议的服务器局面消息。"""
     payload = dict(state_message(
@@ -72,7 +72,7 @@ class SandboxUiTests(unittest.TestCase):
         stones: dict[tuple[int, int], str] | None = None,
         your_color: str | None = "black",
         current: str = "black",
-        move_no: int = 2,
+        move_no: int = 0,
         with_game: bool = True,
     ) -> tuple[OnlinePanel, OnlineGameSession, FakeTransport]:
         """搭一个联机对局页并返回（面板、会话、传输）。"""
@@ -227,7 +227,17 @@ class SandboxUiTests(unittest.TestCase):
 
             # 服务器下发了手数更高的新局面。
             transport.receive(
-                make_state_message(current="white", move_no=5)
+                make_state_message(
+                    current="white",
+                    move_no=5,
+                    stones={
+                        (7, 3): "black",
+                        (8, 3): "white",
+                        (7, 4): "black",
+                        (8, 4): "white",
+                        (7, 5): "black",
+                    },
+                )
             )
 
             self.assertTrue(panel.sandbox_panel.base_stale)

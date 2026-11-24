@@ -69,7 +69,8 @@ class QtWebSocketTransport(Transport):
         try:
             self._socket.close()
         except Exception:
-            pass
+            # 关闭失败也要留痕：否则「连接没断开」这类问题无从排查。
+            logger.debug("WebSocket 关闭失败", exc_info=True)
 
     # ------------------------------------------------------------------
     # QWebSocket 信号

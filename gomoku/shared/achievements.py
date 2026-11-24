@@ -213,8 +213,13 @@ def normalize_achievement_keys(value: object) -> tuple[str, ...]:
 def new_achievement_keys(
     before: Iterable[str], after: Iterable[str]
 ) -> tuple[str, ...]:
-    """返回 after 相比 before 新增的成就 key（按目录顺序）。"""
-    old = set(before)
+    """返回 after 相比 before 新增的成就 key（按目录顺序）。
+
+    两个集合都先归一化：历史数据里的脏 key（拼写错误、已下线的成就）
+    不能因为 ``before`` 里出现过就被当成“未解锁”，否则每次结算都会
+    重复播报新成就。
+    """
+    old = set(normalize_achievement_keys(list(before)))
     return tuple(
         key
         for key in normalize_achievement_keys(list(after))

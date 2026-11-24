@@ -20,6 +20,45 @@ logger = logging.getLogger(__name__)
 _SERVER_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_DB_PATH = _SERVER_ROOT / "data" / "gomoku.db"
 
+#: 房间码默认字母表：去掉容易看混的 I/O/0/1。
+DEFAULT_ROOM_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+#: SQLite 异步驱动 URL 前缀（服务端引擎使用）。
+SQLITE_ASYNC_URL_PREFIX = "sqlite+aiosqlite:///"
+#: SQLite 同步驱动 URL 前缀（备份工具等离线脚本使用）。
+SQLITE_SYNC_URL_PREFIX = "sqlite:///"
+#: 两种写法都指向同一个数据库文件，解析入口只有本模块一处。
+SQLITE_URL_PREFIXES = (SQLITE_ASYNC_URL_PREFIX, SQLITE_SYNC_URL_PREFIX)
+
+
+def is_sqlite_url(url: str) -> bool:
+    """判断 URL 是否是 SQLite（异步或同步写法）。"""
+    return url.startswith(SQLITE_URL_PREFIXES)
+
+
+def sqlite_path_from_url(url: str) -> Optional[Path]:
+    """从 SQLite URL 解析数据库文件路径；非 SQLite 返回 ``None``。
+
+    同时接受 ``sqlite+aiosqlite:///`` 与 ``sqlite:///``，保证同一个
+    ``GOMOKU_DATABASE_URL`` 在服务端引擎、迁移脚本与备份工具里解析到
+    同一个文件，不会因为解析入口不同而备份错文件。
+    """
+    for prefix in SQLITE_URL_PREFIXES:
+        if url.startswith(prefix):
+            return Path(url[len(prefix):]).expanduser()
+    return None
+
+
+def normalize_database_url(url: str) -> str:
+    """把同步 SQLite URL 改写成 aiosqlite 异步驱动。
+
+    异步引擎不能使用同步驱动；统一在这里改写，调用方只需要关心 URL
+    的语义（指向哪个数据库），不用关心用的是哪个驱动。
+    """
+    if url.startswith(SQLITE_SYNC_URL_PREFIX):
+        return SQLITE_ASYNC_URL_PREFIX + url[len(SQLITE_SYNC_URL_PREFIX):]
+    return url
+
 
 def _int_env(
     source: Mapping[str, str],
@@ -56,6 +95,8 @@ class Settings:
     disconnect_forfeit_seconds: float = 20.0
     max_ws_message_chars: int = 8192
     room_code_length: int = 8
+    # 房间码字母表；长度必须不小于 room_code_length，且不能有重复字符。
+    room_code_alphabet: str = DEFAULT_ROOM_CODE_ALPHABET
     # 日志级别与格式（text/json）；生产建议 json 便于采集。
     log_level: str = "INFO"
     log_format: str = "text"
@@ -180,6 +221,25 @@ class Settings:
         season_days = _int_env(
             source, "GOMOKU_SEASON_LENGTH_DAYS", 90, 1, 3650
         )
+        room_code_length = _int_env(
+            source, "GOMOKU_ROOM_CODE_LENGTH", 8, 4, 16
+        )
+        room_code_alphabet = source.get(
+            "GOMOKU_ROOM_CODE_ALPHABET", DEFAULT_ROOM_CODE_ALPHABET
+        ).strip()
+        if not room_code_alphabet:
+            raise ConfigurationError(
+                "GOMOKU_ROOM_CODE_ALPHABET 不能为空"
+            )
+        if len(set(room_code_alphabet)) != len(room_code_alphabet):
+            raise ConfigurationError(
+                "GOMOKU_ROOM_CODE_ALPHABET 不能包含重复字符"
+            )
+        if len(room_code_alphabet) < room_code_length:
+            raise ConfigurationError(
+                "GOMOKU_ROOM_CODE_ALPHABET 至少需要 "
+                f"{room_code_length} 个字符"
+            )
         admin_raw = source.get("GOMOKU_ADMIN_USERNAMES", "")
         admin_usernames = frozenset(
             item.strip().lower()
@@ -208,7 +268,8 @@ class Settings:
             ws_auth_timeout_seconds=auth_timeout,
             ws_idle_timeout_seconds=idle_timeout,
             disconnect_forfeit_seconds=disconnect_forfeit,
-            room_code_length=8,
+            room_code_length=room_code_length,
+            room_code_alphabet=room_code_alphabet,
             log_level=log_level,
             log_format=log_format,
             undo_limit_per_game=undo_limit,
@@ -223,4 +284,13 @@ class Settings:
         )
 
 
-__all__ = ["Settings"]
+__all__ = [
+    "DEFAULT_ROOM_CODE_ALPHABET",
+    "SQLITE_ASYNC_URL_PREFIX",
+    "SQLITE_SYNC_URL_PREFIX",
+    "SQLITE_URL_PREFIXES",
+    "Settings",
+    "is_sqlite_url",
+    "normalize_database_url",
+    "sqlite_path_from_url",
+]

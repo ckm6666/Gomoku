@@ -42,9 +42,10 @@ from gomoku.shared.protocol import (  # noqa: E402
     SERVER_AUTHENTICATED,
     SERVER_GAME_STATE,
     SERVER_LIVE_GAMES_CHANGED,
+    SERVER_ROOM_CREATED,
     make_message,
 )
-from gomoku.shared.rules import BOARD_SIZE, Player  # noqa: E402
+from gomoku.shared.rules import BOARD_SIZE, Player, RuleMode  # noqa: E402
 from tests.fakes import FakeTransport  # noqa: E402
 
 # 保持 QApplication 单例；若 UI 测试先创建则复用同一个实例。
@@ -66,6 +67,7 @@ def state_message(
     black_name: str = "张三",
     white_name: str = "李四",
     rated: bool = False,
+    rule_mode: str | None = None,
 ) -> dict:
     """构造一个符合协议的服务器局面消息。
 
@@ -88,6 +90,7 @@ def state_message(
             "white_name": white_name,
             "black_user_id": "u-black",
             "white_user_id": "u-white",
+            "rule_mode": rule_mode,
         },
     )
 
@@ -230,7 +233,6 @@ class SpectatorPanelTests(unittest.TestCase):
                 your_color=None,
                 is_spectator=True,
                 current=current,
-                move_no=12,
             )
         )
         panel = OnlinePanel()
@@ -309,6 +311,94 @@ class SpectatorPanelTests(unittest.TestCase):
                 result_reason="resign",
             )
             self.assertIsNone(online_victory_notice(finished))
+        finally:
+            panel.close()
+
+
+class RuleModeDisplayTests(unittest.TestCase):
+    """对局页/观战页的规则标签：连珠显示，自由规则隐藏。"""
+
+    def _panel(
+        self,
+        *,
+        rule_mode: str | None,
+        spectator: bool = False,
+    ) -> tuple[OnlinePanel, OnlineGameSession, FakeTransport]:
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        authenticate(transport, session)
+        transport.receive(
+            state_message(
+                your_color=None if spectator else "black",
+                is_spectator=spectator,
+                rule_mode=rule_mode,
+            )
+        )
+        panel = OnlinePanel()
+        panel._session = session
+        panel._ws_connected = True
+        panel._show_game_page()
+        panel._sync_game_page()
+        return panel, session, transport
+
+    def test_renju_snapshot_shows_rule_label(self) -> None:
+        panel, session, _transport = self._panel(rule_mode="renju")
+        try:
+            self.assertIs(session.snapshot.rule_mode, RuleMode.RENJU)
+            self.assertFalse(panel.game_rule_label.isHidden())
+            self.assertIn("连珠", panel.game_rule_label.text())
+            self.assertIn("禁手", panel.game_rule_label.text())
+        finally:
+            panel.close()
+
+    def test_freestyle_snapshot_hides_rule_label(self) -> None:
+        panel, _session, _transport = self._panel(rule_mode=None)
+        try:
+            self.assertTrue(panel.game_rule_label.isHidden())
+            self.assertEqual(panel.game_rule_label.text(), "")
+        finally:
+            panel.close()
+
+    def test_spectator_renju_snapshot_shows_rule_label(self) -> None:
+        """旁观者没有执子颜色，但同样要看到本局规则。"""
+        panel, session, _transport = self._panel(
+            rule_mode="renju", spectator=True
+        )
+        try:
+            self.assertTrue(session.is_spectator)
+            self.assertFalse(panel.game_rule_label.isHidden())
+            self.assertIn("连珠", panel.game_rule_label.text())
+        finally:
+            panel.close()
+
+    def test_waiting_room_shows_created_rule_mode(self) -> None:
+        """等待好友加入时，用 room_created 下发的规则显示标签。"""
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        authenticate(transport, session)
+        transport.receive(
+            make_message(
+                SERVER_ROOM_CREATED,
+                {
+                    "room_code": "ABC123",
+                    "game_id": "game-waiting-renju",
+                    "your_color": "black",
+                    "black_name": "观察者",
+                    "white_name": "",
+                    "turn_seconds": 30,
+                    "rule_mode": "renju",
+                },
+            )
+        )
+        panel = OnlinePanel()
+        panel._session = session
+        panel._ws_connected = True
+        panel._show_game_page()
+        panel._sync_game_page()
+        try:
+            self.assertTrue(session.waiting_for_opponent)
+            self.assertFalse(panel.game_rule_label.isHidden())
+            self.assertIn("连珠", panel.game_rule_label.text())
         finally:
             panel.close()
 

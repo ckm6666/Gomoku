@@ -55,6 +55,8 @@ from gomoku.shared.rules import (
     Cell,
     Player,
     find_winning_line,
+    in_bounds,
+    would_win,
 )
 
 Move = tuple[int, int]
@@ -486,37 +488,13 @@ class _SearchContext:
         return cells if cells else self._all_empty_cells()
 
     def _would_win_at(self, row: int, col: int, player: Player) -> bool:
-        """判断在空点落子是否会立即形成五连（不修改棋盘）。"""
-        if self.board[row][col] is not None:
-            return False
+        """判断在空点落子是否会立即形成五连（不修改棋盘）。
 
-        for dr, dc in WIN_DIRECTIONS:
-            count = 1
-
-            r, c = row + dr, col + dc
-            while (
-                0 <= r < BOARD_SIZE
-                and 0 <= c < BOARD_SIZE
-                and self.board[r][c] is player
-            ):
-                count += 1
-                r += dr
-                c += dc
-
-            r, c = row - dr, col - dc
-            while (
-                0 <= r < BOARD_SIZE
-                and 0 <= c < BOARD_SIZE
-                and self.board[r][c] is player
-            ):
-                count += 1
-                r -= dr
-                c -= dc
-
-            if count >= WIN_LENGTH:
-                return True
-
-        return False
+        胜负判定统一使用 :func:`gomoku.shared.rules.would_win`，避免 AI
+        维护第二套“四方向连子计数”实现后与权威规则漂移；坐标合法性
+        （含越界、已占用）也由该函数统一处理。
+        """
+        return would_win(self.board, row, col, player)
 
     def _immediate_winning_cells(
         self, cells: Sequence[Move], player: Player
@@ -905,11 +883,7 @@ class _SearchContext:
         if move is None:
             return None
         row, col = move
-        if (
-            not 0 <= row < BOARD_SIZE
-            or not 0 <= col < BOARD_SIZE
-            or self.board[row][col] is not None
-        ):
+        if not in_bounds(row, col) or self.board[row][col] is not None:
             return None
         return move
 
@@ -1182,8 +1156,7 @@ class GomokuAI:
             if move is not None:
                 row, col = move
                 if (
-                    0 <= row < BOARD_SIZE
-                    and 0 <= col < BOARD_SIZE
+                    in_bounds(row, col)
                     and board_snapshot[row][col] is None
                 ):
                     ordered = sorted(

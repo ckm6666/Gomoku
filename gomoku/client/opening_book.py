@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from gomoku.client.frozen import is_frozen
-from gomoku.shared.rules import BOARD_SIZE, BoardLike
+from gomoku.shared.rules import BOARD_SIZE, BoardLike, in_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ def _parse_point(raw: Any) -> Optional[Move]:
     row, col = raw
     if not isinstance(row, int) or not isinstance(col, int):
         return None
-    if not (0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE):
+    if not in_bounds(row, col):
         return None
     return (row, col)
 
@@ -235,8 +235,15 @@ def get_default_opening_book() -> OpeningBook:
     return _DEFAULT_BOOK
 
 
+def reset_for_tests() -> None:
+    """丢弃进程内缓存的开局库；仅供测试隔离使用。"""
+    global _DEFAULT_BOOK
+    _DEFAULT_BOOK = None
+
+
 __all__ = [
     "OpeningBook",
     "get_default_opening_book",
     "load_opening_book",
+    "reset_for_tests",
 ]

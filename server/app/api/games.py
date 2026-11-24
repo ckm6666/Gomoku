@@ -133,6 +133,7 @@ async def recent_games(
                 move_no=game.move_no,
                 ended_at=game.ended_at,
                 rating_delta=deltas.get(game.id),
+                rule_mode=game.rule_mode or "freestyle",
             )
         )
 
@@ -152,8 +153,15 @@ async def live_games(
     room_manager = getattr(request.app.state, "room_manager", None)
     entries: list[LiveGameEntry] = []
     if room_manager is not None:
+        # 旧房间数据可能还没有 rule_mode 字段；统一回落到自由规则。
         entries = [
-            LiveGameEntry(**entry) for entry in room_manager.list_live_games()
+            LiveGameEntry(
+                **{
+                    **entry,
+                    "rule_mode": entry.get("rule_mode") or "freestyle",
+                }
+            )
+            for entry in room_manager.list_live_games()
         ]
     return LiveGamesResponse(entries=entries, total=len(entries))
 
@@ -227,6 +235,7 @@ async def game_detail(
             for move in move_rows
         ],
         time_control=_time_control_payload(game),
+        rule_mode=game.rule_mode or "freestyle",
     )
 
 
@@ -269,6 +278,7 @@ async def game_audit(
         moves=audit_moves_from_rows(move_rows),
         started_at=game.started_at,
         ended_at=game.ended_at,
+        rule_mode=game.rule_mode or "freestyle",
     )
     return GameAuditResponse(
         game_id=result.game_id,
