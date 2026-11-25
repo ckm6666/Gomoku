@@ -51,6 +51,40 @@ WHITE_FIRST_STONES: dict[tuple[int, int], str] = {
     (8, 8): "black",
 }
 
+# 新版渲染图：尺寸大、格距宽、网格线是浅灰细线。
+# 边缘扫描只认"深色木纹"网格线，对这类图会失效，需要走投影拟合。
+WIDE_IMAGE_SIZE = 1280
+WIDE_GRID_ORIGIN = 70
+WIDE_GRID_SPACING = 82
+WIDE_LINE_COLOR = QColor(100, 100, 100)
+WIDE_BOARD_COLOR = QColor(204, 148, 74)
+
+
+def build_wide_board_image(
+    stones: dict[tuple[int, int], str]
+) -> QImage:
+    """生成一张新版风格的棋盘图：浅灰细网格 + 大格距。"""
+    image = QImage(WIDE_IMAGE_SIZE, WIDE_IMAGE_SIZE, QImage.Format.Format_RGB32)
+    image.fill(WIDE_BOARD_COLOR)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+    painter.setPen(QPen(WIDE_LINE_COLOR, 1))
+    for index in range(tool.BOARD_SIZE):
+        offset = WIDE_GRID_ORIGIN + index * WIDE_GRID_SPACING
+        painter.drawLine(offset, 0, offset, WIDE_IMAGE_SIZE - 1)
+        painter.drawLine(0, offset, WIDE_IMAGE_SIZE - 1, offset)
+    painter.setPen(QPen(Qt.PenStyle.NoPen))
+    radius = WIDE_GRID_SPACING * 0.42
+    for (row, col), color in stones.items():
+        cx = WIDE_GRID_ORIGIN + col * WIDE_GRID_SPACING
+        cy = WIDE_GRID_ORIGIN + row * WIDE_GRID_SPACING
+        painter.setBrush(
+            BLACK_STONE_COLOR if color == "black" else WHITE_STONE_COLOR
+        )
+        painter.drawEllipse(QPointF(cx, cy), radius, radius)
+    painter.end()
+    return image
+
 
 def build_board_image(stones: dict[tuple[int, int], str]) -> QImage:
     """生成一张 15×15 的合成棋盘图，stones 中的坐标会被画成对应颜色的棋子。"""
@@ -237,6 +271,98 @@ class CandidateJsonTests(unittest.TestCase):
                 tool.main(["--input", str(input_dir), "--output", str(output_dir)])
             debug_files = list((output_dir / tool.DEBUG_DIRNAME).glob("*.png"))
         self.assertEqual(len(debug_files), 1)
+
+
+class ProjectionGridTests(unittest.TestCase):
+    """投影拟合：浅灰细线、大格距的新版渲染图也要能识别出 15 条线。"""
+
+    def test_projection_grid_finds_wide_spaced_lines(self) -> None:
+        image = build_wide_board_image({})
+        grid = tool.detect_projection_grid(image)
+        self.assertIsNotNone(grid)
+        xs, ys = grid
+        expected = [
+            float(WIDE_GRID_ORIGIN + index * WIDE_GRID_SPACING)
+            for index in range(tool.BOARD_SIZE)
+        ]
+        for found, want in zip(xs, expected):
+            self.assertAlmostEqual(found, want, delta=1.5)
+        for found, want in zip(ys, expected):
+            self.assertAlmostEqual(found, want, delta=1.5)
+
+    def test_margin_scan_cannot_read_grey_lines(self) -> None:
+        """浅灰网格线不是深色木纹，边缘扫描应当失败，从而只能走投影拟合。"""
+        image = build_wide_board_image({})
+        self.assertIsNone(tool.detect_margin_grid(image))
+
+    def test_count_check_reads_stones_on_wide_grid(self) -> None:
+        stones = {
+            (5, 5): "black",
+            (5, 6): "white",
+            (6, 7): "black",
+            (7, 8): "white",
+            (8, 9): "black",
+            (9, 10): "white",
+        }
+        image = build_wide_board_image(stones)
+        detected, _ = tool.detect_with_count_check(
+            image, tool.Player.BLACK, None, tool.resolve_profiles("auto")
+        )
+        for cell, color in stones.items():
+            self.assertEqual(detected.get(cell), color, f"{cell} 颜色识别错误")
+
+
+class PuzzleTitleTests(unittest.TestCase):
+    """标题表：图片与成语标题一一对应，标题互不重复。"""
+
+    def test_titles_are_unique_idioms(self) -> None:
+        titles = list(tool.PUZZLE_TITLES.values())
+        self.assertEqual(len(set(titles)), len(titles))
+        for title in titles:
+            self.assertEqual(len(title), 4, f"{title} 不是四字成语")
+
+    def test_every_puzzle_has_a_limit(self) -> None:
+        """每关的限手数要么显式给出，要么落到默认值，且都合法。"""
+        for title in tool.PUZZLE_TITLES.values():
+            limit = tool.PUZZLE_LIMITS.get(title, tool.MAX_PLAYER_MOVES)
+            self.assertTrue(1 <= limit <= 9, f"{title} 限手数非法")
+
+
+class BankMergeTests(unittest.TestCase):
+    """合并题库：同名就地更新、源图缺失的关卡原样保留。"""
+
+    def test_merge_updates_same_title_and_keeps_others(self) -> None:
+        base = [
+            {"id": "p001", "title": "白虹贯日", "moves": [[1, 1]]},
+            {"id": "p002", "title": "白璧无瑕", "moves": [[2, 2]]},
+        ]
+        generated = [
+            {"id": "p001", "title": "白虹贯日", "moves": [[3, 3]]},
+            {"id": "p003", "title": "势如破竹", "moves": [[4, 4]]},
+        ]
+        merged = tool.merge_bank(base, generated)
+        self.assertEqual(len(merged), 3)
+        self.assertEqual(merged[0]["id"], "p001")
+        self.assertEqual(merged[0]["moves"], [[3, 3]])
+        self.assertEqual(merged[1]["moves"], [[2, 2]], "源图缺失的关卡应原样保留")
+        self.assertEqual(merged[2]["id"], "p003", "新条目应接在现有 id 之后")
+        self.assertEqual(merged[2]["title"], "势如破竹")
+
+    def test_merge_with_empty_base_starts_from_generated(self) -> None:
+        generated = [{"id": "p001", "title": "势如破竹", "moves": [[4, 4]]}]
+        merged = tool.merge_bank([], generated)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["title"], "势如破竹")
+
+    def test_load_bank_entries_reads_puzzle_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bank.json"
+            path.write_text(
+                json.dumps({"version": 1, "puzzles": [{"id": "p001"}]}),
+                encoding="utf-8",
+            )
+            self.assertEqual(len(tool.load_bank_entries(path)), 1)
+            self.assertEqual(tool.load_bank_entries(Path(tmp) / "none.json"), [])
 
 
 class CommandLineTests(unittest.TestCase):
