@@ -986,13 +986,10 @@ class UIAndAITests(unittest.TestCase):
         self.assertIs(self.window._game_mode, GameMode.PUZZLE)
         self.assertIsNotNone(self.window._current_puzzle)
         self.assertFalse(self.window.undo_button.isEnabled())
-        self.assertFalse(self.window.hint_button.isHidden())
+        # 残局挑战不提供提示按钮：关卡提示已经写在关卡卡片上。
+        self.assertTrue(self.window.hint_button.isHidden())
+        self.assertFalse(self.window.hint_button.isEnabled())
         self.assertEqual(self.window.menu_back_button.text(), "残局列表")
-
-        self.window.hint_button.click()
-        self.app.processEvents()
-        self.assertFalse(self.window.puzzle_hint_label.isHidden())
-        self.assertIn("提示", self.window.puzzle_hint_label.text())
 
         self.window.menu_back_button.click()
         self.app.processEvents()
