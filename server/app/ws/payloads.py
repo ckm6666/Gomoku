@@ -17,6 +17,7 @@ from gomoku.shared.protocol import (
     SERVER_OPPONENT_STATUS,
     SERVER_REMATCH_STATUS,
     SERVER_ROOM_CREATED,
+    SERVER_SPECTATOR_CHAT,
     SERVER_UNDO_STATUS,
     make_message,
 )
@@ -395,8 +396,32 @@ def chat_message(
     )
 
 
+def spectator_chat_message(
+    conn: ClientConnection,
+    kind: str,
+    content: str,
+    sent_at_ms: int,
+) -> dict:
+    """同观频道的一条消息。
+
+    载荷与普通聊天完全一致，只有消息类型不同——客户端可以用同一套
+    校验与渲染代码处理，区别只在于"这条消息来自观战席"。
+    """
+    return make_message(
+        SERVER_SPECTATOR_CHAT,
+        {
+            "kind": kind,
+            "content": content,
+            "sender_id": conn.user_id,
+            "sender_name": conn.username,
+            "sent_at_ms": sent_at_ms,
+        },
+    )
+
+
 __all__ = [
     "chat_message",
+    "spectator_chat_message",
     "color_text",
     "connection_user_payload",
     "game_state_message",

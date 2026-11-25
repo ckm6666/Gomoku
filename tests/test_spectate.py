@@ -32,17 +32,20 @@ from gomoku.client.auth import AuthSession, AuthUser  # noqa: E402
 from gomoku.client.net.game_history_api import (  # noqa: E402
     GameHistoryHTTPClient,
 )
+from gomoku.client.online_pages.plaza_page import PlazaPage  # noqa: E402
 from gomoku.client.online_panel import (  # noqa: E402
     OnlinePanel,
     online_victory_notice,
 )
 from gomoku.client.sessions.online import OnlineGameSession  # noqa: E402
 from gomoku.shared.protocol import (  # noqa: E402
+    CLIENT_SPECTATOR_CHAT,
     CLIENT_WATCH_GAME,
     SERVER_AUTHENTICATED,
     SERVER_GAME_STATE,
     SERVER_LIVE_GAMES_CHANGED,
     SERVER_ROOM_CREATED,
+    SERVER_SPECTATOR_CHAT,
     make_message,
 )
 from gomoku.shared.rules import BOARD_SIZE, Player, RuleMode  # noqa: E402
@@ -220,11 +223,11 @@ class WatchGameSessionTests(unittest.TestCase):
 
 
 class SpectatorPanelTests(unittest.TestCase):
-    """观战页面必须只读：不能落子、不能操作、看不到聊天。"""
+    """观战页面必须只读：不能落子、不能操作、看不到对局内的聊天。"""
 
-    def _panel(self, current: str = "white") -> tuple[
-        OnlinePanel, OnlineGameSession, FakeTransport
-    ]:
+    def _panel(
+        self, current: str = "white", rated: bool = False
+    ) -> tuple[OnlinePanel, OnlineGameSession, FakeTransport]:
         transport = FakeTransport()
         session = OnlineGameSession(transport)
         authenticate(transport, session)
@@ -233,6 +236,7 @@ class SpectatorPanelTests(unittest.TestCase):
                 your_color=None,
                 is_spectator=True,
                 current=current,
+                rated=rated,
             )
         )
         panel = OnlinePanel()
@@ -264,12 +268,8 @@ class SpectatorPanelTests(unittest.TestCase):
             # 邀请好友对旁观者没有意义。
             self.assertTrue(panel.invite_friend_button.isHidden())
 
-            # 聊天输入栏与对话日志都要藏起来。
-            self.assertTrue(panel.chat_input.isHidden())
-            self.assertTrue(panel.chat_send_button.isHidden())
-            self.assertTrue(panel.emoji_button.isHidden())
-            self.assertTrue(panel.preset_comment_button.isHidden())
-            self.assertTrue(panel.chat_log.isHidden())
+            # 观战席的聊天控件由同观频道的专门用例覆盖：
+            # 自建房/休闲局开放同观，段位赛关闭。
 
             # 积分与成就不属于旁观者。
             self.assertTrue(panel.game_rating_label.isHidden())
@@ -311,6 +311,140 @@ class SpectatorPanelTests(unittest.TestCase):
                 result_reason="resign",
             )
             self.assertIsNone(online_victory_notice(finished))
+        finally:
+            panel.close()
+
+
+class SpectatorChatTests(unittest.TestCase):
+    """同观频道：观战者之间的悄悄话，棋手既收不到也看不到。
+
+    * 自建房/休闲局（rated=False）开放同观；
+    * 段位赛（rated=True）关闭——观战者能实时看到棋盘，场外传话会
+      绕过现有的举报与回放审计。
+    """
+
+    def _panel(
+        self, rated: bool = False
+    ) -> tuple[OnlinePanel, OnlineGameSession, FakeTransport]:
+        transport = FakeTransport()
+        session = OnlineGameSession(transport)
+        authenticate(transport, session)
+        transport.receive(
+            state_message(
+                your_color=None,
+                is_spectator=True,
+                rated=rated,
+            )
+        )
+        panel = OnlinePanel()
+        panel._session = session
+        panel._ws_connected = True
+        # 这个用例不经过真实连接流程，手动补上信号绑定。
+        session.spectator_chat_received.connect(
+            panel._on_spectator_chat_received
+        )
+        session.spectator_chat_failed.connect(
+            panel._on_spectator_chat_failed
+        )
+        panel._show_game_page()
+        panel._sync_game_page()
+        return panel, session, transport
+
+    def test_casual_room_opens_spectator_chat(self) -> None:
+        """自建房/休闲局里，观战席有留言区可用。"""
+        panel, session, transport = self._panel(rated=False)
+        try:
+            self.assertTrue(session.spectator_chat_available)
+            self.assertFalse(panel.chat_input.isHidden())
+            self.assertFalse(panel.chat_send_button.isHidden())
+            self.assertFalse(panel.emoji_button.isHidden())
+            # 留言区默认展开：默认收起的话消息就彻底看不见了。
+            self.assertFalse(panel.chat_log.isHidden())
+            self.assertEqual(
+                panel.chat_log_toggle_button.text(), "隐藏观友"
+            )
+        finally:
+            panel.close()
+
+    def test_rated_room_closes_spectator_chat(self) -> None:
+        """段位赛不开放同观：观战席保持安静。"""
+        panel, session, transport = self._panel(rated=True)
+        try:
+            self.assertFalse(session.spectator_chat_available)
+            self.assertTrue(panel.chat_input.isHidden())
+            self.assertTrue(panel.chat_send_button.isHidden())
+            self.assertTrue(panel.emoji_button.isHidden())
+            self.assertTrue(panel.chat_log.isHidden())
+        finally:
+            panel.close()
+
+    def test_spectator_comment_uses_spectator_channel(self) -> None:
+        """观战者的发言走同观频道，不是对局聊天。"""
+        panel, session, transport = self._panel(rated=False)
+        try:
+            panel.chat_input.setText("这步该走这里")
+            panel._on_send_comment()
+            sent = transport.sent_messages
+            self.assertEqual(len(sent), 1)
+            self.assertEqual(sent[0]["type"], CLIENT_SPECTATOR_CHAT)
+            self.assertEqual(sent[0]["payload"]["kind"], "text")
+            self.assertEqual(sent[0]["payload"]["content"], "这步该走这里")
+            # 发送成功后输入框清空。
+            self.assertEqual(panel.chat_input.text(), "")
+        finally:
+            panel.close()
+
+    def test_spectator_message_goes_to_log_only(self) -> None:
+        """同观消息只进留言区，不飞弹幕挡住正在看的棋盘。"""
+        panel, session, transport = self._panel(rated=False)
+        try:
+            transport.receive(
+                make_message(
+                    SERVER_SPECTATOR_CHAT,
+                    {
+                        "kind": "text",
+                        "content": "我也觉得该走那边",
+                        "sender_id": "u-other",
+                        "sender_name": "另一位观友",
+                        "sent_at_ms": 0,
+                    },
+                )
+            )
+            texts = panel.chat_log.entry_texts()
+            self.assertTrue(
+                any("我也觉得该走那边" in text for text in texts),
+                texts,
+            )
+            # 弹幕层不该收到同观消息。
+            self.assertEqual(panel.danmaku_overlay.active_count(), 0)
+        finally:
+            panel.close()
+
+    def test_rated_room_rejects_spectator_message(self) -> None:
+        """段位赛里观战者发言会被本地挡下，不发到服务器。"""
+        panel, session, transport = self._panel(rated=True)
+        try:
+            before = len(transport.sent_messages)
+            session.send_spectator_comment("传个话")
+            self.assertEqual(len(transport.sent_messages), before)
+        finally:
+            panel.close()
+
+    def test_spectator_chat_failure_hints_in_the_log(self) -> None:
+        """发言被拒时提示落在观友留言区，留言区收起则改用占位提示。"""
+        panel, session, transport = self._panel(rated=False)
+        try:
+            # 失败提示先记进留言区。
+            session.spectator_chat_failed.emit("发言太快，请稍候")
+            texts = panel.chat_log.entry_texts()
+            self.assertTrue(
+                any("发言太快" in text for text in texts), texts
+            )
+            # 留言区收起时改用输入框的占位提示，不会凭空消失。
+            panel.chat_log_toggle_button.setChecked(False)
+            panel.chat_log_toggle_button.toggled.emit(False)
+            session.spectator_chat_failed.emit("评论内容不能为空")
+            self.assertIn("评论内容不能为空", panel.chat_input.placeholderText())
         finally:
             panel.close()
 
@@ -645,6 +779,54 @@ class PlazaPageTests(unittest.TestCase):
             self.assertIs(panel.stack.currentWidget(), panel.plaza_page)
         finally:
             panel.close()
+
+
+class PlazaSpectatorCountTests(unittest.TestCase):
+    """广场列表要显示“观战 N 人”，让人知道不是自己一个人在看。"""
+
+    def _entry(self, **extra) -> dict:
+        return {
+            "game_id": "g-1",
+            "rated": True,
+            "black_username": "张三",
+            "white_username": "李四",
+            "black_user_id": "u1",
+            "white_user_id": "u2",
+            "move_no": 37,
+            "status": "playing",
+            **extra,
+        }
+
+    def test_spectator_count_is_appended(self) -> None:
+        """有人观战时在说明末尾追加观战人数。"""
+        text = PlazaPage._format_entry(
+            self._entry(spectator_count=3)
+        )
+        self.assertEqual(
+            text, "张三（黑）对 李四（白）· 排位 · 第 37 手 · 观战 3 人"
+        )
+
+    def test_no_spectators_keeps_line_clean(self) -> None:
+        """没有人观战时不显示后缀，列表保持干净。"""
+        text = PlazaPage._format_entry(self._entry(spectator_count=0))
+        self.assertEqual(
+            text, "张三（黑）对 李四（白）· 排位 · 第 37 手"
+        )
+        self.assertNotIn("观战", text)
+
+    def test_missing_or_invalid_count_is_ignored(self) -> None:
+        """旧服务器没有这个字段，或者字段值非法时都不显示。"""
+        base = "张三（黑）对 李四（白）· 排位 · 第 37 手"
+        for entry in (
+            self._entry(),
+            self._entry(spectator_count=None),
+            self._entry(spectator_count="3"),
+            self._entry(spectator_count=True),
+        ):
+            with self.subTest(entry=entry):
+                text = PlazaPage._format_entry(entry)
+                self.assertEqual(text, base)
+                self.assertNotIn("观战", text)
 
 
 if __name__ == "__main__":

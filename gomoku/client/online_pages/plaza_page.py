@@ -197,7 +197,17 @@ class PlazaPage(QWidget):
         move_no = entry.get("move_no", 0)
         if not isinstance(move_no, int) or isinstance(move_no, bool):
             move_no = 0
-        return f"{black}（黑）对 {white}（白）· {mode} · 第 {move_no} 手"
+        text = f"{black}（黑）对 {white}（白）· {mode} · 第 {move_no} 手"
+        # 观战人数缺失或非法时不显示后缀；只有确实有人在看才提示，
+        # 免得整列都是「观战 0 人」这种噪音。
+        spectators = entry.get("spectator_count")
+        if (
+            isinstance(spectators, int)
+            and not isinstance(spectators, bool)
+            and spectators >= 1
+        ):
+            text = f"{text} · 观战 {spectators} 人"
+        return text
 
 
 __all__ = ["MAX_LIVE_GAME_ROWS", "PlazaPage"]

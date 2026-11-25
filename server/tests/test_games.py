@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest.mock import patch
 
 from gomoku.shared.protocol import (
     CLIENT_AUTH,
@@ -245,6 +246,66 @@ class GameRuleModeTests(ServerTestBase):
         )
         self.assertEqual(detail.status_code, 200, detail.text)
         self.assertEqual(detail.json()["rule_mode"], "renju")
+
+
+class LiveGamesEndpointTests(ServerTestBase):
+    """/games/live 要能返回观战人数，旧房间数据缺字段时回落到 0。"""
+
+    def _register_access(self, username: str) -> str:
+        response = self.register(username)
+        self.assertEqual(response.status_code, 201, response.text)
+        return response.json()["access_token"]
+
+    def _live_entry(self, **extra) -> dict:
+        return {
+            "game_id": "live-game",
+            "rated": False,
+            "black_username": "live_black",
+            "white_username": "live_white",
+            "black_user_id": "u1",
+            "white_user_id": "u2",
+            "move_no": 12,
+            "status": "playing",
+            **extra,
+        }
+
+    def _fetch_live(self, token: str, entries: list[dict]):
+        manager = self.app.state.room_manager
+        with patch.object(
+            manager, "list_live_games", return_value=entries
+        ):
+            return self.client.get(
+                "/api/v1/games/live",
+                headers=self.auth_headers(token),
+            )
+
+    def test_live_games_returns_entries(self) -> None:
+        """列表接口照常返回对局摘要。"""
+        token = self._register_access("live_viewer")
+        response = self._fetch_live(token, [self._live_entry()])
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["total"], 1)
+        entry = payload["entries"][0]
+        self.assertEqual(entry["game_id"], "live-game")
+        self.assertEqual(entry["move_no"], 12)
+        # 旧房间数据没有观战人数时，字段回落到 0。
+        self.assertEqual(entry["spectator_count"], 0)
+
+    def test_live_games_exposes_spectator_count(self) -> None:
+        """有人观战时，列表条目要带上观战人数。"""
+        token = self._register_access("live_viewer_two")
+        response = self._fetch_live(
+            token, [self._live_entry(spectator_count=3)]
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        entry = response.json()["entries"][0]
+        self.assertEqual(entry["spectator_count"], 3)
+
+    def test_live_games_requires_auth(self) -> None:
+        """没登录不能拉取对局列表。"""
+        response = self.client.get("/api/v1/games/live")
+        self.assertEqual(response.status_code, 401)
 
 
 if __name__ == "__main__":

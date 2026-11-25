@@ -1087,6 +1087,15 @@ class OnlinePanel(InkBackdrop):
     def _set_chat_visibility(self, visible: bool) -> None:
         self._game_ctrl.set_chat_visibility(visible)
 
+    def _apply_spectator_chat_mode(self, available: bool) -> None:
+        self._game_ctrl.apply_spectator_chat_mode(available)
+
+    def _on_spectator_chat_received(self, message: ChatMessage) -> None:
+        self._game_ctrl.on_spectator_chat_received(message)
+
+    def _on_spectator_chat_failed(self, reason: str) -> None:
+        self._game_ctrl.on_spectator_chat_failed(reason)
+
     def _sync_spectator_page(self, snapshot: GameSnapshot) -> None:
         self._game_ctrl.sync_spectator_page(snapshot)
 

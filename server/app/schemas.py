@@ -247,6 +247,8 @@ class LiveGameEntry(BaseModel):
     move_no: int
     status: str
     rule_mode: str = "freestyle"
+    #: 当前观战人数；旧房间数据没有这个字段时回落到 0。
+    spectator_count: int = 0
 
 
 class LiveGamesResponse(BaseModel):

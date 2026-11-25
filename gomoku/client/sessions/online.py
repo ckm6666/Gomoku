@@ -48,6 +48,7 @@ from gomoku.shared.protocol import (
     CLIENT_REMATCH,
     CLIENT_RESPOND_ROOM_INVITE,
     CLIENT_RESIGN,
+    CLIENT_SPECTATOR_CHAT,
     CLIENT_UNDO_REQUEST,
     CLIENT_UNDO_RESPONSE,
     CLIENT_WATCH_GAME,
@@ -70,6 +71,7 @@ from gomoku.shared.protocol import (
     SERVER_ROOM_CREATED,
     SERVER_ROOM_INVITATION,
     SERVER_ROOM_INVITE_RESULT,
+    SERVER_SPECTATOR_CHAT,
     GameSnapshot,
     make_message,
     make_move_intent,
@@ -146,6 +148,9 @@ class OnlineGameSession(GameSession):
     matched = Signal(str, str)  # game_id, opponent_name
     chat_received = Signal(object)  # ChatMessage
     chat_failed = Signal(str)  # 发言被拒/发送失败的中文提示
+    # 同观频道：观战者之间的小频道，棋手收不到也看不到。
+    spectator_chat_received = Signal(object)  # ChatMessage
+    spectator_chat_failed = Signal(str)  # 观战席发言被拒/失败的中文提示
     room_invited = Signal(object)  # 收到自建房邀请 payload
     room_invite_result = Signal(object)  # 邀请发送/接受/拒绝结果
     friend_event = Signal(object)  # FriendEvent
@@ -205,6 +210,8 @@ class OnlineGameSession(GameSession):
         self._opponent_rating_after: Optional[int] = None
         self._rating_delta: Optional[int] = None
         self._last_chat_at: Optional[float] = None
+        # 同观频道的客户端冷却，与玩家聊天各算各的。
+        self._last_spectator_chat_at: Optional[float] = None
         # 已发出但尚未收到服务器回执的发言请求，用于把错误精确归位。
         # 发言成功时服务器只广播消息、不回执 request_id，所以这里必须
         # 有界，否则长时间对局会一直累积。
@@ -425,6 +432,29 @@ class OnlineGameSession(GameSession):
             # 还没进入对局（等待对手）时不可发言。
             return False
         return not self._disconnected
+
+    @property
+    def spectator_chat_available(self) -> bool:
+        """当前是否可以在观战席上发言。
+
+        段位赛不开这个口子：观战者能实时看到棋盘，场外传话会绕过
+        现有的举报与回放审计，段位就不可信了。自建房与休闲局则开放。
+
+        这里**不**包含发言冷却，理由与 :attr:`chat_available` 相同：
+        冷却只用来限流，拿它去禁用输入框会让用户反复点回输入框。
+        """
+        if self._closed or not self._authenticated:
+            return False
+        if not self._spectating:
+            return False
+        if self._snapshot is None:
+            return False
+        if self._disconnected:
+            return False
+        if self._snapshot.rated:
+            # 排位赛不开放观战席聊天。
+            return False
+        return True
 
     @property
     def can_send_chat(self) -> bool:
@@ -772,6 +802,49 @@ class OnlineGameSession(GameSession):
         """发送一条手动输入或预设的评论。"""
         return self.send_chat(CHAT_KIND_TEXT, text)
 
+    def send_spectator_chat(self, kind: str, content: str) -> bool:
+        """在观战席上发一条表情或评论。
+
+        与玩家聊天分成两条独立的通道：内容只会在同一房间的观战者
+        之间流动，棋手既收不到也看不到。
+        """
+        if self._closed or not self._authenticated:
+            return False
+        if not self.spectator_chat_available:
+            self.spectator_chat_failed.emit("当前不能发言")
+            return False
+        try:
+            payload = build_chat_payload(kind, content)
+        except ProtocolError as exc:
+            self.spectator_chat_failed.emit(str(exc))
+            return False
+        # 客户端冷却：与玩家聊天各算各的，互不占用对方的额度。
+        now = time.monotonic()
+        if (
+            self._last_spectator_chat_at is not None
+            and now - self._last_spectator_chat_at < CHAT_INTERVAL_SECONDS
+        ):
+            self.spectator_chat_failed.emit("发言太快，请稍候")
+            return False
+        self._last_spectator_chat_at = now
+        request_id = uuid.uuid4().hex
+        sent = self._send_chat_message(
+            make_message(
+                CLIENT_SPECTATOR_CHAT, payload, request_id=request_id
+            )
+        )
+        if not sent:
+            self.spectator_chat_failed.emit("网络发送失败，请检查连接")
+        return sent
+
+    def send_spectator_emoji(self, emoji: str) -> bool:
+        """在观战席上发送一个预设表情。"""
+        return self.send_spectator_chat(CHAT_KIND_EMOJI, emoji)
+
+    def send_spectator_comment(self, text: str) -> bool:
+        """在观战席上发送一条评论。"""
+        return self.send_spectator_chat(CHAT_KIND_TEXT, text)
+
     def _remember_chat_request(self, request_id: str) -> None:
         """记录一条已发出的发言请求，并淘汰过期的记录。
 
@@ -819,6 +892,7 @@ class OnlineGameSession(GameSession):
         self._your_color = None
         self._game_id = None
         self._spectating = False
+        self._last_spectator_chat_at = None
         self._active = False
         self._pending_move_id = None
         self._last_move_no = 0
@@ -893,6 +967,8 @@ class OnlineGameSession(GameSession):
             return
         elif message_type == SERVER_CHAT:
             self._handle_chat(message)
+        elif message_type == SERVER_SPECTATOR_CHAT:
+            self._handle_spectator_chat(message)
         elif message_type == SERVER_ROOM_INVITATION:
             self._handle_room_invitation(message)
         elif message_type == SERVER_ROOM_INVITE_RESULT:
@@ -1336,6 +1412,19 @@ class OnlineGameSession(GameSession):
             logger.warning("丢弃非法聊天消息：%s", exc)
             return
         self.chat_received.emit(chat)
+
+    def _handle_spectator_chat(self, message: Mapping[str, Any]) -> None:
+        """解析同观频道的消息并转发给界面。
+
+        载荷与普通聊天完全一致，只有消息类型不同，因此复用同一套
+        校验；差别只在于它来自观战席。
+        """
+        try:
+            chat = parse_chat_message(message.get("payload", {}))
+        except ProtocolError as exc:
+            logger.warning("丢弃非法观战席消息：%s", exc)
+            return
+        self.spectator_chat_received.emit(chat)
 
     def _handle_room_invitation(self, message: Mapping[str, Any]) -> None:
         payload = message.get("payload", {})

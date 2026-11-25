@@ -140,6 +140,11 @@ class Room:
     chat_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # 每个用户最近若干次发言的时间戳（time.monotonic），用于限流。
     chat_sent_times: dict[str, list[float]] = field(default_factory=dict)
+    # 同观频道（观战者之间的小频道）的发言时间戳，单独一个桶：
+    # 玩家聊天与观友聊天互不影响，各限各的流。
+    spectator_chat_sent_times: dict[str, list[float]] = field(
+        default_factory=dict
+    )
     rated: bool = False
     matchmade: bool = False
     rating_before: dict[str, int] = field(default_factory=dict)
