@@ -1,7 +1,8 @@
 """从残局图片提取 15×15 棋子坐标，生成题库候选与调试图。
 
 依赖仅 PySide6（QImage 负责解码 WebP）与仓库内的共享规则模块。
-输入目录、输出目录与识别阈值全部通过命令行参数指定，换机器也能直接运行：
+输入目录、输出目录、识别阈值与合并基线全部通过命令行参数指定，
+换机器也能直接运行：
 
     .\\.venv\\Scripts\\python.exe tools\\extract_puzzle_images.py --input <图片目录> --output <输出目录>
 
@@ -11,8 +12,12 @@
     puzzle_extract_report.txt       每张图的 ASCII 棋盘与识别统计
     puzzle_extract_debug/*.png      在原图上标出识别到的棋子，便于人工核对
 
+带 ``--merge <现有题库>`` 时，候选 JSON 会与现有题库按标题合并：同名标题
+就地更新、其余条目原样保留，源图已缺失的关卡不会被新一次提取抹掉。
+
 说明：
-* 棋盘固定 15×15，图片坐标按 5.56% 边距、14 格等分推算；
+* 棋盘固定 15×15，网格有两条来源：边缘扫描（深色木纹网格线）与暗像素投影
+  拟合（浅灰细线、格距大的新版渲染图）；两者都试，取黑白数量对得上的那组；
 * 只识别黑白棋子；褐色/红色标记会被忽略；
 * 图像阈值与网格比例都收拢在具名 dataclass 中，阈值可用 ``--threshold-profile`` 切换；
 * 生成 moves 时黑白交替任意排列——只要最终局面没有五连，任何中间顺序
@@ -116,6 +121,15 @@ MAX_SPACING_CV = 0.12
 # 扫描网格线时尝试的取样比例；这些比例落在相邻网格线之间，避免扫到线本身。
 GRID_SCAN_RATIOS = (0.035, 0.05, 0.07, 0.09)
 
+# 投影拟合：暗像素阈值 = 整图灰度中位数 × 该系数。棋盘底色明显高于阈值，
+# 网格线与棋子低于阈值，于是"每列（行）有多少暗像素"就会在网格线上形成尖峰。
+DARK_THRESHOLD_RATIO = 0.72
+
+# 等距拟合允许的格距区间（相对图片宽/高）以及步长精度（0.1 像素）。
+FIT_MIN_SPACING_RATIO = 1.0 / 22.0
+FIT_MAX_SPACING_RATIO = 1.0 / 11.0
+FIT_STEP_PRECISION = 10
+
 # 网格横纵跨度之比的合法区间（棋盘应当近似正方形）。
 MIN_GRID_SPAN_RATIO = 0.85
 MAX_GRID_SPAN_RATIO = 1.15
@@ -162,19 +176,33 @@ _THRESHOLD_PROFILES: dict[str, ThresholdProfile] = {
 # ``--threshold-profile auto`` 表示依次尝试全部配置，取识别棋子最多的一组。
 AUTO_PROFILE_NAME = "auto"
 
-IDIOM_NAMES = [
-    "白虹贯日",
-    "双管齐下",
-    "暗度陈仓",
-    "声东击西",
-    "黑云压城",
-    "白驹过隙",
-    "一鸣惊人",
-    "柳暗花明",
-    "峰回路转",
-    "白璧无瑕",
-    "黑马当先",
-]
+# 图片文件名 → 成语标题。标题与图片绑定，目录里增删图片不会让已有标题错位。
+PUZZLE_TITLES: dict[str, str] = {
+    "白先1": "白虹贯日",
+    "白先2": "双管齐下",
+    "白先3": "暗度陈仓",
+    "白先4": "声东击西",
+    "黑先5": "黑云压城",
+    "白先6": "白驹过隙",
+    "黑先7": "一鸣惊人",
+    "白先8": "柳暗花明",
+    "白先9": "峰回路转",
+    "黑先10": "势如破竹",
+    "黑先11": "围魏救赵",
+    "黑先12": "釜底抽薪",
+    "黑先13": "调虎离山",
+    "黑先14": "顺手牵羊",
+    "黑先15": "欲擒故纵",
+    "黑先16": "瞒天过海",
+    "黑先17": "笑里藏刀",
+    "黑先18": "以逸待劳",
+    "黑先19": "各个击破",
+    "黑先20": "步步为营",
+    "黑先21": "草船借箭",
+    "黑先22": "偷梁换柱",
+    "黑先23": "关门捉贼",
+    "黑先24": "破釜沉舟",
+}
 
 # 自动识别后按调试图人工核对出的少量补正（坐标已对照原图）。
 MANUAL_CORRECTIONS: dict[str, dict[str, list[tuple[int, int]]]] = {
@@ -190,7 +218,10 @@ GRID_OVERRIDES: dict[str, tuple[list[float], list[float]]] = {
     ),
 }
 
-# 用户实测后指定的每关限手数；未列出的关卡使用默认值。
+# 每关限手数：先手方须在限手数内连成五子。
+# 旧关卡由用户实测确定；新关卡按"大师 AI 执先手对阵困难 AI 防守"实测出的
+# 成五手数与强制胜线路长度取较宽的一档再加一手余量，并夹在 4～6 手之间。
+# 调整限手数只需改这里，重新提取即可。
 PUZZLE_LIMITS: dict[str, int] = {
     "白虹贯日": 4,
     "双管齐下": 6,
@@ -199,6 +230,21 @@ PUZZLE_LIMITS: dict[str, int] = {
     "柳暗花明": 5,
     "峰回路转": 6,
     "白璧无瑕": 5,
+    "势如破竹": 5,
+    "围魏救赵": 6,
+    "釜底抽薪": 5,
+    "调虎离山": 5,
+    "顺手牵羊": 5,
+    "欲擒故纵": 6,
+    "瞒天过海": 6,
+    "笑里藏刀": 5,
+    "以逸待劳": 5,
+    "各个击破": 5,
+    "步步为营": 5,
+    "草船借箭": 6,
+    "偷梁换柱": 5,
+    "关门捉贼": 6,
+    "破釜沉舟": 6,
 }
 
 
@@ -397,6 +443,125 @@ def board_geometry(
 
 
 # ---------------------------------------------------------------------------
+# 投影拟合网格
+# ---------------------------------------------------------------------------
+
+
+def grayscale_plane(image: QImage) -> tuple[bytes, int, int, int]:
+    """把图片转成 8 位灰度，返回 (灰度数据, 宽, 高, 每行字节数)。
+
+    直接取灰度字节比逐像素读 QColor 快一个数量级，1280×1280 的图只需几十毫秒。
+    """
+    gray = image.convertToFormat(QImage.Format.Format_Grayscale8)
+    width, height = gray.width(), gray.height()
+    stride = gray.bytesPerLine()
+    return bytes(gray.constBits()), width, height, stride
+
+
+def median_brightness(data: bytes) -> float:
+    """灰度数据的中位数亮度（用 256 级直方图求，避免整体排序）。"""
+    histogram = [0] * 256
+    for value in data:
+        histogram[value] += 1
+    accumulated = 0
+    half = len(data) // 2
+    for value, count in enumerate(histogram):
+        accumulated += count
+        if accumulated > half:
+            return float(value)
+    return 127.5
+
+
+def dark_table(threshold: float) -> bytes:
+    """构造查表：暗于阈值的像素记 1，其余记 0。"""
+    return bytes(1 if value < threshold else 0 for value in range(256))
+
+
+def dark_counts(
+    data: bytes,
+    width: int,
+    height: int,
+    stride: int,
+    table: bytes,
+    *,
+    horizontal: bool,
+) -> list[int]:
+    """统计每行（horizontal=True）或每列中的暗像素数量。"""
+    counts = [0] * (height if horizontal else width)
+    for y in range(height):
+        row = data[y * stride : y * stride + width].translate(table)
+        if horizontal:
+            counts[y] = sum(row)
+        else:
+            for x, value in enumerate(row):
+                if value:
+                    counts[x] += 1
+    return counts
+
+
+def fit_uniform_lines(counts: Sequence[int], dimension: int) -> list[float]:
+    """在暗像素投影上拟合 :data:`BOARD_SIZE` 条等距网格线。
+
+    网格线贯穿整块棋盘，对应的投影计数远高于棋子（棋子只占一格高），
+    因此"偏移 + 格距"的等距模型能稳定命中真实网格；搜索时取计数总和最大的一组。
+    """
+    low = max(
+        4, int(dimension * FIT_MIN_SPACING_RATIO * FIT_STEP_PRECISION)
+    )
+    high = max(
+        low + 1, int(dimension * FIT_MAX_SPACING_RATIO * FIT_STEP_PRECISION)
+    )
+    best_positions: list[float] = []
+    best_score = -1.0
+    for step_tenths in range(low, high + 1):
+        step = step_tenths / FIT_STEP_PRECISION
+        for offset in range(int(step)):
+            last = offset + (BOARD_SIZE - 1) * step
+            if last >= dimension:
+                break
+            score = 0.0
+            for index in range(BOARD_SIZE):
+                position = int(round(offset + index * step))
+                if 0 <= position < len(counts):
+                    score += counts[position]
+            if score > best_score:
+                best_score = score
+                best_positions = [
+                    offset + index * step for index in range(BOARD_SIZE)
+                ]
+    return best_positions
+
+
+def detect_projection_grid(image: QImage) -> tuple[list[float], list[float]] | None:
+    """用暗像素投影拟合网格，适用于网格线细、格距大的新版渲染图。
+
+    边缘扫描依赖深棕色木纹网格线，对浅灰细线的渲染图会失效；
+    投影拟合只看"哪一列（行）整条都是暗的"，与线的颜色无关。
+    """
+    data, width, height, stride = grayscale_plane(image)
+    if not data:
+        return None
+    threshold = median_brightness(data) * DARK_THRESHOLD_RATIO
+    table = dark_table(threshold)
+    columns = dark_counts(
+        data, width, height, stride, table, horizontal=False
+    )
+    rows = dark_counts(data, width, height, stride, table, horizontal=True)
+    xs = fit_uniform_lines(columns, width)
+    ys = fit_uniform_lines(rows, height)
+    if not xs or not ys:
+        return None
+    x_span = xs[-1] - xs[0]
+    y_span = ys[-1] - ys[0]
+    if not (
+        MIN_GRID_SPAN_RATIO <= x_span / max(1.0, y_span) <= MAX_GRID_SPAN_RATIO
+    ):
+        return None
+    return xs, ys
+
+
+
+# ---------------------------------------------------------------------------
 # 棋子识别
 # ---------------------------------------------------------------------------
 
@@ -461,27 +626,23 @@ def detect_stones(
     image: QImage,
     profile: ThresholdProfile,
     grid_override: tuple[list[float], list[float]] | None = None,
+    grid: tuple[list[float], list[float]] | None = None,
+    exclude_watermark: bool = True,
 ) -> tuple[dict[tuple[int, int], str], tuple[float, float, float, float, float, float]]:
-    """识别图片中的黑白棋子，返回棋子表与棋盘几何信息。"""
+    """识别图片中的黑白棋子，返回棋子表与棋盘几何信息。
+
+    网格来源按优先级取：``grid_override``（人工指定的 15 条线）> ``grid``
+    （调用方给的候选网格）> 边缘扫描 > 按固定边距推算。
+    ``exclude_watermark`` 控制是否跳过右下角水印区域。
+    """
     if grid_override is not None:
         xs, ys = grid_override
-        if len(xs) != BOARD_SIZE or len(ys) != BOARD_SIZE:
-            raise ValueError(
-                f"网格覆盖必须各提供 {BOARD_SIZE} 条线，"
-                f"实际为 {len(xs)} / {len(ys)}"
-            )
-        x_positions = list(xs)
-        y_positions = list(ys)
-        x0, x1 = xs[0], xs[-1]
-        y0, y1 = ys[0], ys[-1]
+    elif grid is not None:
+        xs, ys = grid
     else:
         margin_grid = detect_margin_grid(image)
         if margin_grid is not None:
             xs, ys = margin_grid
-            x_positions = list(xs)
-            y_positions = list(ys)
-            x0, x1 = xs[0], xs[-1]
-            y0, y1 = ys[0], ys[-1]
         else:
             x0, y0, spacing_x, spacing_y, x1, y1 = board_geometry(
                 image.width(), image.height()
@@ -492,7 +653,46 @@ def detect_stones(
             y_positions = [
                 y0 + row * spacing_y for row in range(BOARD_SIZE)
             ]
+            return _classify_board(
+                image,
+                profile,
+                x_positions,
+                y_positions,
+                (x0, x1),
+                (y0, y1),
+                exclude_watermark,
+            )
 
+    if len(xs) != BOARD_SIZE or len(ys) != BOARD_SIZE:
+        raise ValueError(
+            f"网格覆盖必须各提供 {BOARD_SIZE} 条线，"
+            f"实际为 {len(xs)} / {len(ys)}"
+        )
+    x_positions = list(xs)
+    y_positions = list(ys)
+    return _classify_board(
+        image,
+        profile,
+        x_positions,
+        y_positions,
+        (xs[0], xs[-1]),
+        (ys[0], ys[-1]),
+        exclude_watermark,
+    )
+
+
+def _classify_board(
+    image: QImage,
+    profile: ThresholdProfile,
+    x_positions: list[float],
+    y_positions: list[float],
+    x_bounds: tuple[float, float],
+    y_bounds: tuple[float, float],
+    exclude_watermark: bool = True,
+) -> tuple[dict[tuple[int, int], str], tuple[float, float, float, float, float, float]]:
+    """按给定网格线逐点判定黑白棋子。"""
+    x0, x1 = x_bounds
+    y0, y1 = y_bounds
     spacing_x = (x1 - x0) / (BOARD_SIZE - 1)
     spacing_y = (y1 - y0) / (BOARD_SIZE - 1)
     spacing = (spacing_x + spacing_y) / 2.0
@@ -500,8 +700,12 @@ def detect_stones(
     stones: dict[tuple[int, int], str] = {}
     for row in range(BOARD_SIZE):
         for col in range(BOARD_SIZE):
-            # 右下角水印会污染边线样本；残局棋子不会落在这一小块。
-            if row >= WATERMARK_MIN_ROW and col >= WATERMARK_MIN_COL:
+            # 右下角水印会污染边线样本；旧版题库图的水印在这一小块。
+            if (
+                exclude_watermark
+                and row >= WATERMARK_MIN_ROW
+                and col >= WATERMARK_MIN_COL
+            ):
                 continue
             cx = x_positions[col]
             cy = y_positions[row]
@@ -518,13 +722,69 @@ def detect_stones(
     return stones, (x0, y0, spacing_x, spacing_y, x1, y1)
 
 
+def grid_candidates(
+    image: QImage,
+    grid_override: tuple[list[float], list[float]] | None = None,
+) -> list[tuple[list[float], list[float]]]:
+    """列出所有可能的网格：人工指定的线、边缘扫描结果与投影拟合结果。"""
+    if grid_override is not None:
+        return [grid_override]
+    candidates: list[tuple[list[float], list[float]]] = []
+    margin_grid = detect_margin_grid(image)
+    if margin_grid is not None:
+        candidates.append(margin_grid)
+    projection_grid = detect_projection_grid(image)
+    if projection_grid is not None:
+        candidates.append(projection_grid)
+    return candidates
+
+
+def _best_detection(
+    image: QImage,
+    side: Player,
+    grids: Sequence[tuple[list[float], list[float]]],
+    profiles: Sequence[ThresholdProfile],
+    exclude_watermark: bool,
+) -> tuple[bool, dict[tuple[int, int], str], tuple[float, ...]] | None:
+    """在给定网格与阈值组合里挑出黑白数量最合法的一组。"""
+    best: tuple[
+        bool,
+        dict[tuple[int, int], str],
+        tuple[float, float, float, float, float, float],
+    ] | None = None
+    best_key: tuple[bool, int] | None = None
+    for grid in grids:
+        for profile in profiles:
+            stones, geometry = detect_stones(
+                image,
+                profile,
+                grid=grid,
+                exclude_watermark=exclude_watermark,
+            )
+            blacks = sum(1 for color in stones.values() if color == "black")
+            whites = sum(1 for color in stones.values() if color == "white")
+            expected_black = whites + (1 if side is Player.WHITE else 0)
+            key = (blacks == expected_black, len(stones))
+            if best_key is None or key > best_key:
+                best = (key[0], stones, geometry)
+                best_key = key
+    if best is None:
+        return None
+    return best
+
+
 def detect_with_count_check(
     image: QImage,
     side: Player,
     grid_override: tuple[list[float], list[float]] | None = None,
     profiles: Sequence[ThresholdProfile] | None = None,
 ) -> tuple[dict[tuple[int, int], str], tuple[float, float, float, float, float, float]]:
-    """尝试多组阈值，取识别棋子最多的一组；数量合法时优先。
+    """尝试多组网格与多组阈值，取黑白数量合法、且识别棋子最多的一组。
+
+    数量合法性优先于棋子数量：数量对得上说明网格与图片对上了，
+    比"多认出几颗子"更可靠。右下角水印区域先按"排除"处理；只有在排除后
+    数量仍对不上时，才把该区域算进来再试一次——新版渲染图没有水印，
+    那一格里可能放着真正的棋子。
 
     没有任何阈值配置可用时抛出 :class:`RuntimeError`——不能用 ``assert``，
     否则 ``python -O`` 会把这条校验直接优化掉。
@@ -532,32 +792,18 @@ def detect_with_count_check(
     candidates = list(profiles) if profiles is not None else list(
         _THRESHOLD_PROFILES.values()
     )
-    best: tuple[
-        dict[tuple[int, int], str],
-        tuple[float, float, float, float, float, float],
-    ] | None = None
-    best_total = -1
-    best_valid = False
-    for profile in candidates:
-        stones, geometry = detect_stones(
-            image,
-            profile,
-            grid_override=grid_override,
-        )
-        blacks = sum(1 for color in stones.values() if color == "black")
-        whites = sum(1 for color in stones.values() if color == "white")
-        expected_black = whites + (1 if side is Player.WHITE else 0)
-        valid = blacks == expected_black
-        total = len(stones)
-        if total > best_total or (
-            total == best_total and valid and not best_valid
-        ):
-            best = (stones, geometry)
-            best_total = total
-            best_valid = valid
+    grids = grid_candidates(image, grid_override)
+    best = _best_detection(image, side, grids, candidates, True)
     if best is None:
         raise RuntimeError("没有可用的黑白识别阈值配置，无法完成识别")
-    return best
+    if best[0]:
+        return best[1], best[2]
+
+    fallback = _best_detection(image, side, grids, candidates, False)
+    if fallback is not None and fallback[0]:
+        return fallback[1], fallback[2]
+    return best[1], best[2]
+
 
 
 # ---------------------------------------------------------------------------
@@ -712,7 +958,7 @@ def extract_puzzles(
             report.append("跳过：生成历史提前终局。")
             continue
 
-        title = IDIOM_NAMES[index] if index < len(IDIOM_NAMES) else f"残局{index + 1}"
+        title = PUZZLE_TITLES.get(stem) or f"残局{index + 1}"
         limit = PUZZLE_LIMITS.get(title, MAX_PLAYER_MOVES)
         puzzles.append(
             {
@@ -731,17 +977,87 @@ def extract_puzzles(
     return ExtractionResult(puzzles=puzzles, report=report, processed=processed)
 
 
+# ---------------------------------------------------------------------------
+# 题库合并
+# ---------------------------------------------------------------------------
+
+
+def load_bank_entries(path: Path) -> list[dict[str, Any]]:
+    """读取现有题库；文件缺失或结构不对时返回空列表。"""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw, dict):
+        return []
+    items = raw.get("puzzles")
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def next_puzzle_id(entries: Sequence[dict[str, Any]]) -> str:
+    """按现有 id 推断下一个可用 id（形如 ``p012``）。"""
+    highest = 0
+    for entry in entries:
+        raw = str(entry.get("id", ""))
+        if raw.startswith("p") and raw[1:].isdigit():
+            highest = max(highest, int(raw[1:]))
+    return f"p{highest + 1:03d}"
+
+
+def merge_bank(
+    base_entries: Sequence[dict[str, Any]],
+    generated_entries: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """按标题合并题库。
+
+    同名标题就地更新（保留原有 id），新标题追加到末尾并分配新 id，
+    基线里没能重新识别出来的关卡（例如源图已缺失）原样保留。
+    """
+    merged = [dict(entry) for entry in base_entries]
+    position_by_title: dict[str, int] = {}
+    for position, entry in enumerate(merged):
+        title = entry.get("title")
+        if isinstance(title, str) and title not in position_by_title:
+            position_by_title[title] = position
+
+    for generated in generated_entries:
+        title = generated.get("title")
+        entry = dict(generated)
+        if not isinstance(title, str) or title not in position_by_title:
+            entry["id"] = next_puzzle_id(merged)
+            merged.append(entry)
+            if isinstance(title, str):
+                position_by_title[title] = len(merged) - 1
+            continue
+        position = position_by_title[title]
+        entry["id"] = merged[position].get("id", entry.get("id"))
+        merged[position] = entry
+    return merged
+
+
 def write_outputs(
-    output_dir: Path, result: ExtractionResult
+    output_dir: Path,
+    result: ExtractionResult,
+    base_entries: Sequence[dict[str, Any]] | None = None,
 ) -> ExtractionOutputs:
-    """把候选题库与识别报告写入输出目录。"""
+    """把候选题库与识别报告写入输出目录。
+
+    给了 ``base_entries`` 就先按标题合并，这样源图已缺失的关卡不会丢失。
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     candidate_path = output_dir / CANDIDATE_FILENAME
     report_path = output_dir / REPORT_FILENAME
     debug_path = output_dir / DEBUG_DIRNAME
+    puzzles = (
+        merge_bank(base_entries, result.puzzles)
+        if base_entries is not None
+        else result.puzzles
+    )
     candidate_path.write_text(
         json.dumps(
-            {"version": 1, "puzzles": result.puzzles},
+            {"version": 1, "puzzles": puzzles},
             ensure_ascii=False,
             indent=2,
         )
@@ -784,6 +1100,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=AUTO_PROFILE_NAME,
         help="黑白识别阈值配置；auto 表示依次尝试全部配置并取识别棋子最多的一组",
     )
+    parser.add_argument(
+        "--merge",
+        type=Path,
+        default=None,
+        help="现有题库 JSON；给出后按标题合并，源图缺失的关卡会被保留",
+    )
     return parser
 
 
@@ -807,11 +1129,25 @@ def main(argv: list[str] | None = None) -> int:
         print(f"目录中没有图片：{input_dir}")
         return 1
 
+    base_entries: list[dict[str, Any]] | None = None
+    if args.merge is not None:
+        merge_path = args.merge.expanduser()
+        if not merge_path.is_file():
+            print(f"找不到题库文件：{merge_path}")
+            return 1
+        base_entries = load_bank_entries(merge_path)
+
     debug_dir = output_dir / DEBUG_DIRNAME
     result = extract_puzzles(paths, profiles, debug_dir)
-    outputs = write_outputs(output_dir, result)
+    outputs = write_outputs(output_dir, result, base_entries)
 
     print(f"识别到 {len(result.puzzles)} / {result.processed} 个可用残局")
+    if base_entries is not None:
+        merged = len(base_entries) + len(result.puzzles) - len(
+            {entry.get("title") for entry in result.puzzles}
+            & {entry.get("title") for entry in base_entries}
+        )
+        print(f"合并后题库共 {merged} 关")
     print(f"候选题库：{outputs.candidate}")
     print(f"识别报告：{outputs.report}")
     print(f"调试图目录：{outputs.debug}")
