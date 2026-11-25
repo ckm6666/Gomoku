@@ -281,5 +281,45 @@ class HelperScriptTests(unittest.TestCase):
         self.assertIn("PATH", env)
 
 
+class VerifyArchiveTests(unittest.TestCase):
+    """下载到的更新包必须与发布时的摘要一致才能安装。"""
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.root = Path(self._tmpdir.name)
+        self.archive = make_zip(
+            self.root / "update.zip", {"Gomoku.exe": b"MZfake"}
+        )
+        self.digest = auto_update.compute_sha256(self.archive)
+
+    def test_compute_sha256_matches_hashlib(self) -> None:
+        """摘要要与 hashlib 算出来的一致。"""
+        import hashlib
+
+        self.assertEqual(
+            self.digest, hashlib.sha256(self.archive.read_bytes()).hexdigest()
+        )
+
+    def test_matching_digest_passes(self) -> None:
+        """摘要一致时校验通过。"""
+        auto_update.verify_archive(self.archive, self.digest)
+
+    def test_mismatching_digest_is_rejected(self) -> None:
+        """摘要对不上必须报错，绝不能继续安装。"""
+        with self.assertRaises(auto_update.UpdateError):
+            auto_update.verify_archive(self.archive, "0" * 64)
+
+    def test_missing_archive_is_rejected(self) -> None:
+        """文件不存在时报错。"""
+        with self.assertRaises(auto_update.UpdateError):
+            auto_update.verify_archive(self.root / "missing.zip", self.digest)
+
+    def test_empty_expected_digest_skips_verification(self) -> None:
+        """发布没给摘要时跳过校验，但不让流程卡住。"""
+        auto_update.verify_archive(self.archive, "")
+        auto_update.verify_archive(self.archive, "   ")
+
+
 if __name__ == "__main__":
     unittest.main()

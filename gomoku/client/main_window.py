@@ -25,10 +25,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import Qt, QSettings, QTimer
 from PySide6.QtGui import (
     QCloseEvent,
-    QDesktopServices,
     QKeySequence,
     QShortcut,
 )
@@ -55,9 +54,10 @@ from gomoku.client.confirm_dialog import ConfirmDialog
 from gomoku.client.font_control import FontSizeButton
 from gomoku.client.constants import (
     APP_NAME,
+    APP_ORGANIZATION,
+    APP_STORAGE_NAME,
     APP_TITLE,
     APP_VERSION,
-    GITHUB_RELEASES_PAGE_URL,
     GITHUB_RELEASE_API_URL,
     WINDOW_DEFAULT_HEIGHT,
     WINDOW_DEFAULT_WIDTH,
@@ -99,12 +99,19 @@ from gomoku.shared.rules import Player
 from gomoku.shared.update_check import (
     ReleaseInfo,
     is_newer_version,
+    normalize_digest,
     parse_version,
     select_windows_asset,
     summarize_notes,
 )
 
 logger = logging.getLogger(__name__)
+
+#: 启动后自动检查更新的延迟（毫秒）：先让主菜单渲染出来，别拖慢启动。
+UPDATE_AUTO_CHECK_DELAY_MS: int = 2500
+
+#: 记录「用户已选择稍后再说」的版本号的设置键。
+SETTINGS_IGNORED_VERSION: str = "update/ignored_version"
 
 
 class GameMode(Enum):
@@ -273,10 +280,18 @@ class MainWindow(QMainWindow):
         *,
         puzzles: Optional[Sequence[Puzzle]] = None,
         record_store: Optional[LocalRecordStore] = None,
+        auto_update_check: bool = True,
+        settings: Optional[QSettings] = None,
     ) -> None:
         super().__init__()
         # 服务器地址等非敏感配置传给联机页；本地棋盘不联网。
         self.config = config or AppConfig()
+        # 更新相关的持久化设置（「稍后再说」的版本号）；测试可注入临时文件。
+        self._settings_obj = (
+            settings
+            if settings is not None
+            else QSettings(APP_ORGANIZATION, APP_STORAGE_NAME)
+        )
 
         # 残局题库/进度与本地棋谱；测试可注入临时目录/固定题库。
         self._puzzles = (
@@ -296,7 +311,7 @@ class MainWindow(QMainWindow):
         self._transient_notice: Optional[TransientNotice] = None
 
         # 更新检查：版本信息只从 GitHub Releases 检索；Windows 打包产物
-        # 支持直接下载并原地替换，其余环境退回「打开发布页手动下载」。
+        # 支持在客户端内直接下载、校验并原地替换，不再跳转到网页。
         self._update_client = UpdateHTTPClient(
             api_url=GITHUB_RELEASE_API_URL,
             token=self.config.github_token,
@@ -307,11 +322,11 @@ class MainWindow(QMainWindow):
         # 忙状态以客户端信号为准：请求被 abort 或内部提前返回时，客户端
         # 只会发 busy_changed(False)，按钮不会永远停在“检查中…”。
         self._update_client.busy_changed.connect(self._set_update_busy)
-        # 用户在更新弹窗里点了「前往下载页」；弹窗关闭后才真正打开浏览器，
+        # 用户在更新弹窗里点了「立即更新」；弹窗关闭后才真正开始下载，
         # 避免两个模态层叠在一起。
-        self._pending_download_url: Optional[str] = None
-        # 用户在更新弹窗里点了「下载并更新」；同样等弹窗关闭后再开始下载。
         self._pending_update_url: Optional[str] = None
+        # 本次更新包应当匹配的 SHA-256 摘要（来自发布元数据）。
+        self._update_expected_digest: str = ""
         # 下载与替换流程的状态：idle / downloading / downloaded / failed。
         self._update_state: str = "idle"
         self._update_error_message: str = ""
@@ -319,6 +334,17 @@ class MainWindow(QMainWindow):
         self._update_progress_dialog: Optional[UpdateProgressDialog] = None
         self._update_workspace: Optional[Path] = None
         self._update_staging: Optional[Path] = None
+        # 自动检查：只有发现新版本才弹窗，其余情况一律静默，避免每次
+        # 启动都打扰用户。
+        self._update_check_silent = False
+        # 用户点过「稍后再说」的版本号：同一版本不再自动弹窗。
+        self._ignored_update_version = self._load_ignored_update_version()
+        # 启动后自动检查一次更新；测试可关掉它。
+        self._update_auto_timer = QTimer(self)
+        self._update_auto_timer.setSingleShot(True)
+        self._update_auto_timer.timeout.connect(self._auto_check_update)
+        if auto_update_check:
+            self._update_auto_timer.start(UPDATE_AUTO_CHECK_DELAY_MS)
 
         # 对局配置：默认保持本地双人，切到人机模式后默认中等难度。
         self._game_mode = GameMode.LOCAL
@@ -1856,8 +1882,8 @@ class MainWindow(QMainWindow):
     def _check_for_update(self) -> None:
         """从 GitHub Releases 检索最新版本。
 
-        只读取版本信息；安装包始终由用户从发布页自行下载，客户端不经过
-        游戏服务端分发新版本。
+        手动点击「检查更新」时，任何结果都会给出提示；启动时的自动检查
+        只在发现新版本时弹窗，其余情况静默。
         """
         if self._closing or self._update_client.busy:
             return
@@ -1870,6 +1896,20 @@ class MainWindow(QMainWindow):
         if not started:
             # check() 自身会发出 failed 信号，这里只需要恢复按钮状态。
             self._set_update_busy(False)
+            # 请求根本没发出去，「静默」标志没有用武之地：清掉它，否则
+            # 下一次手动检查也会被当成自动检查而不给提示。
+            self._update_check_silent = False
+
+    def _auto_check_update(self) -> None:
+        """启动后自动检查一次更新。
+
+        只在确实发现新版本时弹窗；断网、已是最新版本等情况一律静默，
+        避免每次启动都打扰玩家。
+        """
+        if self._closing or self._update_client.busy:
+            return
+        self._update_check_silent = True
+        self._check_for_update()
 
     def _set_update_busy(self, busy: bool) -> None:
         """更新「检查更新」按钮的忙碌状态。"""
@@ -1877,7 +1917,7 @@ class MainWindow(QMainWindow):
         self.update_button.setText("检查中…" if busy else "检查更新")
 
     def _on_release_ready(self, release: ReleaseInfo) -> None:
-        """收到 GitHub 最新发布信息：比较版本号并给出提示。"""
+        """收到 GitHub 最新发布信息：比较版本号并决定是否弹窗。"""
         self._set_update_busy(False)
         if self._closing:
             return
@@ -1889,20 +1929,32 @@ class MainWindow(QMainWindow):
 
         version = release.version
         notes = release.notes
-        url = release.url
+        silent = self._update_check_silent
+        self._update_check_silent = False
 
         if parse_version(version) is None:
-            self._show_notice(
-                "检查更新",
+            message = (
                 f"无法识别远端版本号（{version or '空'}），"
-                f"当前版本 {APP_VERSION}。",
+                f"当前版本 {APP_VERSION}。"
             )
+            if silent:
+                logger.info("自动更新检查：%s", message)
+                return
+            self._show_notice("检查更新", message)
             return
 
         if not is_newer_version(version, APP_VERSION):
+            if silent:
+                logger.info("自动更新检查：当前已是最新版本 %s", APP_VERSION)
+                return
             self._show_notice(
                 "检查更新", f"当前已是最新版本 {APP_VERSION}。"
             )
+            return
+
+        if version == self._ignored_update_version:
+            # 用户对这个版本已经选过「稍后再说」：不再重复打扰。
+            logger.info("自动更新检查：版本 %s 已被用户忽略", version)
             return
 
         asset = select_windows_asset(release)
@@ -1912,22 +1964,30 @@ class MainWindow(QMainWindow):
             if asset is not None
             else ""
         )
-        # 只有 Windows 打包产物才能原地替换；其余环境退回发布页。
+        # 发布元数据里的摘要：下载完成后用它校验更新包是否完好。
+        self._update_expected_digest = (
+            normalize_digest(asset.digest) if asset is not None else ""
+        )
+        # 只有 Windows 打包产物才能原地替换；其余环境在窗口里说明原因，
+        # 不再把用户引到网页手动下载。
         can_update = bool(asset_url) and auto_update.is_supported()
+        unsupported_reason = (
+            ""
+            if can_update
+            else self._unsupported_reason(asset is not None, bool(asset_url))
+        )
 
         dialog = UpdateAvailableDialog(
             version=version,
             current_version=APP_VERSION,
             notes=summarize_notes(notes),
-            release_page_url=self._safe_release_url(url),
             asset_name=asset.name if asset is not None else "",
             asset_url=asset_url,
             can_update=can_update,
+            unsupported_reason=unsupported_reason,
             parent=self._overlay_host(),
         )
-        self._pending_download_url = None
         self._pending_update_url = None
-        dialog.download_requested.connect(self._note_download_requested)
         dialog.update_requested.connect(self._note_update_requested)
         self._active_modal = dialog
         # 与终局弹窗/确认框一样，打开模态层期间置位该标志：AI 继续走棋，
@@ -1942,16 +2002,28 @@ class MainWindow(QMainWindow):
             # 弹窗关掉了：补上被推迟的终局弹窗与更新提示。
             QTimer.singleShot(0, self._flush_pending_result_dialog)
 
-        # 弹窗已经关闭，此时再打开浏览器或开始下载，避免两个模态层同时存在。
-        pending = self._pending_download_url
-        self._pending_download_url = None
-        if pending:
-            self._open_release_page(pending)
-            return
+        # 弹窗已经关闭，此时再开始下载，避免两个模态层同时存在。
         update_url = self._pending_update_url
         self._pending_update_url = None
         if update_url:
             self._start_update_download(update_url, version)
+        elif not self._closing:
+            # 用户没有点「立即更新」：记下这个版本，同一版本不再自动弹窗。
+            self._remember_ignored_version(version)
+
+    def _unsupported_reason(self, has_asset: bool, has_url: bool) -> str:
+        """说明为什么当前环境无法在客户端内完成更新。"""
+        if not has_asset:
+            return "该版本没有提供 Windows 安装包，无法自动更新。"
+        if not has_url:
+            return "更新包地址未通过校验，无法自动更新。"
+        if not auto_update.is_supported():
+            return (
+                "当前环境不支持自动替换程序文件"
+                "（仅打包后的 Windows 客户端可自动更新），"
+                "请使用打包版客户端获取新版本。"
+            )
+        return "当前环境不支持自动更新。"
 
     def _on_update_failed(self, message: str) -> None:
         """更新检查失败：恢复按钮并提示原因。"""
@@ -1959,17 +2031,47 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         if self._active_modal is not None:
+            # 等模态层关掉再提示：这里不能消费「静默」标志，否则重试时
+            # 会把它当成手动检查，弹出用户并不需要的提示。
             QTimer.singleShot(100, lambda: self._on_update_failed(message))
             return
+        silent = self._update_check_silent
+        self._update_check_silent = False
+        if silent:
+            logger.info("自动更新检查失败：%s", message)
+            return
         self._show_notice("检查更新失败", message)
-
-    def _note_download_requested(self, url: str) -> None:
-        """记录用户的下载意图，等弹窗关闭后再打开浏览器。"""
-        self._pending_download_url = url
 
     def _note_update_requested(self, url: str) -> None:
         """记录用户的更新意图，等弹窗关闭后再开始下载。"""
         self._pending_update_url = url
+
+    # ------------------------------------------------------------------
+    # 「稍后再说」的版本记录
+    # ------------------------------------------------------------------
+    def _remember_ignored_version(self, version: str) -> None:
+        """记住用户选择「稍后再说」的版本号。"""
+        if not version or self._closing:
+            return
+        self._ignored_update_version = version
+        self._save_ignored_update_version(version)
+
+    def _load_ignored_update_version(self) -> str:
+        """读取用户选择过「稍后再说」的版本号。"""
+        try:
+            value = self._settings_obj.value(SETTINGS_IGNORED_VERSION, "")
+        except Exception:  # pragma: no cover - 设置不可用时不影响主流程
+            logger.exception("读取更新设置失败")
+            return ""
+        return str(value or "")
+
+    def _save_ignored_update_version(self, version: str) -> None:
+        """把用户选择「稍后再说」的版本号写进设置。"""
+        try:
+            self._settings_obj.setValue(SETTINGS_IGNORED_VERSION, version)
+            self._settings_obj.sync()
+        except Exception:  # pragma: no cover - 设置不可用时不影响主流程
+            logger.exception("保存更新设置失败")
 
     # ------------------------------------------------------------------
     # 下载与替换
@@ -1981,7 +2083,8 @@ class MainWindow(QMainWindow):
         if not auto_update.is_supported():
             self._show_notice(
                 "无法自动更新",
-                "当前环境不支持自动替换，请从发布页手动下载新版本。",
+                "当前环境不支持自动替换程序文件；"
+                "请使用打包后的 Windows 客户端获取新版本。",
             )
             return
 
@@ -2076,7 +2179,7 @@ class MainWindow(QMainWindow):
             dialog.set_progress(received, total)
 
     def _on_update_downloaded(self, path: str, source: object = None) -> None:
-        """更新包下载完成：解压校验，准备替换。"""
+        """更新包下载完成：校验完整性并解压，准备替换。"""
         if self._closing:
             return
         if source is not None and source is not self._update_download_client:
@@ -2084,9 +2187,14 @@ class MainWindow(QMainWindow):
             return
         dialog = self._update_progress_dialog
         if dialog is not None:
-            dialog.set_status("下载完成，正在准备安装…")
+            dialog.set_status("下载完成，正在校验并准备安装…")
         archive = Path(path)
         try:
+            # 先比对发布时的摘要：下载被截断或中途损坏时在这里就被拦下，
+            # 绝不会拿一个来路不明的压缩包去覆盖本地程序。
+            auto_update.verify_archive(
+                archive, self._update_expected_digest
+            )
             staging = auto_update.extract_archive(
                 archive, self._staging_directory()
             )
@@ -2196,34 +2304,6 @@ class MainWindow(QMainWindow):
         self._show_transient_notice("正在替换文件并重启客户端…")
         # 替换脚本会等待本进程退出后再动文件，因此必须先退出。
         QTimer.singleShot(1200, self.close)
-
-    @staticmethod
-    def _safe_release_url(url: str) -> str:
-        """只放行本仓库的 GitHub 发布页地址。
-
-        地址来自 GitHub API 的响应，理论上可被劫持改写；这里既校验主机，
-        也校验路径，避免被诱导到 ``github.com`` 下的任意钓鱼页面。
-        """
-        candidate = (url or "").strip()
-        if not candidate:
-            return GITHUB_RELEASES_PAGE_URL
-        parsed = QUrl(candidate)
-        if parsed.scheme().lower() != "https":
-            return GITHUB_RELEASES_PAGE_URL
-        if parsed.host().lower() != "github.com":
-            return GITHUB_RELEASES_PAGE_URL
-        if not parsed.path().startswith("/ckm6666/Gomoku/releases"):
-            return GITHUB_RELEASES_PAGE_URL
-        return candidate
-
-    def _open_release_page(self, url: str) -> None:
-        """用系统默认浏览器打开 GitHub 发布页。"""
-        target = self._safe_release_url(url)
-        if not QDesktopServices.openUrl(QUrl(target)):
-            logger.warning("无法打开发布页：%s", target)
-            self._show_notice(
-                "无法打开下载页", f"请手动访问：{target}"
-            )
 
     def active_modal(self) -> Optional[ModalOverlay]:
         """当前正在显示的窗口内模态层（测试用）。"""

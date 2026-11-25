@@ -27,6 +27,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
 import shutil
 import subprocess
@@ -39,6 +41,8 @@ from typing import Final, Optional
 from urllib.parse import urlsplit
 
 from gomoku.client.frozen import is_frozen
+
+logger = logging.getLogger(__name__)
 
 #: 发布产物里的主程序文件名。
 APP_EXE_NAME: Final[str] = "Gomoku.exe"
@@ -140,6 +144,53 @@ def asset_download_url(url: str) -> str:
     if not parsed.path.endswith(".zip"):
         return ""
     return candidate
+
+
+# ---------------------------------------------------------------------------
+# 完整性校验
+# ---------------------------------------------------------------------------
+#: 计算摘要时的分块大小（1 MiB）。
+_CHUNK_SIZE: Final[int] = 1024 * 1024
+
+
+def compute_sha256(path: Path) -> str:
+    """计算文件的 SHA-256 摘要（小写十六进制）。按 1 MiB 分块读取。"""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(_CHUNK_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_archive(archive: Path, expected_sha256: str) -> None:
+    """校验下载到的更新包是否与发布时一致。
+
+    期望摘要来自 GitHub Releases API 的 ``digest`` 字段（形如
+    ``sha256:<64 位十六进制>``）。摘要对不上时抛 :class:`UpdateError`：
+    下载被截断、CDN 给了损坏文件、或产物在中途被换掉，都会在这里被拦下，
+    绝不会拿一个来路不明的压缩包去覆盖本地程序。
+
+    期望摘要为空时不做校验（调用方负责决定是否允许），此时只记录一条
+    警告，方便事后排查。
+    """
+    expected = (expected_sha256 or "").strip().lower()
+    if not expected:
+        logger.warning("发布未提供更新包摘要，跳过完整性校验")
+        return
+    if not archive.is_file():
+        raise UpdateError("更新包不存在，请重新下载")
+    try:
+        actual = compute_sha256(archive)
+    except OSError:
+        raise UpdateError("无法校验更新包，请重新下载") from None
+    if actual != expected:
+        logger.error(
+            "更新包校验失败：期望 %s，实际 %s", expected, actual
+        )
+        raise UpdateError("更新包校验失败，已放弃安装，请重新下载")
 
 
 # ---------------------------------------------------------------------------
@@ -452,11 +503,13 @@ __all__ = [
     "UpdatePlan",
     "asset_download_url",
     "cleanup_workspace",
+    "compute_sha256",
     "create_workspace",
     "extract_archive",
     "install_directory",
     "is_supported",
     "launch_helper",
     "prepare_update",
+    "verify_archive",
     "write_helper_script",
 ]

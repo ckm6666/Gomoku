@@ -25,14 +25,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal  # noqa: E402
+from PySide6.QtCore import QObject, QSettings, Qt, QTimer, Signal  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from gomoku.client.confirm_dialog import ConfirmDialog  # noqa: E402
-from gomoku.client.constants import (  # noqa: E402
-    APP_VERSION,
-    GITHUB_RELEASES_PAGE_URL,
-)
+from gomoku.client.constants import APP_VERSION  # noqa: E402
 from gomoku.client.main_window import MainWindow  # noqa: E402
 from gomoku.client.modal_overlay import ModalOverlay, NoticeOverlay  # noqa: E402
 from gomoku.client.records import LocalRecordStore  # noqa: E402
@@ -67,6 +64,7 @@ def make_release(
     url: str = "https://github.com/ckm6666/Gomoku/releases/tag/v9.9.9",
     notes: str = "新增功能若干",
     asset_name: str = "Gomoku-9.9.9-windows-x64.zip",
+    digest: str = "",
 ) -> ReleaseInfo:
     """构造一条发布信息，模拟 GitHub ``/releases/latest`` 的解析结果。"""
     assets: tuple[ReleaseAsset, ...] = ()
@@ -79,6 +77,7 @@ def make_release(
                     f"v{version}/{asset_name}"
                 ),
                 size=28 * 1024 * 1024,
+                digest=digest,
             ),
         )
     return ReleaseInfo(
@@ -166,10 +165,16 @@ class UpdateUiTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory()
+        tmp = Path(self._tmpdir.name)
+        # 设置写到临时文件：测试不污染真实的用户设置。
+        settings = QSettings(
+            str(tmp / "settings.ini"), QSettings.Format.IniFormat
+        )
         self.window = MainWindow(
-            record_store=LocalRecordStore(
-                Path(self._tmpdir.name) / "records"
-            ),
+            record_store=LocalRecordStore(tmp / "records"),
+            # 测试不联网：启动时的自动检查由用例显式触发。
+            auto_update_check=False,
+            settings=settings,
         )
         self.window.setAttribute(
             Qt.WidgetAttribute.WA_DontShowOnScreen, True
@@ -267,61 +272,66 @@ class UpdateUiTests(unittest.TestCase):
         )
         self.assertIn("新增沙盘复盘", modal.notes_label.text())
 
-    def test_download_button_opens_github_release_page(self) -> None:
-        """不支持原地替换时，点按钮会用浏览器打开 GitHub 发布页。"""
+    def test_update_never_opens_browser(self) -> None:
+        """更新全程不打开浏览器：弹窗里没有「前往下载页」这类入口。"""
+        import gomoku.client.main_window as main_window
+
+        # 客户端里根本没有浏览器入口了。
+        self.assertFalse(hasattr(main_window, "QDesktopServices"))
+
         opened: list[str] = []
 
         def fake_open(url) -> bool:
             opened.append(url.toString())
             return True
 
-        def click_download() -> None:
+        captured: dict = {}
+
+        def inspect() -> None:
             modal = self.window.active_modal()
             if isinstance(modal, UpdateAvailableDialog):
-                modal.download_button.click()
+                captured["dialog"] = modal
+                modal.later_button.click()
 
         with mock.patch(
-            "gomoku.client.main_window.QDesktopServices.openUrl",
+            "PySide6.QtGui.QDesktopServices.openUrl",
             side_effect=fake_open,
         ):
-            QTimer.singleShot(20, click_download)
+            QTimer.singleShot(20, inspect)
             self.window._on_release_ready(  # noqa: SLF001
                 make_release("9.9.9")
             )
             self.app.processEvents()
 
-        self.assertEqual(
-            opened,
-            ["https://github.com/ckm6666/Gomoku/releases/tag/v9.9.9"],
-        )
+        dialog = captured.get("dialog")
+        self.assertIsInstance(dialog, UpdateAvailableDialog)
+        self.assertFalse(hasattr(dialog, "download_requested"))
+        self.assertEqual(opened, [])
 
-    def test_foreign_release_url_falls_back_to_releases_page(self) -> None:
-        """非 GitHub 域名的发布地址会被替换成官方发布页。"""
-        opened: list[str] = []
+    def test_unsupported_environment_explains_in_dialog(self) -> None:
+        """环境不支持原地替换时，弹窗里说明原因，不给出去网页的入口。"""
+        captured: dict = {}
 
-        def fake_open(url) -> bool:
-            opened.append(url.toString())
-            return True
-
-        def click_download() -> None:
+        def inspect() -> None:
             modal = self.window.active_modal()
             if isinstance(modal, UpdateAvailableDialog):
-                modal.download_button.click()
+                captured["dialog"] = modal
+                modal.later_button.click()
 
         with mock.patch(
-            "gomoku.client.main_window.QDesktopServices.openUrl",
-            side_effect=fake_open,
+            "gomoku.client.main_window.auto_update.is_supported",
+            return_value=False,
         ):
-            QTimer.singleShot(20, click_download)
+            QTimer.singleShot(20, inspect)
             self.window._on_release_ready(  # noqa: SLF001
-                make_release(
-                    "9.9.9",
-                    url="https://example.invalid/malicious",
-                )
+                make_release("9.9.9")
             )
             self.app.processEvents()
 
-        self.assertEqual(opened, [GITHUB_RELEASES_PAGE_URL])
+        dialog = captured.get("dialog")
+        self.assertIsInstance(dialog, UpdateAvailableDialog)
+        self.assertIn("不支持", dialog.reason_label.text())
+        self.assertEqual(dialog.later_button.text(), "知道了")
 
     def test_failure_shows_reason(self) -> None:
         """检查失败时提示原因并恢复按钮。"""
@@ -393,33 +403,12 @@ class UpdateUiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertIsNone(self.window.active_modal())
 
-    def test_release_url_allow_list(self) -> None:
-        """只有本仓库的发布页地址会被放行。"""
-        allowed = "https://github.com/ckm6666/Gomoku/releases/tag/v1.13.0"
-        self.assertEqual(
-            self.window._safe_release_url(allowed),  # noqa: SLF001
-            allowed,
-        )
-        for hostile in (
-            "https://github.com.evil.com/ckm6666/Gomoku/releases",
-            "https://github.com@evil.com/ckm6666/Gomoku/releases",
-            "https://attacker.github.com/x",
-            "http://github.com/ckm6666/Gomoku/releases",
-            "javascript:alert(1)",
-            "https://github.com/attacker/phish",
-            "https://github.com/ckm6666/Other/releases",
-            "",
-        ):
-            self.assertEqual(
-                self.window._safe_release_url(hostile),  # noqa: SLF001
-                GITHUB_RELEASES_PAGE_URL,
-                msg=f"不应放行：{hostile!r}",
-            )
-
     # ------------------------------------------------------------------
     # 下载并替换
     # ------------------------------------------------------------------
-    def _run_update_flow(self, client: FakeDownloadClient) -> list[str]:
+    def _run_update_flow(
+        self, client: FakeDownloadClient, *, digest: str = ""
+    ) -> list[str]:
         """走一遍「检查更新 → 下载 → 重启」流程，返回途中出现的提示。
 
         弹窗都是窗口内的模态层，这里用一个定时器代替用户逐个点按钮。
@@ -433,7 +422,7 @@ class UpdateUiTests(unittest.TestCase):
         def inspector() -> None:
             modal = self.window.active_modal()
             if isinstance(modal, UpdateAvailableDialog):
-                modal.download_button.click()
+                modal.update_button.click()
             elif isinstance(modal, ConfirmDialog):
                 seen.append("confirm")
                 modal.confirm_button.click()
@@ -453,7 +442,7 @@ class UpdateUiTests(unittest.TestCase):
                 return_value=True,
             ):
                 self.window._on_release_ready(  # noqa: SLF001
-                    make_release("9.9.9")
+                    make_release("9.9.9", digest=digest)
                 )
                 self.app.processEvents()
         finally:
@@ -461,7 +450,7 @@ class UpdateUiTests(unittest.TestCase):
         return seen
 
     def test_update_button_offers_inplace_download(self) -> None:
-        """支持原地替换时，按钮变成「下载并更新」而不是「前往下载页」。"""
+        """支持原地替换时，按钮是「立即更新」，没有去网页下载的入口。"""
         opened: list[str] = []
 
         def fake_open(url) -> bool:
@@ -472,7 +461,7 @@ class UpdateUiTests(unittest.TestCase):
             "gomoku.client.main_window.auto_update.is_supported",
             return_value=True,
         ), mock.patch(
-            "gomoku.client.main_window.QDesktopServices.openUrl",
+            "PySide6.QtGui.QDesktopServices.openUrl",
             side_effect=fake_open,
         ):
             captured: dict = {}
@@ -491,11 +480,11 @@ class UpdateUiTests(unittest.TestCase):
 
         dialog = captured.get("dialog")
         self.assertIsInstance(dialog, UpdateAvailableDialog)
-        self.assertEqual(dialog.download_button.text(), "下载并更新")
+        self.assertEqual(dialog.update_button.text(), "立即更新")
         self.assertEqual(opened, [])
 
     def test_update_flow_downloads_package_and_asks_for_restart(self) -> None:
-        """点「下载并更新」会真的下载安装包，并询问是否重启。"""
+        """点「立即更新」会真的下载安装包，并询问是否重启。"""
         client = FakeDownloadClient()
         seen = self._run_update_flow(client)
 
@@ -548,6 +537,150 @@ class UpdateUiTests(unittest.TestCase):
 
         self.assertEqual(self.window._update_state, "idle")  # noqa: SLF001
         self.assertEqual(self.window._update_error_message, "")  # noqa: SLF001
+
+    def test_update_flow_rejects_broken_checksum(self) -> None:
+        """摘要对不上时必须放弃安装，绝不替换本地程序。"""
+        client = FakeDownloadClient()
+        # 故意给一个对不上的摘要。
+        seen = self._run_update_flow(
+            client, digest="sha256:" + "0" * 64
+        )
+
+        self.assertIn("notice", seen)
+        self.assertNotIn("confirm", seen)
+        self.assertIsNone(self.window._update_staging)  # noqa: SLF001
+
+    # ------------------------------------------------------------------
+    # 启动时的自动检查
+    # ------------------------------------------------------------------
+    def test_auto_check_runs_once_on_startup(self) -> None:
+        """启动后的自动检查会真的发起一次请求。"""
+        self.window._auto_check_update()  # noqa: SLF001
+        self.app.processEvents()
+        self.assertEqual(self.client.checks, 1)
+
+    def test_auto_check_popups_dialog_for_new_version(self) -> None:
+        """自动检查发现新版本时，不经用户点击直接弹窗。"""
+        self.window._auto_check_update()  # noqa: SLF001
+        captured: dict = {}
+
+        def inspect() -> None:
+            modal = self.window.active_modal()
+            if isinstance(modal, UpdateAvailableDialog):
+                captured["dialog"] = modal
+                modal.later_button.click()
+
+        QTimer.singleShot(20, inspect)
+        self.window._on_release_ready(  # noqa: SLF001
+            make_release("9.9.9")
+        )
+        self.app.processEvents()
+
+        self.assertIsInstance(captured.get("dialog"), UpdateAvailableDialog)
+
+    def test_auto_check_is_silent_when_already_latest(self) -> None:
+        """自动检查发现已是最新版本时不打扰用户。"""
+        self.window._auto_check_update()  # noqa: SLF001
+        self.window._on_release_ready(  # noqa: SLF001
+            make_release(APP_VERSION)
+        )
+        self.app.processEvents()
+        self.assertIsNone(self.window.active_modal())
+
+    def test_auto_check_is_silent_on_failure(self) -> None:
+        """自动检查失败（例如断网）时不弹窗。"""
+        self.window._auto_check_update()  # noqa: SLF001
+        self.window._on_update_failed(  # noqa: SLF001
+            "无法连接 GitHub，请检查网络"
+        )
+        self.app.processEvents()
+        self.assertIsNone(self.window.active_modal())
+
+    def test_auto_check_failure_stays_silent_after_modal_defers(self) -> None:
+        """自动检查失败时若先撞上别的模态层，稍后重试也不能弹出提示。"""
+        blocker = ModalOverlay(self.window._overlay_host())
+        self.window._active_modal = blocker
+
+        self.window._auto_check_update()  # noqa: SLF001
+        self.window._on_update_failed(  # noqa: SLF001
+            "无法连接 GitHub，请检查网络"
+        )
+        self.app.processEvents()
+        # 失败被推迟了：模态层还在，标志还没被消费。
+        self.assertIs(self.window.active_modal(), blocker)
+
+        self.window._active_modal = None
+        self.assertTrue(
+            wait_until(
+                lambda: self.window.active_modal() is None, 3.0, self.app
+            )
+        )
+        self.assertIsNone(self.window.active_modal())
+
+    def test_manual_check_reports_failure_after_silent_auto_check(self) -> None:
+        """自动检查失败后，手动检查仍要给出提示。"""
+        self.window._auto_check_update()  # noqa: SLF001
+        # 自动检查的失败是静默的。
+        self.window._on_update_failed(  # noqa: SLF001
+            "无法连接 GitHub，请检查网络"
+        )
+        self.app.processEvents()
+        self.assertIsNone(self.window.active_modal())
+
+        # 之后的失败（手动检查）必须给出提示。
+        self.client.busy = False
+        self.client.refuse = True
+        captured = self._run_modal(
+            lambda: self.window.update_button.click()
+        )
+        modal = captured.get("modal")
+        self.assertIsNotNone(modal)
+        self.assertIn("更新地址无效", modal.message_label.text())
+
+    def test_ignored_version_is_not_shown_again(self) -> None:
+        """用户点过「稍后再说」后，同一版本不再自动弹窗。"""
+        captured: dict = {}
+
+        def inspect() -> None:
+            modal = self.window.active_modal()
+            if isinstance(modal, UpdateAvailableDialog):
+                captured["dialog"] = modal
+                modal.later_button.click()
+
+        QTimer.singleShot(20, inspect)
+        self.window._on_release_ready(  # noqa: SLF001
+            make_release("9.9.9")
+        )
+        self.app.processEvents()
+        self.assertIsInstance(captured.get("dialog"), UpdateAvailableDialog)
+        self.assertEqual(
+            self.window._ignored_update_version, "9.9.9"  # noqa: SLF001
+        )
+
+        # 再次检查同一版本：不再弹窗。
+        self.window._on_release_ready(  # noqa: SLF001
+            make_release("9.9.9")
+        )
+        self.app.processEvents()
+        self.assertIsNone(self.window.active_modal())
+
+    def test_new_version_after_ignored_one_is_shown(self) -> None:
+        """忽略的是具体版本号：出了新版本仍然会弹窗。"""
+        self.window._ignored_update_version = "9.9.8"  # noqa: SLF001
+        captured: dict = {}
+
+        def inspect() -> None:
+            modal = self.window.active_modal()
+            if isinstance(modal, UpdateAvailableDialog):
+                captured["dialog"] = modal
+                modal.later_button.click()
+
+        QTimer.singleShot(20, inspect)
+        self.window._on_release_ready(  # noqa: SLF001
+            make_release("9.9.9")
+        )
+        self.app.processEvents()
+        self.assertIsInstance(captured.get("dialog"), UpdateAvailableDialog)
 
 
 if __name__ == "__main__":  # pragma: no cover - 手动运行入口

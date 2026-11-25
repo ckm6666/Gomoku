@@ -16,6 +16,7 @@ from gomoku.shared.update_check import (  # noqa: E402
     ReleaseInfo,
     compare_versions,
     is_newer_version,
+    normalize_digest,
     parse_release_payload,
     parse_version,
     select_windows_asset,
@@ -35,6 +36,7 @@ FULL_PAYLOAD = {
             "name": "Gomoku-1.13.0-windows-x64.zip",
             "browser_download_url": "https://example.com/Gomoku-1.13.0-windows-x64.zip",
             "size": 25165824,
+            "digest": "sha256:" + "ab" * 32,
         },
         {
             "name": "Gomoku-1.13.0-linux-x64.zip",
@@ -134,6 +136,29 @@ class ParseReleasePayloadTests(unittest.TestCase):
         self.assertEqual(len(release.assets), 2)
         self.assertEqual(release.assets[0].name, "Gomoku-1.13.0-windows-x64.zip")
         self.assertEqual(release.assets[0].size, 25165824)
+
+    def test_asset_digest_is_parsed(self) -> None:
+        """发布里的摘要要被带出来，客户端靠它校验下载到的安装包。"""
+        release = parse_release_payload(FULL_PAYLOAD)
+        self.assertEqual(
+            release.assets[0].digest, "sha256:" + "ab" * 32
+        )
+        # 没有摘要字段的产物留空串，不影响其它字段。
+        self.assertEqual(release.assets[1].digest, "")
+
+    def test_non_string_digest_is_ignored(self) -> None:
+        """摘要不是字符串时按「没有摘要」处理。"""
+        payload = dict(FULL_PAYLOAD)
+        payload["assets"] = [
+            {
+                "name": "a.zip",
+                "browser_download_url": "https://example.com/a.zip",
+                "size": 1,
+                "digest": 12345,
+            }
+        ]
+        release = parse_release_payload(payload)
+        self.assertEqual(release.assets[0].digest, "")
 
     def test_missing_tag_name_raises(self) -> None:
         payload = dict(FULL_PAYLOAD)
@@ -359,6 +384,33 @@ class ReleasePipelineTests(unittest.TestCase):
         asset = select_windows_asset(release)
         self.assertIsNotNone(asset)
         self.assertEqual(asset.name, "Gomoku-1.13.0-rc.1-windows-x64.zip")
+
+
+class NormalizeDigestTests(unittest.TestCase):
+    """GitHub 的 ``sha256:<hex>`` 摘要应被归一成裸十六进制。"""
+
+    def test_valid_digest_is_lowercased(self) -> None:
+        digest = "sha256:" + "AB" * 32
+        self.assertEqual(normalize_digest(digest), "ab" * 32)
+
+    def test_surrounding_whitespace_is_ignored(self) -> None:
+        digest = "  sha256:" + "cd" * 32 + "\n"
+        self.assertEqual(normalize_digest(digest), "cd" * 32)
+
+    def test_invalid_digests_are_rejected(self) -> None:
+        for bad in (
+            "",
+            "   ",
+            "md5:" + "0" * 32,
+            "sha256:",
+            "sha256:" + "0" * 63,
+            "sha256:" + "0" * 65,
+            "sha256:" + "z" * 64,
+            "0" * 64,
+            "sha256:ABC",
+        ):
+            with self.subTest(digest=bad):
+                self.assertIsNone(normalize_digest(bad))
 
 
 if __name__ == "__main__":

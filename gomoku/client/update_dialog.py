@@ -3,8 +3,9 @@
 弹窗沿用主窗口内的模态遮罩（见 :mod:`gomoku.client.modal_overlay`），
 不创建第二个原生窗口。
 
-更新分两步：先在这里确认「下载并更新」，下载完成后由主窗口接手
-解压、替换与重启。
+更新分两步：先在这里确认「立即更新」，下载完成后由主窗口接手
+解压、替换与重启。全程不离开游戏界面：客户端不再把用户引到网页去
+手动下载安装包。
 """
 
 from __future__ import annotations
@@ -54,19 +55,16 @@ def format_size(num_bytes: int) -> str:
 class UpdateAvailableDialog(ModalOverlay):
     """「发现新版本」弹窗。
 
-    展示最新版本号与更新说明，并提供一个主按钮：
+    展示最新版本号与更新说明，并提供「立即更新」按钮：点击后发出
+    ``update_requested``（携带产物下载地址），由调用方下载、校验并替换。
 
-    * 支持原地替换时（Windows 打包产物且发布里带 Windows 安装包），
-      按钮为「下载并更新」，点击后发出 ``update_requested``（携带产物
-      下载地址），由调用方下载并替换；
-    * 其余情况按钮为「前往下载页」，点击后发出 ``download_requested``
-      （携带发布页地址），由调用方用浏览器打开。
-
-    弹窗本身不下载任何文件，也不直接操作浏览器。
+    不支持原地替换时（例如源码运行、非 Windows 平台），主按钮不出现，
+    弹窗改为说明原因（``unsupported_reason``）并只保留「知道了」——更新
+    始终在游戏界面内完成，不会跳到网页让人手动下载。
     """
 
-    update_requested = Signal(str)  # 产物下载地址
-    download_requested = Signal(str)  # 发布页地址
+    #: 用户点了「立即更新」，参数为产物下载地址。
+    update_requested = Signal(str)
 
     def __init__(
         self,
@@ -74,15 +72,14 @@ class UpdateAvailableDialog(ModalOverlay):
         version: str,
         current_version: str,
         notes: str,
-        release_page_url: str,
         asset_name: str = "",
         asset_url: str = "",
         can_update: bool = False,
+        unsupported_reason: str = "",
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent, object_name="updateDialog")
 
-        self._release_page_url = release_page_url
         self._asset_url = asset_url
         self._can_update = bool(can_update and asset_url)
 
@@ -159,42 +156,51 @@ class UpdateAvailableDialog(ModalOverlay):
         self.notes_area.setWidget(self.notes_label)
         layout.addWidget(self.notes_area)
 
+        # 不支持原地替换时的原因说明。
+        self.reason_label = QLabel(unsupported_reason, card)
+        self.reason_label.setObjectName("updateReason")
+        self.reason_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.reason_label.setWordWrap(True)
+        self.reason_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.reason_label.setVisible(bool(unsupported_reason))
+        layout.addWidget(self.reason_label)
+
         layout.addStretch(1)
 
         buttons = QHBoxLayout()
         buttons.setSpacing(14)
         buttons.addStretch(1)
-        self.download_button = QPushButton(
-            "下载并更新" if self._can_update else "前往下载页", card
+        self.update_button = QPushButton("立即更新", card)
+        self.update_button.setObjectName("resultPrimaryButton")
+        self.update_button.setAutoDefault(False)
+        self.update_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_button.setMinimumWidth(112)
+        self.update_button.setMinimumHeight(38)
+        self.update_button.setVisible(self._can_update)
+        self.later_button = QPushButton(
+            "稍后再说" if self._can_update else "知道了", card
         )
-        self.download_button.setObjectName("resultPrimaryButton")
-        self.download_button.setAutoDefault(False)
-        self.download_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.download_button.setMinimumWidth(112)
-        self.download_button.setMinimumHeight(38)
-        self.later_button = QPushButton("稍后再说", card)
         self.later_button.setObjectName("resultSecondaryButton")
         self.later_button.setDefault(True)
         self.later_button.setAutoDefault(True)
         self.later_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.later_button.setMinimumWidth(112)
         self.later_button.setMinimumHeight(38)
-        buttons.addWidget(self.download_button)
+        buttons.addWidget(self.update_button)
         buttons.addWidget(self.later_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
 
-        self.download_button.clicked.connect(self._on_download_clicked)
+        self.update_button.clicked.connect(self._on_update_clicked)
         self.later_button.clicked.connect(self.reject)
         self.set_default_action(self.reject)
         self.later_button.setFocus()
 
-    def _on_download_clicked(self) -> None:
-        """把下载意图交给调用方。"""
-        if self._can_update:
-            self.update_requested.emit(self._asset_url)
-        else:
-            self.download_requested.emit(self._release_page_url)
+    def _on_update_clicked(self) -> None:
+        """把更新意图交给调用方去下载并替换。"""
+        if not self._can_update:
+            return
+        self.update_requested.emit(self._asset_url)
         self.accept()
 
 
