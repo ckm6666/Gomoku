@@ -372,60 +372,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import os
-          import re
-          from pathlib import Path
-          from string import Template
-
-          version = os.environ["VERSION"]
-          tag = os.environ["TAG"]
-          repo = os.environ["REPO"]
-          # GHCR 的镜像路径强制全小写（docker/metadata-action 也会转小写），
-          # 仓库名原样（如 ckm6666/Gomoku）会让 docker pull 报
-          # "invalid reference format: repository name must be lowercase"。
-          repo_image = repo.lower()
-
-          readme = Path("README.md").read_text(encoding="utf-8")
-          match = re.search(r"^当前版本：(.+)$", readme, re.M)
-          highlight = match.group(1).replace("**", "").strip() if match else ""
-
-          template = Template(
-              """**版本 ${version}** — 由 GitHub Actions 自动发布。
-
-          ${highlight}
-
-          ## 发布产物
-
-          | 产物 | 说明 |
-          | --- | --- |
-          | `Gomoku-${version}-windows-x64.zip` | Windows x64 客户端（`Gomoku.exe`），压缩包内含 `THIRD_PARTY_NOTICES.md` 与字体 OFL 文本 |
-          | `ghcr.io/${repo_image}/gomoku-server:${version}` | 服务端镜像（同时推送 `:${tag}` 与 `:latest` 标签） |
-
-          ## 使用提示
-
-          - 解压后双击 `Gomoku.exe` 即可运行离线双人与人机模式；联机模式需要另行部署服务端。
-          - 拉取服务端镜像：`docker pull ghcr.io/${repo_image}/gomoku-server:${version}`
-          - 打包版默认连接内置的固定公网入口；若要接入自建服务端，请设置
-            `GOMOKU_API_BASE_URL` / `GOMOKU_WS_BASE_URL` 环境变量（详见 README）。
-          - 分发时请保留压缩包内的 `THIRD_PARTY_NOTICES.md` 与 `fonts/OFL-*.txt`，
-            以满足 OFL 字体再分发要求。
-          - 版本说明见 README 顶部的「当前版本」段落。
-          """
-          )
-          Path("release-notes.md").write_text(
-              # 用 substitute 而非 safe_substitute：占位符写错时直接失败，
-              # 避免把未替换的 ${...} 原样发布到 Release 说明里。
-              template.substitute(
-                  version=version,
-                  tag=tag,
-                  repo_image=repo_image,
-                  highlight=highlight,
-              ),
-              encoding="utf-8",
-          )
-          print(Path("release-notes.md").read_text(encoding="utf-8"))
-          PY
+          python tools/compose_release_notes.py
 
       # 只有真正创建 Release 这一步受 dry_run 门禁；前面的产物下载与说明生成
       # 始终执行，这样 dry_run 能完整演练到最后一步而不产生任何外部副作用。
