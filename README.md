@@ -742,7 +742,8 @@ git tag v1.13.0 && git push origin v1.13.0
 
 流水线会依次：校验标签与 `APP_VERSION` 一致 → 跑 ruff/mypy 与双端测试 →
 PyInstaller 打包并冒烟校验版本号 → 生成 `Gomoku-<版本>-windows-x64.zip` →
-构建并推送服务端镜像到 GHCR → 创建 GitHub Release。
+构建并推送服务端镜像到 GHCR → 从 README 顶部的「当前版本」行截取本版说明
+（`tools/compose_release_notes.py`，只保留第一个版本段并拆成列表）→ 创建 GitHub Release。
 
 镜像地址（GHCR 路径强制全小写）：
 
