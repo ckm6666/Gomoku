@@ -1896,6 +1896,9 @@ class MainWindow(QMainWindow):
         if not started:
             # check() 自身会发出 failed 信号，这里只需要恢复按钮状态。
             self._set_update_busy(False)
+            # 请求根本没发出去，「静默」标志没有用武之地：清掉它，否则
+            # 下一次手动检查也会被当成自动检查而不给提示。
+            self._update_check_silent = False
 
     def _auto_check_update(self) -> None:
         """启动后自动检查一次更新。
@@ -2025,15 +2028,17 @@ class MainWindow(QMainWindow):
     def _on_update_failed(self, message: str) -> None:
         """更新检查失败：恢复按钮并提示原因。"""
         self._set_update_busy(False)
-        silent = self._update_check_silent
-        self._update_check_silent = False
         if self._closing:
             return
+        if self._active_modal is not None:
+            # 等模态层关掉再提示：这里不能消费「静默」标志，否则重试时
+            # 会把它当成手动检查，弹出用户并不需要的提示。
+            QTimer.singleShot(100, lambda: self._on_update_failed(message))
+            return
+        silent = self._update_check_silent
+        self._update_check_silent = False
         if silent:
             logger.info("自动更新检查失败：%s", message)
-            return
-        if self._active_modal is not None:
-            QTimer.singleShot(100, lambda: self._on_update_failed(message))
             return
         self._show_notice("检查更新失败", message)
 

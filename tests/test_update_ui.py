@@ -596,6 +596,47 @@ class UpdateUiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertIsNone(self.window.active_modal())
 
+    def test_auto_check_failure_stays_silent_after_modal_defers(self) -> None:
+        """自动检查失败时若先撞上别的模态层，稍后重试也不能弹出提示。"""
+        blocker = ModalOverlay(self.window._overlay_host())
+        self.window._active_modal = blocker
+
+        self.window._auto_check_update()  # noqa: SLF001
+        self.window._on_update_failed(  # noqa: SLF001
+            "无法连接 GitHub，请检查网络"
+        )
+        self.app.processEvents()
+        # 失败被推迟了：模态层还在，标志还没被消费。
+        self.assertIs(self.window.active_modal(), blocker)
+
+        self.window._active_modal = None
+        self.assertTrue(
+            wait_until(
+                lambda: self.window.active_modal() is None, 3.0, self.app
+            )
+        )
+        self.assertIsNone(self.window.active_modal())
+
+    def test_manual_check_reports_failure_after_silent_auto_check(self) -> None:
+        """自动检查失败后，手动检查仍要给出提示。"""
+        self.window._auto_check_update()  # noqa: SLF001
+        # 自动检查的失败是静默的。
+        self.window._on_update_failed(  # noqa: SLF001
+            "无法连接 GitHub，请检查网络"
+        )
+        self.app.processEvents()
+        self.assertIsNone(self.window.active_modal())
+
+        # 之后的失败（手动检查）必须给出提示。
+        self.client.busy = False
+        self.client.refuse = True
+        captured = self._run_modal(
+            lambda: self.window.update_button.click()
+        )
+        modal = captured.get("modal")
+        self.assertIsNotNone(modal)
+        self.assertIn("更新地址无效", modal.message_label.text())
+
     def test_ignored_version_is_not_shown_again(self) -> None:
         """用户点过「稍后再说」后，同一版本不再自动弹窗。"""
         captured: dict = {}
