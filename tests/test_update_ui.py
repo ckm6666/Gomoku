@@ -1,7 +1,7 @@
 """「检查更新」界面的离屏回归测试。
 
-覆盖主菜单入口、版本比较、GitHub 发布页跳转与失败提示；网络层用假客户端
-替换，因此不会产生真实的 GitHub 请求。
+覆盖主菜单入口、版本比较、GitHub 发布页跳转、下载替换流程与失败提示；
+网络层用假客户端替换，因此不会产生真实的 GitHub 请求。
 
 运行方式：
     python -m unittest tests.test_update_ui -v
@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -27,12 +28,13 @@ if str(PROJECT_ROOT) not in sys.path:
 from PySide6.QtCore import QObject, Qt, QTimer, Signal  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+from gomoku.client.confirm_dialog import ConfirmDialog  # noqa: E402
 from gomoku.client.constants import (  # noqa: E402
     APP_VERSION,
     GITHUB_RELEASES_PAGE_URL,
 )
 from gomoku.client.main_window import MainWindow  # noqa: E402
-from gomoku.client.modal_overlay import ModalOverlay  # noqa: E402
+from gomoku.client.modal_overlay import ModalOverlay, NoticeOverlay  # noqa: E402
 from gomoku.client.records import LocalRecordStore  # noqa: E402
 from gomoku.client.ui_theme import apply_app_theme  # noqa: E402
 from gomoku.client.update_dialog import UpdateAvailableDialog  # noqa: E402
@@ -119,6 +121,39 @@ class FakeUpdateClient(QObject):
         self.busy_changed.emit(False)
 
 
+class FakeDownloadClient(QObject):
+    """替代真实下载客户端的假对象：直接产出本地更新包。"""
+
+    progress = Signal(int, int)
+    finished = Signal(str)
+    failed = Signal(str)
+    busy_changed = Signal(bool)
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(kwargs.get("parent"))
+        self.urls: list[str] = []
+        self.targets: list[Path] = []
+        self.aborted = False
+        #: 置为 ``"fail"`` 时直接报下载失败。
+        self.mode = "ok"
+
+    def start(self, url: str, target: Path) -> bool:
+        self.urls.append(url)
+        self.targets.append(Path(target))
+        if self.mode == "fail":
+            self.failed.emit("下载更新包失败，请检查网络")
+            return False
+        Path(target).parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(target, "w") as bundle:
+            bundle.writestr("Gomoku.exe", b"MZfake")
+        self.progress.emit(10, 10)
+        self.finished.emit(str(target))
+        return True
+
+    def abort(self) -> None:
+        self.aborted = True
+
+
 class UpdateUiTests(unittest.TestCase):
     """主菜单「检查更新」入口的行为。"""
 
@@ -149,6 +184,11 @@ class UpdateUiTests(unittest.TestCase):
         self.client.failed.connect(self.window._on_update_failed)
 
     def tearDown(self) -> None:
+        workspace = getattr(self.window, "_update_workspace", None)
+        if workspace is not None:
+            from gomoku.client import auto_update
+
+            auto_update.cleanup_workspace(workspace)
         self.window.close()
         self.app.processEvents()
         self._tmpdir.cleanup()
@@ -228,7 +268,7 @@ class UpdateUiTests(unittest.TestCase):
         self.assertIn("新增沙盘复盘", modal.notes_label.text())
 
     def test_download_button_opens_github_release_page(self) -> None:
-        """点「前往下载」会用浏览器打开 GitHub 发布页。"""
+        """不支持原地替换时，点按钮会用浏览器打开 GitHub 发布页。"""
         opened: list[str] = []
 
         def fake_open(url) -> bool:
@@ -375,6 +415,139 @@ class UpdateUiTests(unittest.TestCase):
                 GITHUB_RELEASES_PAGE_URL,
                 msg=f"不应放行：{hostile!r}",
             )
+
+    # ------------------------------------------------------------------
+    # 下载并替换
+    # ------------------------------------------------------------------
+    def _run_update_flow(self, client: FakeDownloadClient) -> list[str]:
+        """走一遍「检查更新 → 下载 → 重启」流程，返回途中出现的提示。
+
+        弹窗都是窗口内的模态层，这里用一个定时器代替用户逐个点按钮。
+        """
+        seen: list[str] = []
+        clients: list[FakeDownloadClient] = [client]
+
+        def fake_client(*args, **kwargs):
+            return clients[0]
+
+        def inspector() -> None:
+            modal = self.window.active_modal()
+            if isinstance(modal, UpdateAvailableDialog):
+                modal.download_button.click()
+            elif isinstance(modal, ConfirmDialog):
+                seen.append("confirm")
+                modal.confirm_button.click()
+            elif isinstance(modal, NoticeOverlay):
+                seen.append("notice")
+                modal.ok_button.click()
+
+        timer = QTimer()
+        timer.setInterval(20)
+        timer.timeout.connect(inspector)
+        timer.start()
+        try:
+            with mock.patch(
+                "gomoku.client.main_window.UpdateDownloadClient", fake_client
+            ), mock.patch(
+                "gomoku.client.main_window.auto_update.is_supported",
+                return_value=True,
+            ):
+                self.window._on_release_ready(  # noqa: SLF001
+                    make_release("9.9.9")
+                )
+                self.app.processEvents()
+        finally:
+            timer.stop()
+        return seen
+
+    def test_update_button_offers_inplace_download(self) -> None:
+        """支持原地替换时，按钮变成「下载并更新」而不是「前往下载页」。"""
+        opened: list[str] = []
+
+        def fake_open(url) -> bool:
+            opened.append(url.toString())
+            return True
+
+        with mock.patch(
+            "gomoku.client.main_window.auto_update.is_supported",
+            return_value=True,
+        ), mock.patch(
+            "gomoku.client.main_window.QDesktopServices.openUrl",
+            side_effect=fake_open,
+        ):
+            captured: dict = {}
+
+            def inspect() -> None:
+                modal = self.window.active_modal()
+                if isinstance(modal, UpdateAvailableDialog):
+                    captured["dialog"] = modal
+                    modal.later_button.click()
+
+            QTimer.singleShot(20, inspect)
+            self.window._on_release_ready(  # noqa: SLF001
+                make_release("9.9.9")
+            )
+            self.app.processEvents()
+
+        dialog = captured.get("dialog")
+        self.assertIsInstance(dialog, UpdateAvailableDialog)
+        self.assertEqual(dialog.download_button.text(), "下载并更新")
+        self.assertEqual(opened, [])
+
+    def test_update_flow_downloads_package_and_asks_for_restart(self) -> None:
+        """点「下载并更新」会真的下载安装包，并询问是否重启。"""
+        client = FakeDownloadClient()
+        seen = self._run_update_flow(client)
+
+        self.assertEqual(
+            client.urls,
+            [
+                "https://github.com/ckm6666/Gomoku/releases/download/"
+                "v9.9.9/Gomoku-9.9.9-windows-x64.zip"
+            ],
+        )
+        # 下载完成后应当出现「立即重启」的确认框。
+        self.assertIn("confirm", seen)
+
+    def test_update_flow_reports_download_failure(self) -> None:
+        """下载失败时给出原因，并提示条恢复可用。"""
+        client = FakeDownloadClient()
+        client.mode = "fail"
+        seen = self._run_update_flow(client)
+
+        self.assertIn("notice", seen)
+        self.assertNotIn("confirm", seen)
+
+    def test_update_flow_extracts_package(self) -> None:
+        """下载完成后会把安装包解压到暂存目录。"""
+        client = FakeDownloadClient()
+        self._run_update_flow(client)
+
+        staging = self.window._update_staging  # noqa: SLF001
+        self.assertIsNotNone(staging)
+        self.assertTrue((staging / "Gomoku.exe").is_file())
+
+    def test_update_flow_deletes_downloaded_archive(self) -> None:
+        """解压完成后要删掉压缩包，别把几十兆的安装包留在临时目录里。"""
+        client = FakeDownloadClient()
+        self._run_update_flow(client)
+
+        archives = list(client.targets)
+        self.assertEqual(len(archives), 1)
+        self.assertFalse(archives[0].exists())
+
+    def test_stale_download_failure_is_ignored(self) -> None:
+        """过期客户端迟到的失败通知不能影响当前下载。"""
+        stale = FakeDownloadClient()
+        current = FakeDownloadClient()
+        self.window._update_download_client = current  # noqa: SLF001
+
+        self.window._on_update_download_failed(  # noqa: SLF001
+            "无法写入更新包，请检查磁盘空间与权限", stale
+        )
+
+        self.assertEqual(self.window._update_state, "idle")  # noqa: SLF001
+        self.assertEqual(self.window._update_error_message, "")  # noqa: SLF001
 
 
 if __name__ == "__main__":  # pragma: no cover - 手动运行入口
