@@ -4,8 +4,9 @@
 负责请求 GitHub Releases API，界面层负责展示，两者都复用这里的数据模型
 与版本比较逻辑，避免出现“两套判断规则”导致客户端误报更新。
 
-版本元数据一律来自 GitHub Releases API，客户端自身**不提供**安装包下载
-入口；这里只负责把接口返回的 JSON 变成可比较、可展示的数据结构。
+版本元数据一律来自 GitHub Releases API；这里只负责把接口返回的 JSON
+变成可比较、可展示的数据结构。发布产物自带的 ``digest`` 摘要也在这一层
+解析：客户端下载完成后要用它校验安装包，规则放在这里才不会散落两套。
 """
 
 from __future__ import annotations
@@ -34,6 +35,11 @@ WINDOWS_ASSET_SUFFIX: Final[str] = "-windows-x64.zip"
 #: Windows x64 客户端压缩包的文件名模板。
 WINDOWS_ASSET_NAME_TEMPLATE: Final[str] = "Gomoku-{version}-windows-x64.zip"
 
+#: GitHub 资产摘要的写法：``sha256:<64 位十六进制>``。
+_DIGEST_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^sha256:([0-9a-fA-F]{64})$"
+)
+
 
 @dataclass(frozen=True)
 class ReleaseAsset:
@@ -42,6 +48,8 @@ class ReleaseAsset:
     name: str
     download_url: str
     size: int
+    #: GitHub 给出的产物摘要，形如 ``sha256:<64 位十六进制>``；可能为空串。
+    digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -171,11 +179,14 @@ def _parse_assets(payload: Mapping[str, Any]) -> tuple[ReleaseAsset, ...]:
             size = 0
         else:
             size = max(0, raw_size)
+        raw_digest = item.get("digest")
+        digest = raw_digest if isinstance(raw_digest, str) else ""
         assets.append(
             ReleaseAsset(
                 name=name,
                 download_url=download_url,
                 size=size,
+                digest=digest,
             )
         )
     return tuple(assets)
@@ -244,6 +255,21 @@ def select_windows_asset(release: ReleaseInfo) -> Optional[ReleaseAsset]:
     return None
 
 
+def normalize_digest(digest: str) -> Optional[str]:
+    """把 GitHub 的资产摘要归一成裸的小写十六进制 SHA-256。
+
+    只认 ``sha256:<64 位十六进制>`` 这一种写法（GitHub 目前只给 sha256）；
+    空串、别的算法或位数不对都返回 ``None``，调用方据此决定「无法校验」
+    而不是「校验通过」。
+    """
+    if not isinstance(digest, str):
+        return None
+    match = _DIGEST_PATTERN.match(digest.strip())
+    if match is None:
+        return None
+    return match.group(1).lower()
+
+
 def summarize_notes(notes: str, limit: int = NOTES_SUMMARY_LIMIT) -> str:
     """把发布说明压缩成单行摘要。
 
@@ -268,6 +294,7 @@ __all__ = [
     "ReleaseInfo",
     "compare_versions",
     "is_newer_version",
+    "normalize_digest",
     "parse_release_payload",
     "parse_version",
     "select_windows_asset",

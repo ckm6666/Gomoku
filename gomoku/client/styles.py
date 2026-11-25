@@ -916,6 +916,13 @@ QLabel#updateAsset {
     background: transparent;
 }
 
+/* 无法自动更新时的原因说明。 */
+QLabel#updateReason {
+    color: #A8442A;
+    font-size: 12px;
+    background: transparent;
+}
+
 /* 更新下载进度弹窗。 */
 QWidget#updateProgressDialog {
     background: transparent;

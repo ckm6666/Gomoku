@@ -134,6 +134,8 @@ class ClientLifecycleTests(unittest.TestCase):
             record_store=LocalRecordStore(
                 Path(self._tmpdir.name) / "records"
             ),
+            # 测试不联网：关掉启动时的自动更新检查。
+            auto_update_check=False,
         )
         self.window.setAttribute(
             Qt.WidgetAttribute.WA_DontShowOnScreen, True
