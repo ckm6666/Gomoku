@@ -1439,7 +1439,7 @@ class MainWindow(QMainWindow):
             self._sync_ui()
 
     def _request_hint(self) -> None:
-        """按模式请求提示：残局显示文字，人机模式请求 AI 分析。
+        """请求 AI 提示：分析当前局面并推荐一手。
 
         分析进行中时这个按钮变成“取消提示”：再点一次就能中止后台搜索，
         不必干等它算完。
@@ -1452,9 +1452,6 @@ class MainWindow(QMainWindow):
         ):
             return
 
-        if self._game_mode is GameMode.PUZZLE:
-            self._show_puzzle_hint()
-            return
         if self._game_mode is not GameMode.AI:
             return
 
@@ -1502,8 +1499,6 @@ class MainWindow(QMainWindow):
 
     def _default_hint_tooltip(self) -> str:
         """返回提示按钮在“没有备选着法”时使用的默认提示文字。"""
-        if self._game_mode is GameMode.PUZZLE:
-            return "查看当前残局的提示"
         if self._game_mode is GameMode.AI:
             return "让 AI 分析局面并推荐一手"
         return "查看提示"
@@ -1526,15 +1521,8 @@ class MainWindow(QMainWindow):
 
         view = self._session.view
         game_over = view.is_game_over
-        puzzle_over = (
-            self._game_mode is GameMode.PUZZLE
-            and self._puzzle_result is not None
-        )
         button.setText("提示")
-        if self._game_mode is GameMode.PUZZLE:
-            button.setEnabled(not puzzle_over)
-            button.setToolTip(self._default_hint_tooltip())
-        elif self._game_mode is GameMode.AI:
+        if self._game_mode is GameMode.AI:
             session = self._session
             button.setEnabled(
                 isinstance(session, AIGameSession)
@@ -1545,19 +1533,6 @@ class MainWindow(QMainWindow):
                 button.setToolTip(self._default_hint_tooltip())
         else:
             button.setEnabled(False)
-
-    def _show_puzzle_hint(self) -> None:
-        """在当前残局中展示题库提供的文字提示。"""
-        if self._game_mode is not GameMode.PUZZLE:
-            return
-        session = self._session
-        if not isinstance(session, PuzzleSession):
-            return
-        hint = session.hint or session.puzzle.description
-        if not hint:
-            hint = "观察棋盘上的双威胁，优先制造对手无法同时封堵的棋形。"
-        self.puzzle_hint_label.setText(f"提示：{hint}")
-        self.puzzle_hint_label.setVisible(True)
 
     def _on_ai_hint_ready(self, analysis: object) -> None:
         """显示后台分析返回的推荐落点、评分与候选。"""
@@ -2403,7 +2378,9 @@ class MainWindow(QMainWindow):
             self.undo_button.setToolTip(
                 "撤销到你的上一次落子前（Ctrl+Z）"
             )
-        hint_visible = self._game_mode in (GameMode.PUZZLE, GameMode.AI)
+        # 残局挑战不提供提示按钮：关卡的提示文字已经写在关卡卡片上，
+        # 对局中再给提示会直接泄露破局思路。
+        hint_visible = self._game_mode is GameMode.AI
         self.hint_button.setVisible(hint_visible)
         self._sync_hint_button()
         self.restart_button.setText(

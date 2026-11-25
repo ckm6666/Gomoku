@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (  # noqa: E402
 
 from gomoku.client.replay import ReplayError, ReplayTimeline  # noqa: E402
 from gomoku.client.replay_panel import ReplayPanel  # noqa: E402
+from gomoku.client.review import MoveReview, ReviewResult  # noqa: E402
 from gomoku.client.ui_theme import apply_app_theme  # noqa: E402
 from gomoku.shared.record import GameRecord  # noqa: E402
 from gomoku.shared.rules import Move, Player  # noqa: E402
@@ -143,6 +144,84 @@ class ReplayPanelTests(unittest.TestCase):
             self.assertNotIn("连珠", panel.meta_label.text())
         finally:
             panel.shutdown()
+
+
+class ReplayReviewTests(unittest.TestCase):
+    """AI 复盘标注要完整写进右侧落子列表，不能被省略号截断。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+        apply_app_theme(cls.app)
+
+    def setUp(self) -> None:
+        self.host = QWidget()
+        self.host.setAttribute(
+            Qt.WidgetAttribute.WA_DontShowOnScreen, True
+        )
+        self.host.setLayout(QVBoxLayout(self.host))
+        self.window = ReplayPanel([_record()], parent=self.host)
+        self.host.layout().addWidget(self.window)
+        self.host.show()
+        self.app.processEvents()
+
+    def tearDown(self) -> None:
+        self.window.shutdown()
+        self.host.close()
+        self.app.processEvents()
+
+    def _apply_review(self) -> tuple[MoveReview, ...]:
+        record = _record()
+        reviews = tuple(
+            MoveReview(
+                move_no=index,
+                player=move.player,
+                move=(move.row, move.col),
+                best_move=(7, 3 + index),
+                played_score=100,
+                best_score=200,
+                loss=100,
+                label="最佳" if index % 2 else "失误",
+                win_rate_before=0.6,
+                win_rate_after=0.5,
+            )
+            for index, move in enumerate(record.moves, start=1)
+        )
+        self.window._on_review_finished(
+            ReviewResult(
+                record_id=record.record_id,
+                reviews=reviews,
+                average_loss=100.0,
+                accuracy=95,
+                counts={"最佳": 5, "失误": 4},
+            )
+        )
+        self.app.processEvents()
+        return reviews
+
+    def test_move_list_never_elides_text(self) -> None:
+        """落子列表不省略文字：窄面板下改用换行。"""
+        self.assertEqual(
+            self.window.moves_list.textElideMode(),
+            Qt.TextElideMode.ElideNone,
+        )
+        self.assertTrue(self.window.moves_list.wordWrap())
+
+    def test_every_move_shows_its_own_verdict(self) -> None:
+        """每一手都要在右侧落子列表里写出评定与推荐着法。"""
+        reviews = self._apply_review()
+        for index, review in enumerate(reviews, start=1):
+            text = self.window.moves_list.item(index).text()
+            self.assertIn(review.label, text)
+            self.assertIn("推荐", text)
+            self.assertNotIn("…", text)
+            self.assertNotIn("...", text)
+
+    def test_move_list_keeps_room_for_the_verdict(self) -> None:
+        """落子列表要留得下评定，不能被棋谱列表挤成省略号。"""
+        self.assertGreaterEqual(
+            self.window.moves_panel.minimumWidth(), 160
+        )
 
 
 if __name__ == "__main__":

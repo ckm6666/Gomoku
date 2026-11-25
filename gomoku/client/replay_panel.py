@@ -240,7 +240,8 @@ class ReplayPanel(InkBackdrop):
 
         self.records_panel = QWidget(self)
         self.records_panel.setObjectName("replayRecordsPanel")
-        self.records_panel.setMaximumWidth(260)
+        self.records_panel.setMaximumWidth(220)
+        self.records_panel.setMinimumWidth(140)
         records_layout = QVBoxLayout(self.records_panel)
         records_layout.setContentsMargins(0, 0, 0, 0)
         records_layout.setSpacing(6)
@@ -303,6 +304,10 @@ class ReplayPanel(InkBackdrop):
         moves_panel = QWidget(self)
         moves_panel.setObjectName("replayMovesPanel")
         moves_panel.setMaximumWidth(220)
+        # 落子列表优先于棋谱列表保住宽度：复盘评定要逐手完整显示，
+        # 挤成省略号就等于没写出来。
+        moves_panel.setMinimumWidth(170)
+        self.moves_panel = moves_panel
         moves_layout = QVBoxLayout(moves_panel)
         moves_layout.setContentsMargins(0, 0, 0, 0)
         moves_layout.setSpacing(6)
@@ -313,6 +318,11 @@ class ReplayPanel(InkBackdrop):
         self.moves_list.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        # 落子面板很窄，Qt 默认会把过长的条目省略成“…”；那样复盘评定
+        # （最佳/失误、推荐着法）就会被截掉。改为自动换行且不省略，
+        # 保证每一手的评定都能完整显示。
+        self.moves_list.setWordWrap(True)
+        self.moves_list.setTextElideMode(Qt.TextElideMode.ElideNone)
         moves_layout.addWidget(moves_title)
         moves_layout.addWidget(self.moves_list, 1)
         self.moves_list.currentRowChanged.connect(self._on_move_selected)
@@ -706,6 +716,8 @@ class ReplayPanel(InkBackdrop):
         self.review_status_label.setText("已取消 AI 复盘")
 
     def _apply_review_labels(self) -> None:
+        if self._timeline is None:
+            return
         for move_no in range(1, self._timeline.move_count + 1):
             self._update_move_item(move_no)
 
@@ -721,10 +733,18 @@ class ReplayPanel(InkBackdrop):
             item.setText(base)
             item.setForeground(QBrush())
             return
-        item.setText(f"{base}　·　{review.label}")
+        # 评定另起一行：窄面板下换行显示，不会被省略号截断。
+        item.setText(f"{base}\n{self._review_item_text(review)}")
         item.setForeground(
             QBrush(_REVIEW_COLORS.get(review.label, QColor("#3A3226")))
         )
+
+    def _review_item_text(self, review: MoveReview) -> str:
+        """复盘标注行：这一手的评定与 AI 推荐着法。"""
+        if review.best_move is None:
+            return f"· {review.label}"
+        best = _coord(review.best_move[0], review.best_move[1])
+        return f"· {review.label} · 推荐 {best}"
 
     def _review_move_text(self, review: MoveReview) -> str:
         if review.best_move is None:
