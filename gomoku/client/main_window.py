@@ -22,6 +22,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from PySide6.QtCore import Qt, QTimer, QUrl
@@ -47,6 +48,7 @@ from PySide6.QtWidgets import (
 
 from gomoku.client.ai_engine import AIDifficulty
 from gomoku.client.audio import get_audio_manager
+from gomoku.client import auto_update
 from gomoku.client.board_widget import BoardWidget
 from gomoku.client.config import AppConfig
 from gomoku.client.confirm_dialog import ConfirmDialog
@@ -65,6 +67,7 @@ from gomoku.client.constants import (
 )
 from gomoku.client.modal_overlay import ModalOverlay, NoticeOverlay
 from gomoku.client.net.update_api import UpdateHTTPClient
+from gomoku.client.net.update_download import UpdateDownloadClient
 from gomoku.client.online_panel import OnlinePanel
 from gomoku.client.puzzle_bank import load_puzzle_bank
 from gomoku.client.puzzle_page import PuzzlePage
@@ -85,7 +88,10 @@ from gomoku.client.ui_theme import (
     PaperComboBox,
     RicePaperCard,
 )
-from gomoku.client.update_dialog import UpdateAvailableDialog
+from gomoku.client.update_dialog import (
+    UpdateAvailableDialog,
+    UpdateProgressDialog,
+)
 from gomoku.shared.game_model import GameModel
 from gomoku.shared.puzzle import Puzzle
 from gomoku.shared.record import GameRecord
@@ -289,8 +295,8 @@ class MainWindow(QMainWindow):
         # 窗口底部的非阻塞提示条（棋谱保存失败等）。
         self._transient_notice: Optional[TransientNotice] = None
 
-        # 更新检查：版本信息只从 GitHub Releases 检索，安装包也由用户从
-        # 发布页下载，客户端不经过游戏服务端分发新版本。
+        # 更新检查：版本信息只从 GitHub Releases 检索；Windows 打包产物
+        # 支持直接下载并原地替换，其余环境退回「打开发布页手动下载」。
         self._update_client = UpdateHTTPClient(
             api_url=GITHUB_RELEASE_API_URL,
             token=self.config.github_token,
@@ -301,9 +307,18 @@ class MainWindow(QMainWindow):
         # 忙状态以客户端信号为准：请求被 abort 或内部提前返回时，客户端
         # 只会发 busy_changed(False)，按钮不会永远停在“检查中…”。
         self._update_client.busy_changed.connect(self._set_update_busy)
-        # 用户在更新弹窗里点了「前往下载」；弹窗关闭后才真正打开浏览器，
+        # 用户在更新弹窗里点了「前往下载页」；弹窗关闭后才真正打开浏览器，
         # 避免两个模态层叠在一起。
         self._pending_download_url: Optional[str] = None
+        # 用户在更新弹窗里点了「下载并更新」；同样等弹窗关闭后再开始下载。
+        self._pending_update_url: Optional[str] = None
+        # 下载与替换流程的状态：idle / downloading / downloaded / failed。
+        self._update_state: str = "idle"
+        self._update_error_message: str = ""
+        self._update_download_client: Optional[UpdateDownloadClient] = None
+        self._update_progress_dialog: Optional[UpdateProgressDialog] = None
+        self._update_workspace: Optional[Path] = None
+        self._update_staging: Optional[Path] = None
 
         # 对局配置：默认保持本地双人，切到人机模式后默认中等难度。
         self._game_mode = GameMode.LOCAL
@@ -1890,16 +1905,30 @@ class MainWindow(QMainWindow):
             )
             return
 
+        asset = select_windows_asset(release)
+        # 产物地址必须先过白名单：地址来自远端响应，不能直接拿去下载。
+        asset_url = (
+            auto_update.asset_download_url(asset.download_url)
+            if asset is not None
+            else ""
+        )
+        # 只有 Windows 打包产物才能原地替换；其余环境退回发布页。
+        can_update = bool(asset_url) and auto_update.is_supported()
+
         dialog = UpdateAvailableDialog(
             version=version,
             current_version=APP_VERSION,
             notes=summarize_notes(notes),
-            download_url=self._safe_release_url(url),
-            asset_name=self._windows_asset_name(release),
+            release_page_url=self._safe_release_url(url),
+            asset_name=asset.name if asset is not None else "",
+            asset_url=asset_url,
+            can_update=can_update,
             parent=self._overlay_host(),
         )
         self._pending_download_url = None
+        self._pending_update_url = None
         dialog.download_requested.connect(self._note_download_requested)
+        dialog.update_requested.connect(self._note_update_requested)
         self._active_modal = dialog
         # 与终局弹窗/确认框一样，打开模态层期间置位该标志：AI 继续走棋，
         # 终局弹窗也会推迟到本弹窗关闭之后再显示。
@@ -1913,11 +1942,16 @@ class MainWindow(QMainWindow):
             # 弹窗关掉了：补上被推迟的终局弹窗与更新提示。
             QTimer.singleShot(0, self._flush_pending_result_dialog)
 
-        # 弹窗已经关闭，此时再打开浏览器，避免两个模态层同时存在。
+        # 弹窗已经关闭，此时再打开浏览器或开始下载，避免两个模态层同时存在。
         pending = self._pending_download_url
         self._pending_download_url = None
         if pending:
             self._open_release_page(pending)
+            return
+        update_url = self._pending_update_url
+        self._pending_update_url = None
+        if update_url:
+            self._start_update_download(update_url, version)
 
     def _on_update_failed(self, message: str) -> None:
         """更新检查失败：恢复按钮并提示原因。"""
@@ -1932,6 +1966,236 @@ class MainWindow(QMainWindow):
     def _note_download_requested(self, url: str) -> None:
         """记录用户的下载意图，等弹窗关闭后再打开浏览器。"""
         self._pending_download_url = url
+
+    def _note_update_requested(self, url: str) -> None:
+        """记录用户的更新意图，等弹窗关闭后再开始下载。"""
+        self._pending_update_url = url
+
+    # ------------------------------------------------------------------
+    # 下载与替换
+    # ------------------------------------------------------------------
+    def _start_update_download(self, asset_url: str, version: str) -> None:
+        """下载更新包；下载完成后进入替换流程。"""
+        if self._closing:
+            return
+        if not auto_update.is_supported():
+            self._show_notice(
+                "无法自动更新",
+                "当前环境不支持自动替换，请从发布页手动下载新版本。",
+            )
+            return
+
+        try:
+            workspace = auto_update.create_workspace(version)
+        except OSError:
+            self._show_notice(
+                "更新失败", "无法创建临时目录，请检查磁盘空间与权限。"
+            )
+            return
+
+        self._update_workspace = workspace
+        self._update_staging = None
+        self._update_error_message = ""
+        self._update_state = "downloading"
+
+        client = UpdateDownloadClient(parent=self)
+        previous = self._update_download_client
+        if previous is not None:
+            # 上一次的下载客户端已经没有用了：先中止，别让它继续往
+            # 已经删掉的工作目录里写数据（那会冒出一句误导性的
+            # 「无法写入更新包」，把新下载顶掉）。
+            try:
+                previous.abort()
+            except RuntimeError:
+                pass
+            previous.deleteLater()
+        self._update_download_client = client
+        client.progress.connect(self._on_update_progress)
+        # 信号带上发起方：过期的客户端迟到的失败通知不能影响当前下载。
+        client.finished.connect(
+            lambda path, source=client: self._on_update_downloaded(path, source)
+        )
+        client.failed.connect(
+            lambda message, source=client: self._on_update_download_failed(
+                message, source
+            )
+        )
+
+        dialog = UpdateProgressDialog(
+            version=version, parent=self._overlay_host()
+        )
+        self._update_progress_dialog = dialog
+        dialog.cancel_requested.connect(self._cancel_update_download)
+
+        archive = workspace / "update.zip"
+        started = client.start(asset_url, archive)
+        if not started:
+            # 失败信号已经在 start() 里同步发出，这里只负责把原因告诉用户。
+            self._update_state = "failed"
+            self._update_progress_dialog = None
+            dialog.deleteLater()
+            self._show_notice(
+                "更新失败",
+                self._update_error_message or "无法开始下载更新包。",
+            )
+            auto_update.cleanup_workspace(self._update_workspace)
+            self._update_workspace = None
+            return
+
+        self._active_modal = dialog
+        self._modal_dialog_open = True
+        try:
+            # 下载若已经同步完成（状态不再是 downloading），弹窗就没有
+            # 继续存在的必要，直接进入下一步。
+            if self._update_state == "downloading":
+                dialog.exec()
+        finally:
+            self._modal_dialog_open = False
+            self._active_modal = None
+            self._update_progress_dialog = None
+            dialog.deleteLater()
+
+        state = self._update_state
+        if state == "failed":
+            self._show_notice("更新失败", self._update_error_message)
+            auto_update.cleanup_workspace(self._update_workspace)
+            self._update_workspace = None
+            return
+        if state == "downloaded":
+            self._apply_downloaded_update(version)
+            return
+        # 其余情况是用户取消了下载。
+        self._update_state = "cancelled"
+        auto_update.cleanup_workspace(self._update_workspace)
+        self._update_workspace = None
+
+    def _on_update_progress(self, received: int, total: int) -> None:
+        """刷新下载进度。"""
+        dialog = self._update_progress_dialog
+        if dialog is not None:
+            dialog.set_progress(received, total)
+
+    def _on_update_downloaded(self, path: str, source: object = None) -> None:
+        """更新包下载完成：解压校验，准备替换。"""
+        if self._closing:
+            return
+        if source is not None and source is not self._update_download_client:
+            # 过期客户端迟到的通知，忽略。
+            return
+        dialog = self._update_progress_dialog
+        if dialog is not None:
+            dialog.set_status("下载完成，正在准备安装…")
+        archive = Path(path)
+        try:
+            staging = auto_update.extract_archive(
+                archive, self._staging_directory()
+            )
+        except auto_update.UpdateError as exc:
+            self._update_error_message = str(exc)
+            self._update_state = "failed"
+        except OSError:
+            self._update_error_message = "无法解压更新包，请检查磁盘空间。"
+            self._update_state = "failed"
+        else:
+            self._update_staging = staging
+            self._update_state = "downloaded"
+            # 解压完成后压缩包就没用了：留着会在临时目录里留下几十兆
+            # 的垃圾文件。删不掉也不影响后续流程。
+            try:
+                archive.unlink()
+            except OSError:
+                logger.warning("删除更新包失败：%s", archive)
+        if dialog is not None:
+            dialog.accept()
+
+    def _on_update_download_failed(self, message: str, source: object = None) -> None:
+        """下载失败：记录原因并关闭进度弹窗。"""
+        if self._closing:
+            return
+        if source is not None and source is not self._update_download_client:
+            # 过期客户端迟到的失败通知，不能算作当前下载的失败。
+            return
+        self._update_error_message = message
+        self._update_state = "failed"
+        dialog = self._update_progress_dialog
+        if dialog is not None:
+            dialog.reject()
+
+    def _cancel_update_download(self) -> None:
+        """用户取消下载。"""
+        client = self._update_download_client
+        if client is not None:
+            client.abort()
+        self._update_state = "cancelled"
+
+    def _staging_directory(self) -> Path:
+        """本次更新的暂存目录。"""
+        workspace = self._update_workspace
+        if workspace is None:
+            workspace = auto_update.create_workspace()
+            self._update_workspace = workspace
+        staging = workspace / "stage"
+        staging.mkdir(parents=True, exist_ok=True)
+        return staging
+
+    def _apply_downloaded_update(self, version: str) -> None:
+        """询问是否立即重启以完成替换。"""
+        if self._closing or self._update_staging is None:
+            return
+        if self._active_modal is not None:
+            QTimer.singleShot(100, lambda: self._apply_downloaded_update(version))
+            return
+
+        confirm = ConfirmDialog(
+            "更新已下载",
+            f"新版本 {version} 已下载完成，需要重启客户端完成替换。现在重启吗？",
+            confirm_text="立即重启",
+            cancel_text="稍后",
+            seal_text="更",
+            parent=self._overlay_host(),
+        )
+        self._active_modal = confirm
+        self._modal_dialog_open = True
+        try:
+            confirm.exec()
+        finally:
+            self._modal_dialog_open = False
+            self._active_modal = None
+            confirm.deleteLater()
+            QTimer.singleShot(0, self._flush_pending_result_dialog)
+
+        if not confirm.confirm_requested:
+            self._show_notice(
+                "已取消更新",
+                "新版本未安装，可稍后再次检查更新重新下载。",
+            )
+            auto_update.cleanup_workspace(self._update_workspace)
+            self._update_workspace = None
+            self._update_staging = None
+            self._update_state = "idle"
+            return
+        self._launch_update_and_exit(version)
+
+    def _launch_update_and_exit(self, version: str) -> None:
+        """启动替换脚本，然后退出客户端。"""
+        staging = self._update_staging
+        if staging is None:
+            self._show_notice("更新失败", "更新包已丢失，请重新下载。")
+            return
+        try:
+            plan = auto_update.prepare_update(staging, self._update_workspace)
+            auto_update.launch_helper(plan)
+        except auto_update.UpdateError as exc:
+            self._show_notice("更新失败", str(exc))
+            return
+        except OSError:
+            self._show_notice("更新失败", "无法启动更新程序，请检查权限。")
+            return
+
+        logger.info("更新包已就绪，正在替换并重启：version=%s", version)
+        self._show_transient_notice("正在替换文件并重启客户端…")
+        # 替换脚本会等待本进程退出后再动文件，因此必须先退出。
+        QTimer.singleShot(1200, self.close)
 
     @staticmethod
     def _safe_release_url(url: str) -> str:
@@ -1951,12 +2215,6 @@ class MainWindow(QMainWindow):
         if not parsed.path().startswith("/ckm6666/Gomoku/releases"):
             return GITHUB_RELEASES_PAGE_URL
         return candidate
-
-    @staticmethod
-    def _windows_asset_name(release: ReleaseInfo) -> str:
-        """取发布里的 Windows 客户端压缩包文件名。"""
-        asset = select_windows_asset(release)
-        return asset.name if asset is not None else ""
 
     def _open_release_page(self, url: str) -> None:
         """用系统默认浏览器打开 GitHub 发布页。"""
@@ -2137,6 +2395,13 @@ class MainWindow(QMainWindow):
             self._update_client.abort()
         except RuntimeError:
             pass
+        # 同理，正在下载的更新包也要中止，避免进程退出时留下半个文件。
+        download_client = self._update_download_client
+        if download_client is not None:
+            try:
+                download_client.abort()
+            except RuntimeError:
+                pass
         if self._online_panel is not None:
             try:
                 self._online_panel.shutdown()

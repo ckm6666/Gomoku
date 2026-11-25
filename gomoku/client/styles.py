@@ -916,6 +916,28 @@ QLabel#updateAsset {
     background: transparent;
 }
 
+/* 更新下载进度弹窗。 */
+QWidget#updateProgressDialog {
+    background: transparent;
+}
+
+QProgressBar#updateProgressBar {
+    background-color: #E7DECF;
+    border: none;
+    border-radius: 3px;
+}
+
+QProgressBar#updateProgressBar::chunk {
+    background-color: #B8934E;
+    border-radius: 3px;
+}
+
+QLabel#updateProgressText {
+    color: #4C463C;
+    font-size: 12px;
+    background: transparent;
+}
+
 /* ------------------------------ 残局与棋谱 ------------------------------ */
 QWidget#puzzleScrollBody,
 QScrollArea#puzzleScroll,
