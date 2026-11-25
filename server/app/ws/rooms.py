@@ -1554,6 +1554,9 @@ class RoomManager:
                 "move_no": room.game.move_count,
                 "status": room.status,
                 "rule_mode": room.rule_mode.value,
+                # 观战人数：让广场上的人知道"这场有人看"，
+                # 才可能进来看同观频道。
+                "spectator_count": len(room.spectators),
             }
             for room in self._rooms_by_code.values()
             if room.status == "playing" and room.allow_spectators
@@ -2230,6 +2233,70 @@ class RoomManager:
             )
             await self._send_all(
                 [(other, message) for other in room.connections.values()]
+            )
+
+    async def send_spectator_chat(
+        self,
+        conn: ClientConnection,
+        kind: str,
+        content: str,
+        request_id: Optional[str] = None,
+    ) -> None:
+        """处理同观频道的一条发言：只发给同一房间的观战者。
+
+        与玩家聊天刻意分开成一条独立的频道：观战席是观众自己的
+        角落，棋手既收不到、也看不到这里的任何内容。
+
+        频道不落库，房间一关就没了——它是"此刻"的陪伴而不是留言簿，
+        所以这里既不建表也不写数据库。
+        """
+        if not self._is_current_connection(conn):
+            return
+
+        room = self._spectator_by_user.get(conn.user_id)
+        # 连接可能已经换过（重连后旧连接不再有效），两种情况都视为
+        # 不在观战席。
+        if room is None or room.spectators.get(conn.user_id) is not conn:
+            await self._send_error(conn, "你不在观战席中", request_id)
+            return
+
+        if room.rated:
+            # 排位赛不开观战席交流：观战者能实时看到棋盘，场外传话
+            # 会绕过现有的举报与回放审计，段位就不可信了。
+            await self._send_error(
+                conn, "排位对局不支持观战席聊天", request_id
+            )
+            return
+
+        try:
+            normalized = normalize_chat_content(kind, content)
+        except ProtocolError as exc:
+            await self._send_error(conn, str(exc), request_id)
+            return
+
+        # 与玩家聊天共用房间的发言锁：它只用来串行化广播顺序，
+        # 两种频道各限各的流，互不消耗对方的额度。
+        async with room.chat_lock:
+            now = time.monotonic()
+            times = [
+                stamp
+                for stamp in room.spectator_chat_sent_times.get(
+                    conn.user_id, []
+                )
+                if now - stamp < CHAT_WINDOW_SECONDS
+            ]
+            if len(times) >= CHAT_BURST:
+                await self._send_error(conn, "发言太快，请稍候", request_id)
+                return
+            times.append(now)
+            room.spectator_chat_sent_times[conn.user_id] = times
+
+            message = payloads.spectator_chat_message(
+                conn, kind, normalized, _now_ms()
+            )
+            # 只发给观战者。棋手永远收不到这个频道的任何内容。
+            await self._send_all(
+                [(other, message) for other in room.spectators.values()]
             )
 
     # ------------------------------------------------------------------

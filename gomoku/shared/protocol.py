@@ -63,6 +63,8 @@ CLIENT_INVITE_TO_ROOM = "invite_to_room"
 CLIENT_RESPOND_ROOM_INVITE = "respond_room_invite"
 # 观战：旁观者以对局编号进入别人正在进行的一局，只接收权威快照。
 CLIENT_WATCH_GAME = "watch_game"
+# 同观：观战者之间的小频道，只在观战席内部广播，棋手永远收不到。
+CLIENT_SPECTATOR_CHAT = "spectator_chat"
 
 # 服务端 → 客户端
 SERVER_AUTHENTICATED = "authenticated"
@@ -84,6 +86,8 @@ SERVER_FRIEND_EVENT = "friend_event"
 SERVER_DIRECT_MESSAGE = "direct_message"
 # 进行中的对局列表发生变化（有人开局或终局），客户端据此刷新对战广场。
 SERVER_LIVE_GAMES_CHANGED = "live_games_changed"
+# 同观频道的一条消息，只发给同一房间的观战者。
+SERVER_SPECTATOR_CHAT = "spectator_chat_message"
 
 _ALLOWED_MESSAGE_TYPES = {
     CLIENT_AUTH,
@@ -102,6 +106,7 @@ _ALLOWED_MESSAGE_TYPES = {
     CLIENT_INVITE_TO_ROOM,
     CLIENT_RESPOND_ROOM_INVITE,
     CLIENT_WATCH_GAME,
+    CLIENT_SPECTATOR_CHAT,
     SERVER_AUTHENTICATED,
     SERVER_ROOM_CREATED,
     SERVER_GAME_STATE,
@@ -120,6 +125,7 @@ _ALLOWED_MESSAGE_TYPES = {
     SERVER_FRIEND_EVENT,
     SERVER_DIRECT_MESSAGE,
     SERVER_LIVE_GAMES_CHANGED,
+    SERVER_SPECTATOR_CHAT,
 }
 
 # 服务端 → 客户端的消息类型集合。
@@ -147,6 +153,7 @@ SERVER_MESSAGE_TYPES = frozenset(
         SERVER_FRIEND_EVENT,
         SERVER_DIRECT_MESSAGE,
         SERVER_LIVE_GAMES_CHANGED,
+        SERVER_SPECTATOR_CHAT,
     }
 )
 
@@ -927,6 +934,7 @@ __all__ = [
     "CLIENT_INVITE_TO_ROOM",
     "CLIENT_RESPOND_ROOM_INVITE",
     "CLIENT_WATCH_GAME",
+    "CLIENT_SPECTATOR_CHAT",
     "SERVER_AUTHENTICATED",
     "SERVER_ROOM_CREATED",
     "SERVER_GAME_STATE",
@@ -945,6 +953,7 @@ __all__ = [
     "SERVER_FRIEND_EVENT",
     "SERVER_DIRECT_MESSAGE",
     "SERVER_LIVE_GAMES_CHANGED",
+    "SERVER_SPECTATOR_CHAT",
     "SERVER_MESSAGE_TYPES",
     "GameSnapshot",
     "rule_mode_from_payload",

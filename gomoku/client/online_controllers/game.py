@@ -84,6 +84,15 @@ class GameController(PanelController):
     def on_chat_failed(self, reason: str) -> None:
         self.chat.on_chat_failed(reason)
 
+    def on_spectator_chat_received(self, message: ChatMessage) -> None:
+        self.chat.on_spectator_chat_received(message)
+
+    def on_spectator_chat_failed(self, reason: str) -> None:
+        self.chat.on_spectator_chat_failed(reason)
+
+    def apply_spectator_chat_mode(self, available: bool) -> None:
+        self.chat.apply_spectator_chat_mode(available)
+
     def flash_chat_hint(self, text: str) -> None:
         self.chat.flash_chat_hint(text)
 

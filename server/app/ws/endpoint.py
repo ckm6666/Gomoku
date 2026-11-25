@@ -36,6 +36,7 @@ from gomoku.shared.protocol import (
     CLIENT_REMATCH,
     CLIENT_RESPOND_ROOM_INVITE,
     CLIENT_RESIGN,
+    CLIENT_SPECTATOR_CHAT,
     CLIENT_LEAVE_ROOM,
     CLIENT_UNDO_REQUEST,
     CLIENT_UNDO_RESPONSE,
@@ -565,6 +566,26 @@ async def game_websocket(websocket: WebSocket) -> None:
                         # 白名单、长度、限流与规范化都在 RoomManager 内完成，
                         # 网关只负责挡下非字符串的畸形负载。
                         await room_manager.send_chat(
+                            conn, kind, content, request_id
+                        )
+                elif message_type == CLIENT_SPECTATOR_CHAT:
+                    kind = payload.get("kind")
+                    content = payload.get("content")
+                    if (
+                        not isinstance(kind, str)
+                        or not isinstance(content, str)
+                    ):
+                        await conn.send(
+                            make_message(
+                                SERVER_ERROR,
+                                {"reason": "聊天消息格式非法"},
+                                request_id=request_id,
+                            )
+                        )
+                    else:
+                        # 同观频道的校验与广播同样在 RoomManager 内完成，
+                        # 网关只挡下非字符串的畸形负载。
+                        await room_manager.send_spectator_chat(
                             conn, kind, content, request_id
                         )
                 elif message_type == CLIENT_INVITE_TO_ROOM:

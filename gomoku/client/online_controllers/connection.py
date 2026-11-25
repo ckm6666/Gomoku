@@ -49,6 +49,12 @@ class ConnectionController(PanelController):
         session.matched.connect(self.panel._on_match_found)
         session.chat_received.connect(self.panel._on_chat_received)
         session.chat_failed.connect(self.panel._on_chat_failed)
+        session.spectator_chat_received.connect(
+            self.panel._on_spectator_chat_received
+        )
+        session.spectator_chat_failed.connect(
+            self.panel._on_spectator_chat_failed
+        )
         session.room_invited.connect(self.panel._on_room_invited)
         session.room_invite_result.connect(self.panel._on_room_invite_result)
         session.friend_event.connect(self.panel._on_friend_event)

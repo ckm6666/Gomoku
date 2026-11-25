@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from typing import Any, Optional
+
 from PySide6.QtCore import QTimer
 
 from gomoku.client.online_controllers.common import (
@@ -18,6 +20,14 @@ from gomoku.shared.chat import CHAT_KIND_EMOJI, CHAT_KIND_TEXT, ChatMessage
 
 class GameChatController(PanelController):
     """对局页聊天的发送、接收、日志与输入控件管理。"""
+
+    def __init__(self, panel: Any) -> None:
+        super().__init__(panel)
+        # 是否处于"观友模式"：复用同一套聊天控件，但语义变成观战席
+        # 之间的悄悄话——只来自观众，棋手看不到，也不飞弹幕挡住棋盘。
+        self._spectator_mode = False
+        # 进入观友模式前的日志展开状态，离开观战席后还原。
+        self._log_expanded_before_spectator: Optional[bool] = None
 
     def log_game_notice(self, text: str) -> None:
         """把一条对局内的提示写进对话日志，方便回看失败原因。"""
@@ -49,9 +59,72 @@ class GameChatController(PanelController):
         self.panel.chat_log.append_message(message, is_self)
 
     def on_emoji_picked(self, emoji: str) -> None:
-        """发送用户选中的预设表情。"""
+        """发送用户选中的预设表情。
+
+        观战者发到同观频道，其他人对局玩家聊天。
+        """
         if self.panel._session is not None:
-            self.panel._session.send_emoji(emoji)
+            self._send_from_widgets(CHAT_KIND_EMOJI, emoji)
+
+    # ------------------------------------------------------------------
+    # 同观频道：观战者之间的小角落
+    # ------------------------------------------------------------------
+    def apply_spectator_chat_mode(self, available: bool) -> None:
+        """切换聊天控件到"观友模式"。
+
+        观友模式复用同一套控件，但语义完全不同：消息只来自观战席，
+        棋手既收不到也看不到。这里同时把留言区默认展开——
+        默认收起的日志会让观友消息彻底看不见。
+        """
+        available = bool(available)
+        if available and not self._spectator_mode:
+            # 记下玩家原本的展开状态，离开观战席后还原。
+            self._log_expanded_before_spectator = self.panel._chat_log_expanded
+        self._spectator_mode = available
+        if available:
+            self.panel._apply_chat_log_visibility(True)
+            self.panel._set_chat_visibility(True)
+        else:
+            self.panel._set_chat_visibility(False)
+            if self._log_expanded_before_spectator is not None:
+                self.panel._apply_chat_log_visibility(
+                    self._log_expanded_before_spectator
+                )
+                self._log_expanded_before_spectator = None
+
+    def on_spectator_chat_received(self, message: ChatMessage) -> None:
+        """收到同观频道的一条消息：只写进观友留言区。
+
+        刻意不飞弹幕：观战者正在看棋盘，浮字会挡住他要看的棋局。
+        """
+        if self.panel.sender() is not self.panel._session or self.panel._closing:
+            return
+        session = self.panel._session
+        if session is None or not session.is_spectator:
+            return
+        is_self = message.sender_id == session.user_id
+        self.panel.chat_log.append_message(message, is_self)
+
+    def on_spectator_chat_failed(self, reason: str) -> None:
+        """观战席发言失败：提示在观友留言区，不打断观战。"""
+        if self.panel.sender() is not self.panel._session or self.panel._closing:
+            return
+        text = reason or "发言未发送"
+        self.panel.chat_log.append_notice(f"（{text}）")
+        if not self.panel._chat_log_expanded:
+            self.panel._flash_chat_hint(text)
+
+    def _send_from_widgets(self, kind: str, content: str) -> bool:
+        """按当前身份把一条发言送到对应对的通道。
+
+        观战者走同观频道，其他人对局玩家聊天。
+        """
+        session = self.panel._session
+        if session is None:
+            return False
+        if session.is_spectator:
+            return session.send_spectator_chat(kind, content)
+        return session.send_chat(kind, content)
 
     def on_chat_failed(self, reason: str) -> None:
         """发言失败：提示在聊天区域，不打断对局。
@@ -102,6 +175,15 @@ class GameChatController(PanelController):
             if expanded
             else "展开对话日志，查看双方的发言"
         )
+        if self._spectator_mode:
+            # 观友模式下这块面板不是"对局发言记录"，而是观战席上的
+            # 悄悄话，语义不同，措辞也要跟着变。
+            button.setText("隐藏观友" if expanded else "观友留言")
+            button.setToolTip(
+                "收起观友留言"
+                if expanded
+                else "展开观友留言，看观战席上的悄悄话"
+            )
 
     def load_chat_log_visible(self) -> bool:
         """读取上次的对话日志展开状态；没有记录时默认收起。"""
@@ -124,7 +206,7 @@ class GameChatController(PanelController):
     def on_preset_comment_picked(self, text: str) -> None:
         """发送用户选中的预设评论。"""
         if self.panel._session is not None:
-            self.panel._session.send_comment(text)
+            self._send_from_widgets(CHAT_KIND_TEXT, text)
 
     def on_send_comment(self) -> None:
         """发送手动输入的评论；发送成功后清空输入框。"""
@@ -133,7 +215,7 @@ class GameChatController(PanelController):
         text = self.panel.chat_input.text().strip()
         if not text:
             return
-        if self.panel._session.send_comment(text):
+        if self._send_from_widgets(CHAT_KIND_TEXT, text):
             self.panel.chat_input.clear()
 
     def refresh_chat_controls(self) -> None:
@@ -147,13 +229,20 @@ class GameChatController(PanelController):
         if chat_input is None:
             return
         session = self.panel._session
-        enabled = (
-            session is not None
-            and self.panel._ws_connected
-            and session.chat_available
-            # 观战者不发言。
-            and not session.is_spectator
-        )
+        if session is not None and session.is_spectator:
+            # 观战者只发同观频道：段位赛不开放，自建房与休闲局开放。
+            enabled = (
+                self.panel._ws_connected
+                and session.spectator_chat_available
+            )
+        else:
+            enabled = (
+                session is not None
+                and self.panel._ws_connected
+                and session.chat_available
+                # 观战者不发言。
+                and not session.is_spectator
+            )
         chat_input.setEnabled(enabled)
         self.panel.chat_send_button.setEnabled(enabled)
         self.panel.emoji_button.set_emoji_enabled(enabled)

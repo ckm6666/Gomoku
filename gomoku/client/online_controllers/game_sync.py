@@ -75,7 +75,9 @@ class GameSyncController(PanelController):
             # 快照里没有执子颜色同样说明这是旁观者视角。
             self.panel._sync_spectator_page(snapshot)
             return
-        # 玩家视角：聊天控件重新可见（观战时是被隐藏的）。
+        # 玩家视角：聊天控件重新可见（观战时是被隐藏的），
+        # 同时退出观友模式，免得沿用观战席的措辞。
+        self.panel._apply_spectator_chat_mode(False)
         self.panel._set_chat_visibility(True)
         waiting = session.waiting_for_opponent
         rated = session.rated or (
@@ -566,8 +568,13 @@ class GameSyncController(PanelController):
         )
         self.panel.leave_button.setText("退出观战")
         self.panel.leave_button.setEnabled(self.panel._ws_connected)
-        # 旁观者不发言，也看不到双方的聊天。
-        self.panel._set_chat_visibility(False)
+        # 旁观者不参与对局内的聊天，也看不到双方的发言；
+        # 但自建房与休闲局的观战席之间有自己的小频道。
+        self.panel._apply_spectator_chat_mode(
+            session.spectator_chat_available
+            if session is not None
+            else False
+        )
 
     def update_achievement_notice(
         self, snapshot: Optional[GameSnapshot]
