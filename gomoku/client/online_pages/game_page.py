@@ -223,6 +223,13 @@ def build_game_page(panel: Any) -> QWidget:
         "对局结束后可提交举报，管理员会结合回放审计处理"
     )
     panel.report_button.setVisible(False)
+    panel.colophon_button = QPushButton("拓片", page)
+    panel.colophon_button.setObjectName("undoButton")
+    panel.colophon_button.setToolTip(
+        "为这一局刻一张题跋拓片，存进自己的拓片册"
+    )
+    # 只有终局后才出现：对局中的局面随时会变，拓片没有意义。
+    panel.colophon_button.setVisible(False)
     panel.leave_button = QPushButton("离开房间", page)
     panel.leave_button.setObjectName("undoButton")
     for button in (
@@ -232,6 +239,7 @@ def build_game_page(panel: Any) -> QWidget:
         panel.resign_button,
         panel.rematch_button,
         panel.report_button,
+        panel.colophon_button,
         panel.leave_button,
     ):
         button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -245,6 +253,7 @@ def build_game_page(panel: Any) -> QWidget:
     panel.resign_button.clicked.connect(panel._on_resign)
     panel.rematch_button.clicked.connect(panel._on_rematch)
     panel.report_button.clicked.connect(panel._on_report_clicked)
+    panel.colophon_button.clicked.connect(panel._on_colophon_clicked)
     panel.leave_button.clicked.connect(panel._on_leave_room)
     panel.invite_friend_button.clicked.connect(
         panel._on_invite_friend_clicked

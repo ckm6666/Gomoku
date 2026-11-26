@@ -226,6 +226,10 @@ ONLINE_BACKDROP_SPEC = BackdropSpec(
 _pixmap_cache: dict[str, QPixmap] = {}
 _texture_cache: dict[float, QPixmap] = {}
 _seal_cache: dict[tuple[str, int, str, float], QPixmap] = {}
+_title_seal_cache: dict[tuple[str, int, float], QPixmap] = {}
+#: 题名印缓存的上限。题名由玩家自由填写，取值没有上限，缓存不能跟着
+#: 册子一起长。
+_TITLE_SEAL_CACHE_LIMIT: int = 256
 _divider_cache: dict[tuple[int, int, float], QPixmap] = {}
 _sound_icon_cache: dict[tuple[bool, int, float], QPixmap] = {}
 _font_icon_cache: dict[tuple[int, float], QPixmap] = {}
@@ -427,6 +431,109 @@ def make_seal_pixmap(
 
     painter.end()
     _seal_cache[key] = pixmap
+    return pixmap
+
+
+def _title_seal_positions(count: int, rect: QRectF) -> list[tuple[float, float]]:
+    """计算题名印里每个字的中心坐标。
+
+    排布沿用传统方印的读序：单字居中；两字上下排列；三字右列两字、
+    左列一字居中；四字右列先读、左列后读。
+    """
+    center = rect.center()
+    if count <= 1:
+        return [(center.x(), center.y())]
+    if count == 2:
+        return [
+            (center.x(), rect.top() + rect.height() * 0.28),
+            (center.x(), rect.top() + rect.height() * 0.72),
+        ]
+    if count == 3:
+        return [
+            (rect.left() + rect.width() * 0.72, rect.top() + rect.height() * 0.28),
+            (rect.left() + rect.width() * 0.72, rect.top() + rect.height() * 0.72),
+            (rect.left() + rect.width() * 0.28, center.y()),
+        ]
+    return [
+        (rect.left() + rect.width() * 0.72, rect.top() + rect.height() * 0.28),
+        (rect.left() + rect.width() * 0.72, rect.top() + rect.height() * 0.72),
+        (rect.left() + rect.width() * 0.28, rect.top() + rect.height() * 0.28),
+        (rect.left() + rect.width() * 0.28, rect.top() + rect.height() * 0.72),
+    ]
+
+
+def make_title_seal(
+    text: str,
+    size: int,
+    *,
+    dpr: float = 1.0,
+) -> QPixmap:
+    """生成题名用的朱砂方印（支持 1~4 字，按传统读序排布）。
+
+    与 :func:`make_seal_pixmap` 的区别是后者只放一个字（头像用的单字
+    纹样），题名往往是两到四个字，需要按方印的读序排进印面。
+    """
+    chars = [char for char in text if char.strip()][:4]
+    key = ("".join(chars), size, round(max(1.0, dpr), 2))
+    cached = _title_seal_cache.get(key)
+    if cached is not None:
+        return cached
+
+    # 题名是玩家自己写的，取值没有上限：缓存不能跟着册子一起长。
+    # 一次册子最多几百幅，缓存里留不住那么多张位图，超了就整份清空
+    # ——重新画一张印远比维护一套 LRU 便宜。
+    if len(_title_seal_cache) >= _TITLE_SEAL_CACHE_LIMIT:
+        _title_seal_cache.clear()
+
+    pixmap = QPixmap(round(size * dpr), round(size * dpr))
+    pixmap.setDevicePixelRatio(dpr)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+
+    rect = QRectF(0.8, 0.8, size - 1.6, size - 1.6)
+    radius = max(1.5, size * 0.10)
+    painter.setPen(QPen(QColor(CINNABAR_DARK), max(0.8, size * 0.025)))
+    painter.setBrush(QColor(CINNABAR))
+    painter.drawRoundedRect(rect, radius, radius)
+
+    inner = rect.adjusted(size * 0.09, size * 0.09, -size * 0.09, -size * 0.09)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.setPen(QPen(QColor(PAPER_LIGHT), max(0.7, size * 0.022)))
+    painter.drawRect(inner)
+
+    if chars:
+        # 单字大、两字次之、四字最小；排得下且不挤。
+        ratio = {1: 0.56, 2: 0.36, 3: 0.30}.get(len(chars), 0.30)
+        font = QFont(DISPLAY_FONT_FAMILY)
+        font.setPixelSize(max(8, int(size * ratio)))
+        font.setWeight(QFont.Weight.Normal)
+        painter.setFont(font)
+        painter.setPen(QColor(PAPER_LIGHT))
+        positions = _title_seal_positions(len(chars), inner)
+        for char, (x, y) in zip(chars, positions):
+            painter.drawText(
+                QRectF(x - size / 2.0, y - size / 2.0, size, size),
+                int(Qt.AlignmentFlag.AlignCenter),
+                char,
+            )
+
+    # 做旧斑点：与头像印章同一套质感，避免两种印看起来不像一家人。
+    rng = random.Random(0x5EA1 + size + len(text))
+    painter.setPen(Qt.PenStyle.NoPen)
+    for _ in range(max(6, size // 5)):
+        x = rng.uniform(2.0, size - 2.0)
+        y = rng.uniform(2.0, size - 2.0)
+        if rng.random() < 0.55:
+            painter.setBrush(_c(CINNABAR_DARK, rng.randint(18, 45)))
+        else:
+            painter.setBrush(_c(PAPER_LIGHT, rng.randint(12, 30)))
+        radius = rng.uniform(0.4, 1.1)
+        painter.drawEllipse(QPointF(x, y), radius, radius)
+
+    painter.end()
+    _title_seal_cache[key] = pixmap
     return pixmap
 
 
@@ -1215,6 +1322,7 @@ __all__ = [
     "make_font_icon",
     "make_ink_divider",
     "make_seal_pixmap",
+    "make_title_seal",
     "make_sound_icon",
     "paint_corner_ornament",
     "paper_texture_tile",

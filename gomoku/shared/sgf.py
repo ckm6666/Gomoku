@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import timezone
-from typing import Optional
+from typing import Any, Optional, Sequence
 
 from gomoku.shared.game_model import GameModel
 from gomoku.shared.record import NON_BOARD_ENDINGS, GameRecord, RecordError
@@ -68,6 +68,8 @@ def record_to_sgf(record: GameRecord) -> str:
     """把一局棋谱序列化为 SGF 文本。
 
     规则模式写入标准 ``RU`` 属性：``RU[freestyle]`` 或 ``RU[renju]``。
+    棋谱 ``metadata`` 里的 ``colophon`` 写成根节点的 ``C[]`` 注释，
+    这样题跋能随棋谱一起流转，别的 SGF 软件也能看到。
     """
     if record.mode not in {"local", "ai", "puzzle", "online"}:
         raise SgfError("棋谱模式非法")
@@ -85,11 +87,33 @@ def record_to_sgf(record: GameRecord) -> str:
         f"RE[{_result_property(record)}]"
         f"RU[{rule_mode}]"
     )
+    # 题跋写成根节点的 C[] 注释。别的 SGF 软件会把这段显示成注释，
+    # 题跋因此能跟着棋谱一起流转。
+    colophon = str(record.metadata.get("colophon", "")).strip()
+    if colophon:
+        root += f"C[{_escape(colophon)}]"
     moves = []
     for move in record.moves:
         color = "B" if move.player is Player.BLACK else "W"
         moves.append(f";{color}[{_coord(move.row, move.col)}]")
     return root + "".join(moves) + ")\n"
+
+
+def sgf_collection(games: Sequence[str]) -> str:
+    """把多局 SGF 文本合成一个 SGF 集。
+
+    SGF 集就是一串 ``(;...)`` 游戏；本函数只负责把已经生成好的单局
+    文本拼起来，不解析内容。
+    """
+    parts: list[str] = []
+    for game in games:
+        text = game.strip()
+        if not text:
+            continue
+        parts.append(text)
+    if not parts:
+        return ""
+    return "\n".join(parts) + "\n"
 
 
 def _parse_date(value: str) -> str:
@@ -163,11 +187,17 @@ def _skip_variation(text: str, start: int) -> int:
     raise SgfError("SGF 括号不匹配")
 
 
-def _parse_main_variation(text: str) -> list[tuple[str, tuple[str, ...]]]:
-    """按 SGF 语法解析主变化上的全部属性，返回 (键, 取值列表) 列表。
+def _parse_main_variation(
+    text: str,
+) -> list[list[tuple[str, tuple[str, ...]]]]:
+    """按 SGF 语法解析主变化，返回每个节点的属性列表。
 
     只跟随每个节点的第一个后继节点：``(`` 打开的子变化整棵跳过；注释
     （``C[...]``）里的 ``;B[aa]`` 只是普通属性值，不会被当成落子。
+
+    按节点分组是必要的：根节点的 ``C[]`` 是题跋，而落在某一手上的
+    ``C[]`` 只是那一步的普通注释。混在一起会把别家 SGF 软件的随手
+    备注当成玩家写的题跋。
     """
     index = 0
     length = len(text)
@@ -177,7 +207,7 @@ def _parse_main_variation(text: str) -> list[tuple[str, tuple[str, ...]]]:
         raise SgfError("不是有效的 SGF 文本")
     index += 1
 
-    properties: list[tuple[str, tuple[str, ...]]] = []
+    nodes: list[list[tuple[str, tuple[str, ...]]]] = []
     while True:
         while index < length and text[index].isspace():
             index += 1
@@ -185,11 +215,13 @@ def _parse_main_variation(text: str) -> list[tuple[str, tuple[str, ...]]]:
             raise SgfError("SGF 文本意外结束")
         char = text[index]
         if char == ")":
-            return properties
+            return nodes
         if char != ";":
             raise SgfError("SGF 语法错误：节点应以 ';' 开头")
         index += 1
 
+        node: list[tuple[str, tuple[str, ...]]] = []
+        nodes.append(node)
         while True:
             while index < length and text[index].isspace():
                 index += 1
@@ -209,9 +241,9 @@ def _parse_main_variation(text: str) -> list[tuple[str, tuple[str, ...]]]:
             if not key:
                 raise SgfError("SGF 语法错误：缺少属性标识符")
             raw_values, index = _read_prop_values(text, index, key)
-            properties.append((key, raw_values))
+            node.append((key, raw_values))
 
-    return properties
+    return nodes
 
 
 def _read_prop_values(
@@ -242,27 +274,37 @@ def _read_prop_values(
 
 
 def _parse_moves(
-    properties: list[tuple[str, tuple[str, ...]]]
+    nodes: list[list[tuple[str, tuple[str, ...]]]]
 ) -> list[Move]:
-    """从主变化的属性列表里取出落子序列。"""
+    """从主变化的各节点属性里取出落子序列。"""
     moves: list[Move] = []
-    for key, values in properties:
-        if key not in ("B", "W") or not values:
-            continue
-        coord = values[0].strip().lower()
-        if len(coord) != 2 or not coord.isascii() or not coord.isalpha():
-            raise SgfError(f"落子坐标非法：{values[0]}")
-        col = _SGF_LETTERS.find(coord[0])
-        row = _SGF_LETTERS.find(coord[1])
-        if col < 0 or row < 0 or col >= BOARD_SIZE or row >= BOARD_SIZE:
-            raise SgfError("落子坐标超出棋盘")
-        moves.append(
-            Move(
-                row=row,
-                col=col,
-                player=Player.BLACK if key == "B" else Player.WHITE,
+    for node in nodes:
+        for key, values in node:
+            if key not in ("B", "W") or not values:
+                continue
+            coord = values[0].strip().lower()
+            if (
+                len(coord) != 2
+                or not coord.isascii()
+                or not coord.isalpha()
+            ):
+                raise SgfError(f"落子坐标非法：{values[0]}")
+            col = _SGF_LETTERS.find(coord[0])
+            row = _SGF_LETTERS.find(coord[1])
+            if (
+                col < 0
+                or row < 0
+                or col >= BOARD_SIZE
+                or row >= BOARD_SIZE
+            ):
+                raise SgfError("落子坐标超出棋盘")
+            moves.append(
+                Move(
+                    row=row,
+                    col=col,
+                    player=Player.BLACK if key == "B" else Player.WHITE,
+                )
             )
-        )
     return moves
 
 
@@ -271,13 +313,24 @@ def record_from_sgf(text: str) -> GameRecord:
     if not isinstance(text, str) or "(" not in text or ";" not in text:
         raise SgfError("不是有效的 SGF 文本")
 
-    raw_properties = _parse_main_variation(text)
+    nodes = _parse_main_variation(text)
 
     properties: dict[str, str] = {}
-    for key, raw_values in raw_properties:
-        if key in {"B", "W"} or not raw_values:
-            continue
-        properties.setdefault(key, _unescape(raw_values[0]))
+    for node in nodes:
+        for key, raw_values in node:
+            if key in {"B", "W"} or not raw_values:
+                continue
+            properties.setdefault(key, _unescape(raw_values[0]))
+
+    # 题跋只认根节点的 C[]：落在某一手上的 C[] 是那一步的普通注释，
+    # 不能当成玩家写的题跋——否则别家 SGF 软件随手写的备注会被当成
+    # 题跋存进册子，再导出时又被搬到根节点上。
+    root_colophon = ""
+    if nodes:
+        for key, raw_values in nodes[0]:
+            if key == "C" and raw_values:
+                root_colophon = _unescape(raw_values[0]).strip()
+                break
 
     size_text = properties.get("SZ", str(BOARD_SIZE))
     try:
@@ -287,7 +340,7 @@ def record_from_sgf(text: str) -> GameRecord:
     if size != BOARD_SIZE:
         raise SgfError(f"只支持 {BOARD_SIZE} 路棋盘")
 
-    moves = _parse_moves(raw_properties)
+    moves = _parse_moves(nodes)
 
     # 规则模式是可选的 RU 属性；缺省按自由规则处理。未知取值说明文件
     # 使用了本程序不支持的规则，必须明确拒绝而不是猜测。
@@ -324,6 +377,11 @@ def record_from_sgf(text: str) -> GameRecord:
             "F": "escape",
         }.get(suffix, "resign")
 
+    metadata: dict[str, Any] = {"source": "sgf"}
+    # 根节点的 C[] 注释是题跋：导入时保留下来，题跋才能跟着棋谱走。
+    if root_colophon:
+        metadata["colophon"] = root_colophon
+
     data = {
         "record_id": uuid.uuid4().hex,
         "created_at": _parse_date(properties.get("DT", "")),
@@ -342,7 +400,7 @@ def record_from_sgf(text: str) -> GameRecord:
         "white_name": properties.get("PW", "白方") or "白方",
         "rated": False,
         "rule_mode": rule_mode,
-        "metadata": {"source": "sgf"},
+        "metadata": metadata,
     }
     try:
         return GameRecord.from_dict(data)
@@ -350,4 +408,10 @@ def record_from_sgf(text: str) -> GameRecord:
         raise SgfError(f"棋谱校验失败：{exc}") from exc
 
 
-__all__ = ["DEFAULT_CREATED_AT", "SgfError", "record_from_sgf", "record_to_sgf"]
+__all__ = [
+    "DEFAULT_CREATED_AT",
+    "SgfError",
+    "record_from_sgf",
+    "record_to_sgf",
+    "sgf_collection",
+]
