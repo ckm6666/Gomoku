@@ -122,9 +122,20 @@ class ModalOverlay(QWidget):
         self._default_action: Optional[Callable[[], None]] = None
 
         self.setObjectName(object_name)
-        # 遮罩必须自己画满整块区域：不透明绘制事件保证底层像素不会被
-        # 背景擦除，半透明墨色叠加后正好把棋盘压暗。
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        # 遮罩是半透明墨色，必须让宿主的内容透出来。
+        #
+        # 这里刻意**不**设 WA_OpaquePaintEvent。那个属性的语义是"我保证
+        # 画满每一像素，Qt 不用重画我下面的东西"——遮罩恰恰做不到：它只
+        # 画一层半透明墨色。带着这个属性时，遮罩每次重绘都不会让宿主
+        # 重画，于是新的墨色直接叠在上一层的墨色上：点几下弹窗，背景就
+        # 越点越黑。
+        #
+        # 改成半透明背景，Qt 才会把宿主一起重画，遮罩永远叠在新鲜的宿主
+        # 像素上，亮度不会累积。
+        self.setAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground, True
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setAutoFillBackground(False)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 

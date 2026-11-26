@@ -117,6 +117,8 @@ class OnlinePanel(InkBackdrop):
     back_requested = Signal()
     #: 请求复盘某局棋谱；参数为棋谱列表。
     replay_requested = Signal(object)
+    #: 联机对局请求生成拓片，携带 (棋谱, 自己的执子色, 是否五连终局)。
+    colophon_requested = Signal(object)
 
     def __init__(
         self,
@@ -297,6 +299,10 @@ class OnlinePanel(InkBackdrop):
         self._visible_paused = False
         # 隐藏期间对局结束：回到前台时补一次终局音与终局提示。
         self._pending_end_notice = False
+        # 点了「拓片」正在等服务端回这一局的棋谱：这批棋谱不是复盘要的。
+        self._pending_colophon = False
+        # 拓片要的是哪一局：复盘与拓片共用取棋谱的接口，靠它分流。
+        self._pending_colophon_game_id = ""
 
         # 对战广场的兜底刷新：服务器会推送“对局列表变了”，但推送可能
         # 在断线期间丢失，定时兜底保证列表不会一直停在前一次的结果上。
@@ -765,15 +771,39 @@ class OnlinePanel(InkBackdrop):
         self._profile_ctrl.fill_recent_games(entries, total)
 
     def _on_history_game_ready(self, data: object) -> None:
+        if self._pending_colophon and self._is_pending_colophon_data(data):
+            # 这次棋谱是拓片要来的，不是复盘要的。
+            self._pending_colophon = False
+            self._pending_colophon_game_id = ""
+            self._on_colophon_game_ready(data)
+            return
         self._profile_ctrl.on_history_game_ready(data)
+
+    def _is_pending_colophon_data(self, data: object) -> bool:
+        """判断这次回应是不是拓片要的那一局。
+
+        拓片与复盘共用同一个取棋谱的接口，两个请求可以同时在途。
+        只靠"有没有点过拓片"来分流，谁先回来谁被当成拓片——复盘会被
+        吞掉，拓片也会拿到别人的棋谱。得认准对局编号。
+        """
+        expected = self._pending_colophon_game_id
+        if not expected:
+            return True
+        if not isinstance(data, Mapping):
+            return False
+        return data.get("game_id") == expected
 
     def _open_replay(self, record: GameRecord) -> None:
         self._profile_ctrl.open_replay(record)
 
     def _on_history_failed(self, message: str) -> None:
+        self._pending_colophon = False
+        self._pending_colophon_game_id = ""
         self._profile_ctrl.on_history_failed(message)
 
     def _on_history_unauthorized(self) -> None:
+        self._pending_colophon = False
+        self._pending_colophon_game_id = ""
         self._profile_ctrl.on_history_unauthorized()
 
     def _on_history_busy_changed(self, _busy: bool) -> None:
@@ -896,6 +926,56 @@ class OnlinePanel(InkBackdrop):
 
     def _on_report_clicked(self) -> None:
         self._social_ctrl.on_report_clicked()
+
+    # ------------------------------------------------------------------
+    # 题跋拓片
+    # ------------------------------------------------------------------
+    def _on_colophon_clicked(self) -> None:
+        """点「拓片」：向服务端要这一局的完整棋谱。
+
+        快照只有终局局面，没有落子次序；拓片要能导出 SGF，就得拿到
+        服务端保存的完整棋谱。
+        """
+        session = self._session
+        if session is None or self._auth_session is None:
+            return
+        snapshot = session.snapshot
+        if snapshot is None or not snapshot.is_game_over:
+            return
+        self._pending_colophon = True
+        self._pending_colophon_game_id = snapshot.game_id
+        self._history_client.fetch_game(
+            self._auth_session.access_token, snapshot.game_id
+        )
+
+    def _on_colophon_game_ready(self, data: object) -> None:
+        """棋谱到手：生成一份拓片，交给主窗口开编辑器。"""
+        from gomoku.client.history_records import record_from_game_detail
+        from gomoku.shared.record import RecordError
+
+        if not isinstance(data, Mapping):
+            self._show_colophon_failure("这一局的棋谱取不回来了。")
+            return
+        try:
+            record = record_from_game_detail(data)
+        except (RecordError, TypeError, ValueError) as exc:
+            logger.warning("联机棋谱数据无效：%s", exc)
+            self._show_colophon_failure("这一局的棋谱无法拓片。")
+            return
+
+        your_color = None
+        session = self._session
+        if session is not None and session.snapshot is not None:
+            your_color = session.snapshot.your_color
+
+        finished_by_five = record.result_reason == "five"
+        self.colophon_requested.emit(
+            (record, your_color, finished_by_five)
+        )
+
+    def _show_colophon_failure(self, message: str) -> None:
+        """拓片取材失败时给玩家一句话。"""
+        self._set_game_error(message)
 
     def _on_report_submit(self, category: str, description: str) -> None:
         self._social_ctrl.on_report_submit(category, description)
@@ -1116,6 +1196,7 @@ class OnlinePanel(InkBackdrop):
         undo: bool,
         reject_undo: bool,
         report: bool = False,
+        colophon: bool = False,
     ) -> None:
         self._game_ctrl.set_action_visibility(
             resign,
@@ -1124,6 +1205,7 @@ class OnlinePanel(InkBackdrop):
             undo=undo,
             reject_undo=reject_undo,
             report=report,
+            colophon=colophon,
         )
 
     def _update_clock_label(self) -> None:

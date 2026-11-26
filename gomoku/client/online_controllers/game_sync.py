@@ -425,6 +425,8 @@ class GameSyncController(PanelController):
             undo=not over,
             reject_undo=reject_undo,
             report=over,
+            # 观战者没有自己的对局，拓不出"我的这一局"。
+            colophon=over and not snapshot.is_spectator,
         )
         self.panel.resign_button.setEnabled(not over and self.panel._ws_connected)
         self.panel.report_button.setEnabled(over and self.panel._ws_connected)
@@ -618,6 +620,7 @@ class GameSyncController(PanelController):
         undo: bool,
         reject_undo: bool,
         report: bool = False,
+        colophon: bool = False,
     ) -> None:
         """按对局阶段显示或隐藏操作按钮。"""
         self.panel.undo_button.setVisible(undo)
@@ -625,4 +628,5 @@ class GameSyncController(PanelController):
         self.panel.resign_button.setVisible(resign)
         self.panel.rematch_button.setVisible(rematch)
         self.panel.report_button.setVisible(report)
+        self.panel.colophon_button.setVisible(colophon)
         self.panel.leave_button.setVisible(leave)

@@ -55,9 +55,12 @@ class ResultDialog(ModalOverlay):
         self,
         presentation: ResultPresentation,
         parent: Optional[QWidget] = None,
+        *,
+        colophon_enabled: bool = True,
     ) -> None:
         super().__init__(parent, object_name="resultDialog")
         self._presentation = presentation
+        self._colophon_requested = False
 
         card = self.card
         card.setObjectName("resultCard")
@@ -111,6 +114,15 @@ class ResultDialog(ModalOverlay):
         buttons = QHBoxLayout()
         buttons.setSpacing(14)
         buttons.addStretch(1)
+        self.colophon_button = QPushButton("拓片", card)
+        self.colophon_button.setObjectName("smallButton")
+        self.colophon_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.colophon_button.setMinimumWidth(84)
+        self.colophon_button.setMinimumHeight(38)
+        self.colophon_button.setToolTip(
+            "为这一局刻一张题跋拓片，存进自己的拓片册"
+        )
+        self.colophon_button.setVisible(colophon_enabled)
         self.restart_button = QPushButton(presentation.primary_text, card)
         self.restart_button.setObjectName("resultPrimaryButton")
         self.restart_button.setDefault(True)
@@ -124,15 +136,22 @@ class ResultDialog(ModalOverlay):
         self.view_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.view_button.setMinimumWidth(112)
         self.view_button.setMinimumHeight(38)
+        buttons.addWidget(self.colophon_button)
         buttons.addWidget(self.restart_button)
         buttons.addWidget(self.view_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
 
+        self.colophon_button.clicked.connect(self._on_colophon)
         self.restart_button.clicked.connect(self.accept)
         self.view_button.clicked.connect(self.reject)
         self.set_default_action(self.accept)
         self.restart_button.setFocus()
+
+    def _on_colophon(self) -> None:
+        """点了“拓片”：记下意图并关闭弹窗，由调用方打开编辑器。"""
+        self._colophon_requested = True
+        self.reject()
 
     # ------------------------------------------------------------------
     # 语义
@@ -141,6 +160,11 @@ class ResultDialog(ModalOverlay):
     def restart_requested(self) -> bool:
         """用户是否选择再来一局。"""
         return self.result() == RESULT_ACCEPTED
+
+    @property
+    def colophon_requested(self) -> bool:
+        """用户是否选择为这一局拓片。"""
+        return self._colophon_requested
 
 
 __all__ = [

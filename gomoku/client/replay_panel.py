@@ -119,6 +119,12 @@ class ReplayPanel(InkBackdrop):
     #: 用户点击“关闭”时发出，由主窗口切回来源页面。
     closed = Signal()
 
+    #: 用户点“拓此手”时发出，携带当前所在的手数。
+    colophon_requested = Signal(int)
+
+    #: 用户点“拓片册”时发出，由主窗口切到册页。
+    album_requested = Signal()
+
     def __init__(
         self,
         records: Sequence[GameRecord] = (),
@@ -132,6 +138,7 @@ class ReplayPanel(InkBackdrop):
         self._index = 0
         self._syncing = False
         self._closing = False
+        self._controls_enabled = True
         self._shortcuts: list[QShortcut] = []
         self._review_worker: Optional[AIReviewWorker] = None
         self._review_result: Optional[ReviewResult] = None
@@ -159,6 +166,26 @@ class ReplayPanel(InkBackdrop):
         self._closing = True
         self._stop_play()
         self._stop_review(wait=True)
+
+    # ------------------------------------------------------------------
+    # 供拓片编辑器使用
+    # ------------------------------------------------------------------
+    @property
+    def current_ply(self) -> int:
+        """当前所在的手数（0 表示起始局面）。"""
+        return self._index
+
+    def current_record(self) -> Optional[GameRecord]:
+        """返回当前正在复盘的棋谱；没有选中棋谱时是 ``None``。"""
+        return self._current_record()
+
+    def review_results(self) -> tuple[MoveReview, ...]:
+        """返回本次复盘的逐手评定；没跑过复盘时是空元组。
+
+        拓片编辑器靠它自动定位关键手、起草题跋——玩家跑过复盘，拓片
+        就刻在真正要紧的那一手上；没跑过就退回到普通棋谱。
+        """
+        return tuple(self._reviews_by_move.values())
 
     # ------------------------------------------------------------------
     # 可见性
@@ -217,6 +244,20 @@ class ReplayPanel(InkBackdrop):
             "逐手分析：推荐着法、评分损失与准确率（本地运行）"
         )
         self.review_button.clicked.connect(self._toggle_ai_review)
+        self.colophon_button = QPushButton("拓此手", self)
+        self.colophon_button.setObjectName("smallButton")
+        self.colophon_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.colophon_button.setToolTip(
+            "为当前这一手刻一张题跋拓片，存进自己的拓片册"
+        )
+        self.colophon_button.clicked.connect(self._emit_colophon)
+        self.album_button = QPushButton("拓片册", self)
+        self.album_button.setObjectName("smallButton")
+        self.album_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.album_button.setToolTip("浏览已保存的题跋拓片")
+        self.album_button.clicked.connect(
+            lambda _checked=False: self.album_requested.emit()
+        )
         self.close_button = QPushButton("关闭", self)
         self.close_button.setObjectName("undoButton")
         self.close_button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -231,6 +272,12 @@ class ReplayPanel(InkBackdrop):
         )
         header.addWidget(
             self.review_button, 0, Qt.AlignmentFlag.AlignVCenter
+        )
+        header.addWidget(
+            self.colophon_button, 0, Qt.AlignmentFlag.AlignVCenter
+        )
+        header.addWidget(
+            self.album_button, 0, Qt.AlignmentFlag.AlignVCenter
         )
         header.addWidget(self.close_button, 0, Qt.AlignmentFlag.AlignVCenter)
         root.addLayout(header)
@@ -541,6 +588,10 @@ class ReplayPanel(InkBackdrop):
 
         self.index_label.setText(f"第 {bounded} / {self._last_index} 手")
         self._update_move_info()
+        # “拓此手”的可用性跟着当前手数走：第 0 手是空局面，无从拓起。
+        self.colophon_button.setEnabled(
+            self._controls_enabled and bounded >= 1
+        )
 
         self.first_button.setEnabled(bounded > 0)
         self.prev_button.setEnabled(bounded > 0)
@@ -569,6 +620,7 @@ class ReplayPanel(InkBackdrop):
             self._set_index(row)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
+        self._controls_enabled = enabled
         for widget in (
             self.first_button,
             self.prev_button,
@@ -579,10 +631,22 @@ class ReplayPanel(InkBackdrop):
         ):
             widget.setEnabled(enabled)
         self.export_button.setEnabled(enabled and bool(self._records))
+        self.album_button.setEnabled(enabled)
+        # “拓此手”至少要有一手之后才有局面可拓。
+        self.colophon_button.setEnabled(
+            enabled and bool(self._records) and self._index >= 1
+        )
         if self._review_worker is None:
             self.review_button.setEnabled(
                 enabled and bool(self._records)
             )
+
+    def _emit_colophon(self) -> None:
+        """把当前手数交给主窗口去开编辑器。"""
+        record = self._current_record()
+        if record is None or self._index < 1:
+            return
+        self.colophon_requested.emit(self._index)
 
     # ------------------------------------------------------------------
     # 自动播放

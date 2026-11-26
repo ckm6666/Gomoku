@@ -23,7 +23,7 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 from PySide6.QtCore import Qt, QSettings, QTimer
 from PySide6.QtGui import (
@@ -65,6 +65,13 @@ from gomoku.client.constants import (
     WINDOW_MIN_WIDTH,
     WINDOW_SCREEN_MARGIN,
 )
+from gomoku.client.colophon import (
+    Colophon,
+    ColophonStore,
+    draft_online_colophons,
+)
+from gomoku.client.colophon_album import ColophonAlbum
+from gomoku.client.colophon_editor import ColophonEditor
 from gomoku.client.modal_overlay import ModalOverlay, NoticeOverlay
 from gomoku.client.net.update_api import UpdateHTTPClient
 from gomoku.client.net.update_download import UpdateDownloadClient
@@ -280,6 +287,7 @@ class MainWindow(QMainWindow):
         *,
         puzzles: Optional[Sequence[Puzzle]] = None,
         record_store: Optional[LocalRecordStore] = None,
+        colophon_store: Optional[ColophonStore] = None,
         auto_update_check: bool = True,
         settings: Optional[QSettings] = None,
     ) -> None:
@@ -298,6 +306,10 @@ class MainWindow(QMainWindow):
             tuple(puzzles) if puzzles is not None else load_puzzle_bank()
         )
         self._record_store = record_store or LocalRecordStore()
+        # 题跋拓片册：同样是纯本地的收藏，测试可注入临时目录。
+        self._colophon_store = colophon_store or ColophonStore()
+        # 刚刚记录下来的那一局，拓片编辑器要用它当底稿。
+        self._last_record: Optional[GameRecord] = None
         self._current_puzzle: Optional[Puzzle] = None
         self._puzzle_result: Optional[tuple[bool, str]] = None
         self._recorded_generation = -1
@@ -305,6 +317,9 @@ class MainWindow(QMainWindow):
         self._online_panel: Optional[OnlinePanel] = None
         self._replay_panel: Optional[ReplayPanel] = None
         self._replay_return_page: Optional[QWidget] = None
+        # 拓片册页与它的来源页面。
+        self._colophon_album: Optional[ColophonAlbum] = None
+        self._colophon_album_return_page: Optional[QWidget] = None
         # 当前正在显示的窗口内模态层（终局弹窗/确认框），供测试定位。
         self._active_modal: Optional[ModalOverlay] = None
         # 窗口底部的非阻塞提示条（棋谱保存失败等）。
@@ -563,6 +578,8 @@ class MainWindow(QMainWindow):
         except Exception:
             logger.exception("保存本地棋谱失败")
             saved = False
+        # 记下这一局：终局弹窗的“拓片”入口要拿它当底稿。
+        self._last_record = record
         self._recorded_generation = self._game_generation
         if not saved:
             # 只记日志的话，用户会以为棋谱已经存好；这里给一条不打断
@@ -1073,6 +1090,8 @@ class MainWindow(QMainWindow):
         ):
             return
         self._game_mode = mode
+        # 换局就换底稿：上一局留下的棋谱不能拿去给新的一局拓片。
+        self._last_record = None
         # _replace_session 负责 shutdown 旧会话、同步界面和播放开局音。
         self._replace_session()
         self._show_page(self.game_page)
@@ -1149,6 +1168,8 @@ class MainWindow(QMainWindow):
         self._current_puzzle = puzzle
         self._game_mode = GameMode.PUZZLE
         self._puzzle_result = None
+        # 残局不写棋谱，底稿也要跟着换掉。
+        self._last_record = None
         self._replace_session()
         self._show_page(self.game_page)
         self._set_game_shortcuts_enabled(True)
@@ -1217,6 +1238,10 @@ class MainWindow(QMainWindow):
         if panel is None:
             panel = ReplayPanel(records, parent=self.stack)
             panel.closed.connect(self._on_replay_panel_closed)
+            panel.colophon_requested.connect(
+                self._open_colophon_from_replay
+            )
+            panel.album_requested.connect(self._open_colophon_album)
             self._replay_panel = panel
             self.stack.addWidget(panel)
         else:
@@ -1238,6 +1263,141 @@ class MainWindow(QMainWindow):
             self._enter_game_page()
         if target is self.menu_page:
             self.online_button.setFocus()
+
+    # ------------------------------------------------------------------
+    # 题跋拓片
+    # ------------------------------------------------------------------
+    def _open_colophon_editor(
+        self,
+        record: GameRecord,
+        *,
+        ply: int = 0,
+        reviews: Sequence[Any] = (),
+        initial_colophon: str = "",
+    ) -> None:
+        """打开题跋编辑器；保存后写进本地拓片册。
+
+        编辑器是主窗口内的一层模态遮罩，不新建窗口——应用全局始终只有
+        一个原生窗口是本项目的硬约定。
+        """
+        if self._closing or self._modal_dialog_open:
+            return
+        if not record.moves:
+            return
+
+        editor = ColophonEditor(
+            record,
+            parent=self._overlay_host(),
+            ply=ply,
+            reviews=reviews,
+            initial_colophon=initial_colophon,
+        )
+        self._active_modal = editor
+        self._modal_dialog_open = True
+        saved: list[Colophon] = []
+        editor.saved.connect(saved.append)
+        try:
+            editor.exec()
+        finally:
+            self._modal_dialog_open = False
+            self._active_modal = None
+            editor.deleteLater()
+
+        if not saved:
+            return
+        self._save_colophon(saved[0])
+
+    def _save_colophon(self, colophon: Colophon) -> None:
+        """把一份拓片写进册子，并给玩家一句反馈。"""
+        if self._colophon_store.add(colophon):
+            self._show_transient_notice(
+                f"拓片《{colophon.title}》已存入拓片册。"
+            )
+            if self._colophon_album is not None:
+                self._colophon_album.refresh()
+        else:
+            self._show_transient_notice(
+                "拓片册写入失败，这一幅拓片没有保存。"
+            )
+
+    def _open_colophon_from_replay(self, ply: int) -> None:
+        """复盘页点“拓此手”：按当前手数打开编辑器。"""
+        panel = self._replay_panel
+        if panel is None:
+            return
+        record = panel.current_record()
+        if record is None:
+            return
+        self._open_colophon_editor(
+            record,
+            ply=ply,
+            reviews=panel.review_results(),
+        )
+
+    def _open_colophon_from_result(self) -> None:
+        """终局弹窗点“拓片”：为刚刚结束的这一局刻一张。"""
+        record = self._last_record
+        if record is None:
+            self._show_transient_notice("这一局没有留下棋谱，无法拓片。")
+            return
+        self._open_colophon_editor(record)
+
+    def _open_online_colophon(self, payload: object) -> None:
+        """联机对局请求拓片：自动生成一份，开编辑器让玩家过目。
+
+        联机对局在本地没有 AI 复盘可用，题跋只能依据胜负与终局方式
+        自动起草；玩家可以直接存册，也可以改成自己的话。
+        """
+        if not isinstance(payload, tuple) or len(payload) != 3:
+            return
+        record, your_color, finished_by_five = payload
+        if not isinstance(record, GameRecord):
+            return
+        drafts = draft_online_colophons(
+            record,
+            your_color=your_color,
+            finished_by_five=bool(finished_by_five),
+        )
+        initial = drafts[0][1] if drafts else ""
+        self._open_colophon_editor(
+            record,
+            ply=len(record.moves),
+            initial_colophon=initial,
+        )
+
+    def _open_colophon_album(self) -> None:
+        """打开拓片册页。
+
+        册页是主窗口页面栈里的一页（不是独立窗口），入口在复盘页的
+        「拓片册」按钮上——主菜单仍保持六项，不为收藏功能再占一个位置。
+        """
+        if self._closing:
+            return
+        album = self._colophon_album
+        if album is None:
+            album = ColophonAlbum(self._colophon_store, parent=self.stack)
+            album.closed.connect(self._on_colophon_album_closed)
+            self._colophon_album = album
+            self.stack.addWidget(album)
+        else:
+            album.set_store(self._colophon_store)
+            album.refresh()
+
+        # 册页从复盘页进来，关闭时回复盘页。
+        self._colophon_album_return_page = self._replay_panel
+        self._leave_game_page()
+        self._show_page(album)
+        self._set_game_shortcuts_enabled(False)
+
+    def _on_colophon_album_closed(self) -> None:
+        """拓片册关闭：回到来源页面。"""
+        target = (
+            self._colophon_album_return_page
+            or self._replay_panel
+            or self.menu_page
+        )
+        self._colophon_album_return_page = None
+        self._show_page(target)
 
     def _exit_game(self) -> None:
         """退出应用；closeEvent 负责停止联机页与后台线程。"""
@@ -1265,6 +1425,7 @@ class MainWindow(QMainWindow):
                     self._return_to_menu_from_online
                 )
                 panel.replay_requested.connect(self._open_replay_page)
+                panel.colophon_requested.connect(self._open_online_colophon)
                 self._online_panel = panel
                 self.stack.addWidget(panel)
             # 联机页不是对局页：离开对局页前先暂停会话。
@@ -1688,14 +1849,20 @@ class MainWindow(QMainWindow):
         self._result_dialog_open = True
         self._modal_dialog_open = True
         restart = False
+        colophon = False
         try:
             presentation = self._build_result_presentation(
                 view.winner, view.move_count
             )
-            result_dialog = ResultDialog(presentation, self._overlay_host())
+            result_dialog = ResultDialog(
+                presentation,
+                self._overlay_host(),
+                colophon_enabled=self._last_record is not None,
+            )
             self._active_modal = result_dialog
             result_dialog.exec()
             restart = result_dialog.restart_requested
+            colophon = result_dialog.colophon_requested
             result_dialog.deleteLater()
             self._active_modal = None
         finally:
@@ -1706,6 +1873,10 @@ class MainWindow(QMainWindow):
             self._reset_game()
         elif self._game_mode is GameMode.PUZZLE:
             self._request_puzzle_list()
+        elif colophon:
+            # 拓片要在模态层彻底关闭之后才开：两个嵌套事件循环会让窗口
+            # 关不掉。
+            QTimer.singleShot(0, self._open_colophon_from_result)
 
         QTimer.singleShot(0, self._flush_pending_result_dialog)
 

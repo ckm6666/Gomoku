@@ -16,6 +16,7 @@ def _record(
     reason: str,
     mode: str = "local",
     rule_mode: str = "freestyle",
+    metadata: dict | None = None,
 ) -> GameRecord:
     return GameRecord(
         record_id="sgf-test",
@@ -27,6 +28,7 @@ def _record(
         black_name="甲",
         white_name="乙",
         rule_mode=rule_mode,
+        metadata=metadata or {},
     )
 
 
@@ -139,6 +141,45 @@ class SgfRoundTripTests(unittest.TestCase):
         )
         with self.assertRaises(SgfError):
             record_from_sgf(sgf)
+
+
+class SgfCommentTests(unittest.TestCase):
+    """根节点 ``C[]`` 注释（题跋）的导入导出。"""
+
+    def test_root_comment_is_imported_as_the_colophon(self) -> None:
+        record = record_from_sgf(
+            "(;GM[1]SZ[15]C[第 3 手，一着之差。];B[ch];W[aa])"
+        )
+        self.assertEqual(record.metadata["colophon"], "第 3 手，一着之差。")
+
+    def test_comment_on_a_move_is_not_the_colophon(self) -> None:
+        """落在某一手上的 ``C[]`` 只是那一步的普通注释。
+
+        别家 SGF 软件随手写的备注不能被当成玩家写的题跋：它会被存进
+        拓片册，再导出时又被搬到根节点上。
+        """
+        record = record_from_sgf(
+            "(;GM[1]SZ[15];B[ch];C[这是第三手的注释];W[aa])"
+        )
+        self.assertNotIn("colophon", record.metadata)
+
+    def test_comment_after_the_first_move_is_not_the_colophon(self) -> None:
+        record = record_from_sgf(
+            "(;GM[1]SZ[15];B[ch]C[随手写的备注];W[aa])"
+        )
+        self.assertNotIn("colophon", record.metadata)
+
+    def test_colophon_round_trip_through_sgf(self) -> None:
+        record = _record(
+            [(7, 3, Player.BLACK), (9, 3, Player.WHITE)],
+            winner=None,
+            reason="",
+            metadata={"colophon": "第 1 手，风起。"},
+        )
+        text = record_to_sgf(record)
+        self.assertIn("C[第 1 手，风起。]", text)
+        back = record_from_sgf(text)
+        self.assertEqual(back.metadata["colophon"], "第 1 手，风起。")
 
 
 if __name__ == "__main__":

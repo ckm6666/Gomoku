@@ -235,6 +235,7 @@ class GameController(PanelController):
         undo: bool,
         reject_undo: bool,
         report: bool = False,
+        colophon: bool = False,
     ) -> None:
         self.sync.set_action_visibility(
             resign,
@@ -243,6 +244,7 @@ class GameController(PanelController):
             undo=undo,
             reject_undo=reject_undo,
             report=report,
+            colophon=colophon,
         )
 
     # ------------------------------------------------------------------
