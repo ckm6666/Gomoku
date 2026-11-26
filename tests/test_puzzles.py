@@ -25,9 +25,9 @@ QT_APP = QApplication.instance() or QApplication([])
 
 
 class PuzzleBankTests(unittest.TestCase):
-    def test_builtin_bank_has_twenty_six_valid_puzzles(self) -> None:
+    def test_builtin_bank_has_thirty_one_valid_puzzles(self) -> None:
         puzzles = load_puzzle_bank()
-        self.assertEqual(len(puzzles), 26)
+        self.assertEqual(len(puzzles), 31)
         self.assertEqual(len({puzzle.id for puzzle in puzzles}), len(puzzles))
         self.assertTrue(all(puzzle.title for puzzle in puzzles))
         for puzzle in puzzles:
@@ -61,17 +61,22 @@ class PuzzleBankTests(unittest.TestCase):
                 "偷梁换柱": 5,
                 "关门捉贼": 6,
                 "破釜沉舟": 6,
+                "一网打尽": 7,
+                "瓮中捉鳖": 4,
+                "四面楚歌": 5,
+                "一气呵成": 4,
+                "神机妙算": 6,
             },
         )
 
     def test_new_puzzles_are_black_to_move(self) -> None:
-        """新增的黑先关卡一律黑先，限手数落在 4～6 手之间。"""
+        """新增的黑先关卡一律黑先，限手数落在 4～7 手之间。"""
         puzzles = load_puzzle_bank()
         added = [p for p in puzzles if p.id >= "p012"]
-        self.assertEqual(len(added), 15)
+        self.assertEqual(len(added), 20)
         for puzzle in added:
             self.assertEqual(puzzle.to_move, Player.BLACK)
-            self.assertTrue(4 <= puzzle.max_player_moves <= 6)
+            self.assertTrue(4 <= puzzle.max_player_moves <= 7)
             self.assertEqual(
                 puzzle.setup_move_count % 2, 0,
                 f"{puzzle.title} 黑白子数应相等",
